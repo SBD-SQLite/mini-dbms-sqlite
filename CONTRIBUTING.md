@@ -17,6 +17,8 @@ The `main` branch is protected. Direct pushes are not allowed; every change must
 
    Pushing new commits after approval dismisses the existing approval, so the PR must be re-approved.
 
+   Members of **@SBD-SQLite/group-leads** may bypass these requirements when merging a Pull Request (e.g. to merge their own PR). Direct pushes to `main` remain blocked for everyone.
+
 ## Conventions
 
 **Types:** `feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `ci`, `chore`
