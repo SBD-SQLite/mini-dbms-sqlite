@@ -1,0 +1,58 @@
+name: Conventions
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  conventions:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_TITLE: ${{ github.event.pull_request.title }}
+      HEAD_REF: ${{ github.head_ref }}
+      TYPES: feat|fix|docs|test|refactor|perf|ci|chore
+      SCOPES: qp|qo|sm|ccm|frm|global
+    steps:
+      - name: Check branch name
+        run: |
+          pattern="^(${TYPES})/(${SCOPES})/[a-z0-9][a-z0-9-]*$"
+          if [[ ! "$HEAD_REF" =~ $pattern ]]; then
+            echo "::error::Nama branch '$HEAD_REF' tidak sesuai. Format: <tipe>/<komponen>/<deskripsi>, contoh feat/qp/select-parser"
+            exit 1
+          fi
+          echo "Branch OK: $HEAD_REF"
+
+      - name: Check PR title
+        run: |
+          pattern="^(${TYPES})(\((${SCOPES})\))?!?: .+"
+          if [[ ! "$PR_TITLE" =~ $pattern ]]; then
+            echo "::error::Judul PR '$PR_TITLE' tidak sesuai. Format: <tipe>(<komponen>): <deskripsi>, contoh feat(qo): add join reordering"
+            exit 1
+          fi
+          echo "Title OK: $PR_TITLE"
+
+      - name: Check commit messages
+        run: |
+          pattern="^(${TYPES})(\((${SCOPES})\))?!?: .+"
+          failed=0
+          while IFS= read -r subject; do
+            if [[ "$subject" =~ ^(Merge|Revert)\  ]]; then
+              continue
+            fi
+            if [[ ! "$subject" =~ $pattern ]]; then
+              echo "::error::Commit message tidak sesuai: '$subject'"
+              failed=1
+            fi
+          done < <(gh api "repos/$REPO/pulls/$PR_NUMBER/commits" --paginate --jq '.[].commit.message | split("\n")[0]')
+          if [[ $failed -ne 0 ]]; then
+            echo "Format: <tipe>(<komponen>): <deskripsi>. Perbaiki dengan git commit --amend atau git rebase -i, lalu push --force-with-lease."
+            exit 1
+          fi
+          echo "All commits OK"
