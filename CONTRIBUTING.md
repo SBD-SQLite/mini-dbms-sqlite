@@ -1,36 +1,36 @@
-# Contributing
+# Contributing Guide
 
-Branch `main` dikunci: tidak bisa push langsung, semua perubahan masuk lewat Pull Request.
+The `main` branch is protected. Direct pushes are not allowed; every change must go through a Pull Request.
 
-## Alur kerja
+## Workflow
 
-1. Update `main`, lalu buat branch baru:
+1. Sync `main` and create a new branch:
    ```bash
    git switch main && git pull
    git switch -c feat/qp/select-parser
    ```
-2. Commit dengan format konvensi di bawah, lalu push branch.
-3. Buka PR ke `main`. Judul PR juga ikut format konvensi.
-4. PR bisa di-merge kalau:
-   - check **Conventions** lulus, dan
-   - sudah di-approve minimal 1 orang dari **@SBD-SQLite/group-leads**.
+2. Commit your changes following the conventions below, then push the branch.
+3. Open a Pull Request targeting `main`. The PR title must follow the same convention.
+4. A PR can be merged only when:
+   - the **Conventions** check passes, and
+   - it has at least one approval from a member of **@SBD-SQLite/group-leads**.
 
-   Kalau ada commit baru setelah approve, approval-nya hangus dan perlu di-approve ulang.
+   Pushing new commits after approval dismisses the existing approval, so the PR must be re-approved.
 
-## Konvensi
+## Conventions
 
-**Tipe:** `feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `ci`, `chore`
+**Types:** `feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `ci`, `chore`
 
-**Komponen:** `qp` (Query Processor), `qo` (Query Optimizer), `sm` (Storage Manager), `ccm` (Concurrency Control), `frm` (Failure Recovery), `global` (lintas komponen / repo)
+**Scopes:** `qp` (Query Processor), `qo` (Query Optimizer), `sm` (Storage Manager), `ccm` (Concurrency Control Manager), `frm` (Failure Recovery Manager), `global` (cross-component or repository-wide)
 
-| | Format | Contoh |
+| | Format | Example |
 |---|---|---|
-| Branch | `<tipe>/<komponen>/<deskripsi-kebab-case>` | `fix/sm/buffer-flush` |
-| Commit & judul PR | `<tipe>(<komponen>): <deskripsi>` (komponen opsional) | `feat(qo): add join reordering` |
+| Branch name | `<type>/<scope>/<short-description>` (kebab-case) | `fix/sm/buffer-flush` |
+| Commit message & PR title | `<type>(<scope>): <description>` (scope optional) | `feat(qo): add join reordering` |
 
-Commit `Merge ...` dan `Revert ...` bawaan git diperbolehkan.
+Git-generated `Merge ...` and `Revert ...` commits are allowed.
 
-## Aturan tubes
+## Project Rules
 
-- Hanya ubah kode di folder komponen group sendiri. Perubahan lintas komponen dikoordinasikan dulu.
-- Hanya library standar (dilarang sqlite3, pandas, library parser SQL, dll).
+- Only modify code within your own group's component directory. Coordinate with the owning group before making cross-component changes.
+- Use standard libraries only. Libraries that implement core DBMS functionality (e.g. `sqlite3`, `pandas`, SQL parser libraries) are prohibited.

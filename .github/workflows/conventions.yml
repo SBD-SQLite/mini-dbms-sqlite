@@ -24,7 +24,7 @@ jobs:
         run: |
           pattern="^(${TYPES})/(${SCOPES})/[a-z0-9][a-z0-9-]*$"
           if [[ ! "$HEAD_REF" =~ $pattern ]]; then
-            echo "::error::Nama branch '$HEAD_REF' tidak sesuai. Format: <tipe>/<komponen>/<deskripsi>, contoh feat/qp/select-parser"
+            echo "::error::Branch name '$HEAD_REF' is invalid. Expected <type>/<scope>/<short-description>, e.g. feat/qp/select-parser"
             exit 1
           fi
           echo "Branch OK: $HEAD_REF"
@@ -33,7 +33,7 @@ jobs:
         run: |
           pattern="^(${TYPES})(\((${SCOPES})\))?!?: .+"
           if [[ ! "$PR_TITLE" =~ $pattern ]]; then
-            echo "::error::Judul PR '$PR_TITLE' tidak sesuai. Format: <tipe>(<komponen>): <deskripsi>, contoh feat(qo): add join reordering"
+            echo "::error::PR title '$PR_TITLE' is invalid. Expected <type>(<scope>): <description>, e.g. feat(qo): add join reordering"
             exit 1
           fi
           echo "Title OK: $PR_TITLE"
@@ -47,12 +47,12 @@ jobs:
               continue
             fi
             if [[ ! "$subject" =~ $pattern ]]; then
-              echo "::error::Commit message tidak sesuai: '$subject'"
+              echo "::error::Invalid commit message: '$subject'"
               failed=1
             fi
           done < <(gh api "repos/$REPO/pulls/$PR_NUMBER/commits" --paginate --jq '.[].commit.message | split("\n")[0]')
           if [[ $failed -ne 0 ]]; then
-            echo "Format: <tipe>(<komponen>): <deskripsi>. Perbaiki dengan git commit --amend atau git rebase -i, lalu push --force-with-lease."
+            echo "Expected <type>(<scope>): <description>. Fix with git commit --amend or git rebase -i, then push --force-with-lease."
             exit 1
           fi
           echo "All commits OK"

@@ -1,8 +1,8 @@
-## Ringkasan
+## Summary
 
-<!-- Apa yang diubah dan kenapa -->
+<!-- What does this PR change, and why? -->
 
-## Komponen
+## Component
 
 - [ ] QP
 - [ ] QO
@@ -13,6 +13,6 @@
 
 ## Checklist
 
-- [ ] Judul PR mengikuti format `<tipe>(<komponen>): <deskripsi>`
-- [ ] Hanya mengubah folder komponen sendiri (atau sudah dikoordinasikan)
-- [ ] Sudah dites (driver / unit test)
+- [ ] PR title follows `<type>(<scope>): <description>`
+- [ ] Changes are limited to my group's component (or have been coordinated with the owning group)
+- [ ] Tested (driver program / unit tests)
