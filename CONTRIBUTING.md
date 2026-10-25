@@ -11,13 +11,14 @@ The `main` branch is protected. Direct pushes are not allowed; every change must
    ```
 2. Commit your changes following the conventions below, then push the branch.
 3. Open a Pull Request targeting `main`. The PR title must follow the same convention.
-4. A PR can be merged only when:
-   - the **Conventions** check passes, and
-   - it has at least one approval from a member of **@SBD-SQLite/group-leads**.
+4. Only members of **@SBD-SQLite/group-leads** can merge into `main`. A PR is ready to merge when:
+   - the **Conventions** check passes,
+   - it has at least one approval from a member of **@SBD-SQLite/group-leads**, and
+   - all review conversations are resolved.
 
    Pushing new commits after approval dismisses the existing approval, so the PR must be re-approved.
 
-   Members of **@SBD-SQLite/group-leads** may bypass these requirements when merging a Pull Request (e.g. to merge their own PR). Direct pushes to `main` remain blocked for everyone.
+   Group leads may bypass these requirements when merging a Pull Request (e.g. to merge their own PR). Direct pushes to `main` remain blocked for everyone.
 
 ## Conventions
 
