@@ -18,7 +18,7 @@ public final class ExecutionContext {
     private final Map<ResourceKey, AccessGrant> grants = new ConcurrentHashMap<>();
 
     public ExecutionContext(long txId, Optional<String> sessionId) {
-        this(txId, sessionId, false, new AtomicLong(), new CancellationToken());
+        this(txId, sessionId, true, new AtomicLong(), new CancellationToken());
     }
 
     public ExecutionContext(long txId, Optional<String> sessionId, boolean implicit, AtomicLong sequence, CancellationToken cancellation) {
@@ -41,6 +41,10 @@ public final class ExecutionContext {
 
     public static ExecutionContext of(long txId, String sessionId) {
         return new ExecutionContext(txId, Optional.ofNullable(sessionId));
+    }
+
+    public static ExecutionContext of(long txId, String sessionId, boolean implicit) {
+        return new ExecutionContext(txId, Optional.ofNullable(sessionId), implicit, new AtomicLong(), new CancellationToken());
     }
 
     public long txId() {

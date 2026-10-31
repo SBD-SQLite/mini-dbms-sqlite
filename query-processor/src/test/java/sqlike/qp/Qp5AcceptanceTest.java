@@ -29,6 +29,8 @@ public final class Qp5AcceptanceTest {
         test("QP-12 BEGIN forms, unique IDs, and event", Qp5AcceptanceTest::beginTransactions);
         test("QP-12 auto-commit", Qp5AcceptanceTest::autoCommit);
         test("QP-12 access permission and WAIT", Qp5AcceptanceTest::accessAndWait);
+        test("QP-09 Access request ordering and merging", Qp5AcceptanceTest::accessOrderingAndMerging);
+        test("QP-04 CHAR/VARCHAR length in UTF-8 bytes", Qp5AcceptanceTest::utf8ByteLength);
         test("QP-12 COMMIT success and rejection", Qp5AcceptanceTest::commitResults);
         test("QP-13 CREATE INDEX and confirmation", Qp5AcceptanceTest::createIndexes);
         test("QP-13 IndexScan without table scan", Qp5AcceptanceTest::indexScan);
@@ -137,8 +139,75 @@ public final class Qp5AcceptanceTest {
         database.execute("ABORT;");
     }
 
+    private static void accessOrderingAndMerging() throws Exception {
+        TestDatabase database = new TestDatabase();
+        AccessCoordinator coordinator = new AccessCoordinator(database.transactions);
+        TxId tx = database.transactions.begin(database.session.sessionId());
+        ExecutionContext context = ExecutionContext.of(tx.value());
+
+        // Requests for "zeta" (READ), "alpha" (READ), "beta" (WRITE), "alpha" (WRITE)
+        PreparedStatement stmt = new PreparedStatement(List.of(
+                new AccessRequest(ResourceKey.table(new TableId("zeta")), AccessMode.READ),
+                new AccessRequest(ResourceKey.table(new TableId("alpha")), AccessMode.READ),
+                new AccessRequest(ResourceKey.table(new TableId("beta")), AccessMode.WRITE),
+                new AccessRequest(ResourceKey.table(new TableId("alpha")), AccessMode.WRITE)
+        ));
+
+        database.trace.clear();
+        coordinator.acquireAll(stmt, context);
+
+        // Verify alpha upgraded to WRITE
+        assertEquals(AccessMode.WRITE, context.requireGrant(new TableId("alpha"), AccessMode.WRITE).mode());
+        assertEquals(AccessMode.WRITE, context.requireGrant(new TableId("beta"), AccessMode.WRITE).mode());
+        assertEquals(AccessMode.READ, context.requireGrant(new TableId("zeta"), AccessMode.READ).mode());
+
+        // Verify exactly 3 requests (not 4) to CCM, in TableId sorted order: alpha (WRITE), beta (WRITE), zeta (READ)
+        List<String> ccmAccessTrace = database.trace.stream()
+                .filter(t -> t.startsWith("CCM.access."))
+                .toList();
+        assertEquals(List.of("CCM.access.WRITE", "CCM.access.WRITE", "CCM.access.READ"), ccmAccessTrace);
+    }
+
+    private static void utf8ByteLength() {
+        Schema schema = Schema.of(List.of(
+                new ColumnSchema("code", DataType.VARCHAR, Optional.of(3))
+        ));
+
+        // ASCII 3 chars = 3 bytes -> valid
+        Value v1 = new Value(DataType.VARCHAR, Optional.empty(), Optional.empty(), Optional.of("abc"));
+        Row r1 = schema.validate(new Row(List.of(v1)));
+        assertEquals("abc", r1.values().get(0).textValue().orElseThrow());
+
+        // 'é' is 1 char but 2 UTF-8 bytes. "é" in VARCHAR(3) -> 2 bytes -> valid
+        Value v2 = new Value(DataType.VARCHAR, Optional.empty(), Optional.empty(), Optional.of("é"));
+        Row r2 = schema.validate(new Row(List.of(v2)));
+        assertEquals("é", r2.values().get(0).textValue().orElseThrow());
+
+        // "éé" is 2 chars but 4 UTF-8 bytes -> exceeds VARCHAR(3) (3 bytes)!
+        boolean threw = false;
+        try {
+            Value v3 = new Value(DataType.VARCHAR, Optional.empty(), Optional.empty(), Optional.of("éé"));
+            schema.validate(new Row(List.of(v3)));
+        } catch (IllegalStateException e) {
+            threw = e.getMessage().contains("Text too long");
+        }
+        assertTrue(threw, "String with UTF-8 byte size exceeding maxLength should be rejected");
+    }
+
     private static void createIndexes() throws Exception {
         TestDatabase database = new TestDatabase();
+
+        // 1. CREATE INDEX within explicit transaction must be rejected, without implicit commit, and transaction remains active
+        database.execute("BEGIN;");
+        Result rejectedInTx = database.runner.execute(database.session, "CREATE INDEX by_id_fail ON employees(id);");
+        assertTrue(!rejectedInTx.success(), "CREATE INDEX should fail inside explicit transaction");
+        assertTrue(rejectedInTx.message().contains("not allowed within an explicit transaction"),
+                "Wrong error message: " + rejectedInTx.message());
+        assertTrue(!database.trace.contains("SM.createIndex.by_id_fail"), "SM index created despite rejection");
+        assertTrue(database.session.getCurrentTxId().isPresent(), "Transaction was aborted or cleared");
+        database.execute("ABORT;");
+
+        // 2. Normal CREATE INDEX outside explicit transaction
         Result hash = database.execute("CREATE INDEX by_id ON employees(id);");
         Result tree = database.execute("CREATE INDEX by_salary ON employees(salary) USING BPLUS_TREE;");
 

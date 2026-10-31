@@ -169,7 +169,7 @@ public final class QueryProcessor implements IQueryProcessor {
 
     private QueryResult executeInExplicitTransaction(SessionState session, QueryPlan plan, long txId) {
         try {
-            return planExecutor.execute(plan, ExecutionContext.of(txId, session.getId()));
+            return planExecutor.execute(plan, ExecutionContext.of(txId, session.getId(), false));
         } catch (RuntimeException e) {
             ErrorInfo error = toErrorInfo(e);
             if (error.code() == ErrorCode.TRANSACTION_ABORTED) {
@@ -185,7 +185,7 @@ public final class QueryProcessor implements IQueryProcessor {
         long txId = begin.txId();
         session.attachTransaction(txId, false);
         try {
-            QueryResult result = planExecutor.execute(plan, ExecutionContext.of(txId, session.getId()));
+            QueryResult result = planExecutor.execute(plan, ExecutionContext.of(txId, session.getId(), true));
             requireStatus(concurrencyControl.commit(txId), TransactionStatus.COMMITTED);
             return result;
         } catch (RuntimeException e) {

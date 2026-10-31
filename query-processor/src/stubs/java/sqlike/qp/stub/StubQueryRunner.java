@@ -74,7 +74,9 @@ public final class StubQueryRunner {
                 return new Result(true, count, List.of(), plan.kind() == PlanNodeKind.CREATE_INDEX
                         ? "Index " + plan.createIndex().orElseThrow().indexName() + " created successfully" : count + " row(s) affected");
             } catch (RuntimeException e) {
-                if (context != null) {
+                boolean isExplicitCreateIndexRejection = plan != null && plan.kind() == PlanNodeKind.CREATE_INDEX
+                        && e.getMessage() != null && e.getMessage().contains("CREATE INDEX is not allowed within an explicit transaction");
+                if (context != null && !isExplicitCreateIndexRejection) {
                     try { transactions.handleRuntimeFailure(session, context, new DbmsError(e.getMessage())); }
                     catch (RuntimeException cleanup) { e.addSuppressed(cleanup); }
                 }

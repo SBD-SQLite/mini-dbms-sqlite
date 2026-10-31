@@ -1,6 +1,6 @@
 package sqlike.qp;
 
-import java.util.Objects;
+import java.util.*;
 import sqlike.shared.AccessStatus;
 import sqlike.qp.port.QpContracts.*;
 import static sqlike.qp.port.QpContracts.failure;
@@ -13,8 +13,28 @@ public final class AccessCoordinator {
     }
 
     public void acquireAll(PreparedStatement statement, ExecutionContext context) {
+        if (statement == null || statement.accesses() == null || statement.accesses().isEmpty()) {
+            return;
+        }
+
+        Map<TableId, AccessMode> mergedByTable = new TreeMap<>(Comparator.comparing(TableId::value));
+        Map<TableId, ResourceKey> resourceByTable = new LinkedHashMap<>();
+
         for (AccessRequest request : statement.accesses()) {
-            context.addGrant(acquireOne(request.resource(), request.mode(), context));
+            TableId table = request.resource().tableId();
+            mergedByTable.merge(table, request.mode(), (oldMode, newMode) ->
+                    (oldMode == AccessMode.WRITE || newMode == AccessMode.WRITE) ? AccessMode.WRITE : AccessMode.READ
+            );
+            resourceByTable.merge(table, request.resource(), (oldRes, newRes) ->
+                    oldRes.rid().isEmpty() ? oldRes : newRes
+            );
+        }
+
+        for (Map.Entry<TableId, AccessMode> entry : mergedByTable.entrySet()) {
+            TableId table = entry.getKey();
+            AccessMode mode = entry.getValue();
+            ResourceKey resource = resourceByTable.getOrDefault(table, ResourceKey.table(table));
+            context.addGrant(acquireOne(resource, mode, context));
         }
     }
 

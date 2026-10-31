@@ -85,7 +85,8 @@ public record Schema(List<ColumnSchema> columns, Optional<String> tableName) {
         if (input.type() != column.dataType()) {
             throw new IllegalStateException("Type mismatch: " + column.name());
         }
-        if (payload instanceof String text && column.maxLength().isPresent() && text.length() > column.maxLength().get()) {
+        if (payload instanceof String text && column.maxLength().isPresent()
+                && text.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > column.maxLength().get()) {
             throw new IllegalStateException("Text too long: " + column.name());
         }
         return input;

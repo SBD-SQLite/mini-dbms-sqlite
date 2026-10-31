@@ -2,6 +2,7 @@ package sqlike.qp;
 
 import java.util.Objects;
 import sqlike.qp.port.QpContracts.*;
+import static sqlike.qp.port.QpContracts.failure;
 import sqlike.storage.StorageException;
 
 public final class CreateIndexExecutor extends AbstractCommandExecutor {
@@ -29,6 +30,9 @@ public final class CreateIndexExecutor extends AbstractCommandExecutor {
 
     @Override
     protected long doExecute(ExecutionContext context) {
+        if (!context.implicit()) {
+            throw failure("CREATE INDEX is not allowed within an explicit transaction");
+        }
         context.requireGrant(spec.tableId(), AccessMode.WRITE);
         if (qpStorage != null) {
             qpStorage.createIndex(spec, context, context.requireGrant(spec.tableId(), AccessMode.WRITE));
