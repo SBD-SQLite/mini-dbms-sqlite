@@ -8,7 +8,6 @@ import sqlike.shared.JoinAlgorithm;
 import sqlike.shared.JoinSpec;
 import sqlike.shared.JoinType;
 
-/** shortcut: M1 uses registered output rows, execute BNLJ against children in the next milestone. */
 public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
     private JoinSpec spec;
     private JoinLayout layout;
@@ -121,7 +120,7 @@ public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
         }
     }
 
-    // shortcut: helper algoritma masih dummy M1, aktifkan saat BNLJ penuh mulai dikerjakan.
+    // helper algoritma masih dummy M1, aktifkan saat BNLJ penuh mulai dikerjakan.
     private boolean fillOuterBatch() {return false;}
 
     private void reopenInner() {}

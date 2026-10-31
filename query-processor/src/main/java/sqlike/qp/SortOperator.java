@@ -7,7 +7,6 @@ import sqlike.shared.ErrorCode;
 import sqlike.shared.SortDirection;
 import sqlike.shared.SortSpec;
 
-/** shortcut: M1 uses preordered output rows, read and sort child input in the next milestone. */
 public class SortOperator extends AbstractUnaryOperator {
     private SortSpec spec;
     private RowComparator comparator;
@@ -99,4 +98,3 @@ public class SortOperator extends AbstractUnaryOperator {
     }
 
 }
-

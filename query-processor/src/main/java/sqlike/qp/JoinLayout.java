@@ -48,7 +48,7 @@ public class JoinLayout {
         return RowEnvelope.of(Row.of(outputMapping.stream().map(input::getValue).toList()));
     }
 
-    // shortcut: provenance kosong pada M1, lengkapi setelah RowEnvelope multi-relasi disepakati.
+    // provenance kosong pada M1, lengkapi setelah RowEnvelope multi-relasi disepakati.
     private Map<String,RecordRef> mergeOrigins(RowEnvelope left, RowEnvelope right) {return Map.of();}
 
     private void validateMapping() {
