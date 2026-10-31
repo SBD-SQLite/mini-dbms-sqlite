@@ -1,0 +1,13 @@
+package sqlike.storage;
+
+public enum StorageErrorCode {
+    TABLE_NOT_FOUND,
+    RECORD_NOT_FOUND,
+    INDEX_NOT_FOUND,
+    INVALID_VALUE,
+    INVALID_RESERVATION,
+    INVALID_STATE,
+    UNSUPPORTED_OPERATION,
+    IO_ERROR,
+    WAL_FAILURE
+}
