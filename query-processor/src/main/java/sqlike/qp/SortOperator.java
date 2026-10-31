@@ -36,13 +36,3 @@ public class SortOperator extends AbstractUnaryOperator {
 
 }
 
-// shortcut: parent sementara untuk kerangka QP4, ganti saat kontrak parent operator QP2 tersedia.
-class AbstractUnaryOperator {
-    protected Operator child;
-    protected Schema outputSchema;
-
-    protected AbstractUnaryOperator(Operator child, Schema outputSchema) {
-        this.child = child;
-        this.outputSchema = outputSchema;
-    }
-}
