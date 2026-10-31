@@ -13,7 +13,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicLong;
 
 import sqlike.contract.IConcurrencyControlManager;
 import sqlike.shared.AccessResponse;
@@ -336,76 +335,6 @@ public class CCMDriver {
         }
         sb.append("]");
         return sb.toString();
-    }
-
-    /**
-     * Default Milestone 1 mock CCM (always GRANTED) used when running CCMDriver standalone
-     * before CC1's ConcurrencyControlManager implementation is connected.
-     */
-    public static class Milestone1MockCCM implements IConcurrencyControlManager {
-        private final AtomicLong txCounter = new AtomicLong(0);
-        private final FRMBridge frmBridge;
-        private volatile ProtocolType activeProtocol = ProtocolType.LOCK_BASED;
-
-        public Milestone1MockCCM(MockFRM mockFrm) {
-            this.frmBridge = new FRMBridge(mockFrm);
-        }
-
-        @Override
-        public TransactionResponse beginTransaction() {
-            long id = txCounter.incrementAndGet();
-            frmBridge.logBegin(id);
-            return new TransactionResponse(id, id, TransactionStatus.ACTIVE, Optional.empty());
-        }
-
-        @Override
-        public AccessResponse requestRead(long txId, ResourceId resource) {
-            return new AccessResponse(AccessStatus.GRANTED, Optional.empty(), Optional.empty(), Optional.empty());
-        }
-
-        @Override
-        public AccessResponse requestWrite(long txId, DataChange change) {
-            long lsn = frmBridge.logWrite(txId, change);
-            return new AccessResponse(AccessStatus.GRANTED, Optional.of(lsn), Optional.empty(), Optional.empty());
-        }
-
-        @Override
-        public TransactionResponse commit(long txId) {
-            frmBridge.logCommit(txId);
-            return new TransactionResponse(txId, txId, TransactionStatus.COMMITTED, Optional.empty());
-        }
-
-        @Override
-        public TransactionResponse abort(long txId) {
-            frmBridge.rollbackThenLogAbort(txId);
-            return new TransactionResponse(txId, txId, TransactionStatus.ABORTED, Optional.empty());
-        }
-
-        @Override
-        public void setProtocol(ProtocolType protocol) {
-            this.activeProtocol = protocol;
-        }
-
-        @Override
-        public void initAfterRecovery(long lastTxId) {
-            txCounter.set(lastTxId);
-        }
-
-        @Override
-        public void pauseNewTransactions() {
-        }
-
-        @Override
-        public void awaitNoActiveTransactions() {
-        }
-
-        @Override
-        public void resumeTransactions() {
-        }
-
-        public ProtocolType getActiveProtocol() {
-            return activeProtocol;
-        }
     }
 
     public static List<Scenario> defaultScenarios() {
