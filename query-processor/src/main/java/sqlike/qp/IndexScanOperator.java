@@ -1,37 +1,96 @@
 package sqlike.qp;
 
-import java.util.*;
-import sqlike.qp.port.QpContracts.*;
-import sqlike.qp.stub.StubRuntime.AbstractOperator;
-import static sqlike.qp.port.QpContracts.failure;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Optional;
+import sqlike.contract.IStorageManager;
+import sqlike.shared.ErrorCode;
+import sqlike.shared.RID;
+import sqlike.shared.Record;
 
 public final class IndexScanOperator extends AbstractOperator {
     private final IStorageManager storage;
     private final IndexScanSpec spec;
-    private Optional<RidCursor> cursor = Optional.empty();
+    private Optional<Iterator<RID>> cursor;
+
     public IndexScanOperator(IStorageManager storage, IndexScanSpec spec, Schema schema) {
-        super(schema); this.storage = Objects.requireNonNull(storage); 
-        this.spec = Objects.requireNonNull(spec);
+        super(schema);
+        if (storage == null) {
+            throw new IllegalArgumentException("Storage manager cannot be null in IndexScanOperator");
+        }
+        if (spec == null) {
+            throw new IllegalArgumentException("IndexScanSpec cannot be null in IndexScanOperator");
+        }
+        if (spec.tableName() == null || spec.tableName().isBlank()) {
+            throw new IllegalArgumentException("Table name cannot be null or blank in IndexScanOperator");
+        }
+        if (spec.indexName() == null || spec.indexName().isBlank()) {
+            throw new IllegalArgumentException("Index name cannot be null or blank in IndexScanOperator");
+        }
+        this.storage = storage;
+        this.spec = spec;
+        this.cursor = Optional.empty();
     }
-    @Override protected void doOpen() {
-        var context = requireContext();
-        cursor = Optional.of(storage.findIndex(spec.tableId(), spec.value().indexName().orElseThrow(),
-                new IndexSearch(spec.value().condition().orElseThrow()), context, context.requireGrant(spec.tableId(), AccessMode.READ)));
+
+    @Override
+    protected void doOpen() {
+        requireContext();
+        try {
+            List<RID> rids = storage.lookupIndex(spec.indexName(), spec.condition().orElse(null));
+            if (rids == null) {
+                throw new QpException(
+                        ErrorCode.IO_ERROR,
+                        "Storage manager returned null RID list for index: " + spec.indexName());
+            }
+            this.cursor = Optional.of(List.copyOf(rids).iterator());
+        } catch (QpException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new QpException(
+                    ErrorCode.IO_ERROR,
+                    "Failed to lookup index '" + spec.indexName() + "': " + e.getMessage());
+        }
     }
-    @Override protected Optional<RowEnvelope> doNext() {
-        Optional<Rid> rid = cursor.orElseThrow().next();
-        if (rid.isEmpty()) return Optional.empty();
-        StoredRecord record = fetchRecord(rid.get()); 
-        return Optional.of(new RowEnvelope(record.tableId(), record.rid(), record.row()));
+
+    @Override
+    protected Optional<RowEnvelope> doNext() {
+        Iterator<RID> activeCursor = cursor.orElseThrow(
+                () -> new QpException(
+                        ErrorCode.INVALID_STATE,
+                        "IndexScanOperator cursor is not open for index: " + spec.indexName()));
+        if (!activeCursor.hasNext()) {
+            return Optional.empty();
+        }
+        RID nextRid = activeCursor.next();
+        StoredRecord record = fetchRecord(nextRid);
+        return Optional.of(RowEnvelope.of(record.row(), record.rid()));
     }
-    @Override protected void doClose() {
-        Optional<RidCursor> previous = cursor; 
-        cursor = Optional.empty(); 
-        previous.ifPresent(RidCursor::close);
+
+    @Override
+    protected void doClose() {
+        this.cursor = Optional.empty();
     }
-    private StoredRecord fetchRecord(Rid rid) {
-        var context = requireContext();
-        return storage.fetch(spec.tableId(), rid, context, context.requireGrant(spec.tableId(), AccessMode.READ))
-                .orElseThrow(() -> failure("Index points to a missing record"));
+
+    private StoredRecord fetchRecord(RID rid) {
+        if (rid == null) {
+            throw new IllegalArgumentException("RID cannot be null when fetching record in IndexScanOperator");
+        }
+        requireContext();
+        try {
+            Optional<Record> fetched = storage.fetch(spec.tableName(), rid);
+            if (fetched == null || fetched.isEmpty()) {
+                throw new QpException(
+                        ErrorCode.NOT_FOUND,
+                        "Indexed RID not found in table '" + spec.tableName() + "': " + rid);
+            }
+            Record record = fetched.get();
+            return new StoredRecord(record.rid(), Row.of(record.values()));
+        } catch (QpException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new QpException(
+                    ErrorCode.IO_ERROR,
+                    "Failed to fetch record for RID " + rid + " in table '" + spec.tableName() + "': " + e.getMessage());
+        }
     }
 }
