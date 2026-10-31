@@ -14,6 +14,24 @@ public record UpdateSpec(String tableName, Optional<ColumnRef> updateColumn, Opt
         updateExpression = updateExpression == null ? Optional.empty() : updateExpression;
     }
 
+    public UpdateSpec(sqlike.qp.port.QpContracts.TableId tableId, ColumnRef column, sqlike.qp.port.QpContracts.Expr value) {
+        this(tableId != null ? tableId.value() : "",
+             Optional.ofNullable(column),
+             value != null ? Optional.ofNullable(value.value()) : Optional.empty());
+    }
+
+    public sqlike.qp.port.QpContracts.TableId tableId() {
+        return new sqlike.qp.port.QpContracts.TableId(tableName);
+    }
+
+    public ColumnRef column() {
+        return updateColumn.orElseThrow(() -> new IllegalStateException("UpdateSpec missing column"));
+    }
+
+    public sqlike.qp.port.QpContracts.Expr value() {
+        return new sqlike.qp.port.QpContracts.Expr(updateExpression.orElseThrow(() -> new IllegalStateException("UpdateSpec missing expression")));
+    }
+
     public static UpdateSpec fromMutationSpec(MutationSpec mutation) {
         if (mutation == null) {
             throw new IllegalArgumentException("MutationSpec cannot be null");

@@ -23,12 +23,34 @@ public final class SessionState {
         this.executionLock = new ReentrantLock();
     }
 
+    public SessionState() {
+        this(java.util.UUID.randomUUID().toString());
+    }
+
+    public final java.util.concurrent.atomic.AtomicLong sequence = new java.util.concurrent.atomic.AtomicLong();
+
     public String getId() {
         return id;
     }
 
+    public String id() {
+        return id;
+    }
+
+    public sqlike.qp.port.QpContracts.SessionId sessionId() {
+        try {
+            return new sqlike.qp.port.QpContracts.SessionId(java.util.UUID.fromString(id));
+        } catch (Exception e) {
+            return new sqlike.qp.port.QpContracts.SessionId(java.util.UUID.nameUUIDFromBytes(id.getBytes()));
+        }
+    }
+
     public synchronized Optional<Long> getCurrentTxId() {
         return Optional.ofNullable(activeTxId);
+    }
+
+    public synchronized Optional<sqlike.qp.port.QpContracts.TxId> currentTxId() {
+        return getCurrentTxId().map(sqlike.qp.port.QpContracts.TxId::new);
     }
 
     public synchronized boolean isExplicitTransaction() {
@@ -47,6 +69,10 @@ public final class SessionState {
         }
         this.activeTxId = txId;
         this.explicitTransaction = explicit;
+    }
+
+    public synchronized void attachTransaction(sqlike.qp.port.QpContracts.TxId txId, boolean explicit) {
+        attachTransaction(txId.value(), explicit);
     }
 
     public synchronized void clearTransaction() {

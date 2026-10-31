@@ -8,7 +8,6 @@ import sqlike.qo.PlanNodes;
 import sqlike.shared.*;
 import sqlike.qp.port.QpContracts.*;
 import sqlike.qp.stub.*;
-import sqlike.qp.stub.StubRuntime.SessionState;
 import sqlike.qp.stub.StubQueryRunner.Result;
 import static sqlike.qp.port.QpContracts.payload;
 
@@ -76,13 +75,13 @@ public final class Qp5AcceptanceTest {
     private static void beginTransactions() throws Exception {
         TestDatabase database = new TestDatabase();
         Result begin = database.execute("BEGIN;");
-        TxId first = database.session.getCurrentTxId().orElseThrow();
+        TxId first = new TxId(database.session.getCurrentTxId().orElseThrow());
         assertTrue(begin.message().contains("ACTIVE"), begin.message());
         assertTrue(database.trace.contains("FRM.BEGIN." + first.value()), "Missing BEGIN event");
 
         database.execute("ABORT;");
         database.execute("BEGIN TRANSACTION;");
-        TxId second = database.session.getCurrentTxId().orElseThrow();
+        TxId second = new TxId(database.session.getCurrentTxId().orElseThrow());
         assertTrue(second.value() > first.value(), "CCM reused a transaction ID");
         assertTrue(database.trace.contains("FRM.BEGIN." + second.value()), "Missing BEGIN event");
         database.execute("ABORT;");
@@ -184,8 +183,10 @@ public final class Qp5AcceptanceTest {
     }
 
     private static void runProcess(String phase, Path snapshot) throws Exception {
+        String javaBin = Path.of(System.getProperty("java.home"), "bin",
+                System.getProperty("os.name").toLowerCase().contains("win") ? "java.exe" : "java").toString();
         Process process = new ProcessBuilder(
-                Path.of(System.getProperty("java.home"), "bin", "java.exe").toString(),
+                javaBin,
                 "-cp", System.getProperty("java.class.path"),
                 Qp5AcceptanceTest.class.getName(), phase, snapshot.toString())
                 .redirectErrorStream(true).start();
@@ -213,7 +214,7 @@ public final class Qp5AcceptanceTest {
             storage = new StubStorage(snapshot, trace);
             transactions = new StubTransactions(storage, trace);
             if (storage.listTables().isEmpty()) {
-                storage.define(new TableSchema(1, "employees", List.of(
+                storage.define(new TableSchema("1", "employees", List.of(
                         new ColumnSchema("id", DataType.INTEGER, Optional.empty()),
                         new ColumnSchema("salary", DataType.FLOAT, Optional.empty()))));
             }

@@ -3,6 +3,7 @@ package sqlike.qp.stub;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
+import sqlike.shared.AccessStatus;
 import sqlike.qp.port.QpContracts.*;
 import static sqlike.qp.port.QpContracts.failure;
 

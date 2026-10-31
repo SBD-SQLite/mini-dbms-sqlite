@@ -66,7 +66,7 @@ public final class StubQueryRunner {
                     case INSERT -> new InsertExecutor(new InsertSpec(table, new Row(plan.mutation().orElseThrow().insertValues())), mutations);
                     case UPDATE -> new UpdateExecutor(source(plan.children().get(0)), new UpdateSpec(table,
                             plan.mutation().orElseThrow().updateColumn().orElseThrow(), new Expr(plan.mutation().orElseThrow().updateExpression().orElseThrow())),
-                            storage.getSchema(table), new MutationTargetCollector(storage), evaluator, mutations);
+                            storage.getSchema(table), new MutationTargetCollector(storage.getUnderlyingStorage()), evaluator, mutations);
                     case CREATE_INDEX -> new CreateIndexExecutor(new CreateIndexSpec(plan.createIndex().orElseThrow()), storage);
                     default -> throw failure("Unsupported command");
                 }) { count = executor.execute(context); }
@@ -92,11 +92,11 @@ public final class StubQueryRunner {
     }
     private Operator source(PlanNode plan) {
         TableId table = table(plan); Schema schema = storage.getSchema(table);
-        if (plan.kind() == PlanNodeKind.INDEX_SCAN) return new IndexScanOperator(storage, new IndexScanSpec(plan.scan().orElseThrow()), schema);
+        if (plan.kind() == PlanNodeKind.INDEX_SCAN) return new IndexScanOperator(storage.getUnderlyingStorage(), new IndexScanSpec(plan.scan().orElseThrow()), schema);
         if (plan.kind() == PlanNodeKind.SCAN) return new AbstractOperator(schema) {
             private sqlike.qp.port.QpContracts.RecordCursor cursor;
             @Override protected void doOpen() { cursor = storage.scan(table, context, context.requireGrant(table, AccessMode.READ)); }
-            @Override protected Optional<RowEnvelope> doNext() { return cursor.next().map(r -> new RowEnvelope(r.tableId(), r.rid(), r.row())); }
+            @Override protected Optional<RowEnvelope> doNext() { return cursor.next().map(r -> RowEnvelope.of(r.row(), r.rid())); }
             @Override protected void doClose() { if (cursor != null) { cursor.close(); cursor = null; } }
         };
         Operator child = source(plan.children().get(0));
@@ -113,11 +113,11 @@ public final class StubQueryRunner {
         if (plan.kind() != PlanNodeKind.PROJECT) throw failure("STUB QP3: unsupported source " + plan.kind());
         if (plan.projection().size() == 1 && plan.projection().get(0).columnName().equals("*")) return child;
         var offsets = plan.projection().stream().map(schema::offset).toList();
-        var columns = offsets.stream().map(i -> schema.value().columns().get(i)).toList();
-        return new AbstractOperator(new Schema(new TableSchema(schema.value().tableId(), table.value(), columns))) {
+        var columns = offsets.stream().map(i -> schema.getColumn(i)).toList();
+        return new AbstractOperator(Schema.of(table.value(), columns)) {
             @Override protected void doOpen() { child.open(context); }
             @Override protected Optional<RowEnvelope> doNext() {
-                return child.next().map(row -> new RowEnvelope(row.tableId(), row.rid(), new Row(offsets.stream().map(i -> row.row().values().get(i)).toList())));
+                return child.next().map(row -> RowEnvelope.of(new Row(offsets.stream().map(i -> row.row().values().get(i)).toList()), row.rid().orElse(null)));
             }
             @Override protected void doClose() { child.close(); }
         };
