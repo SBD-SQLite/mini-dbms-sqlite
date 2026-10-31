@@ -1,7 +1,8 @@
-package sort;
+package sqlike.qp;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import sqlike.shared.SortSpec;
 
 public class SortOperator extends AbstractUnaryOperator {
     private SortSpec spec;
@@ -33,4 +34,15 @@ public class SortOperator extends AbstractUnaryOperator {
 
     private void materializeInput() {throw new UnsupportedOperationException("Sort belum diimplementasikan");}
 
+}
+
+// shortcut: parent sementara untuk kerangka QP4, ganti saat kontrak parent operator QP2 tersedia.
+class AbstractUnaryOperator {
+    protected Operator child;
+    protected Schema outputSchema;
+
+    protected AbstractUnaryOperator(Operator child, Schema outputSchema) {
+        this.child = child;
+        this.outputSchema = outputSchema;
+    }
 }

@@ -1,7 +1,8 @@
-package join;
+package sqlike.qp;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import sqlike.shared.JoinSpec;
 
 public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
     private JoinSpec spec;

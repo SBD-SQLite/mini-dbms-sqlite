@@ -1,4 +1,4 @@
-package join;
+package sqlike.qp;
 import java.util.List;
 import java.util.Map;
 import java.util.HashMap;
@@ -26,9 +26,9 @@ public class JoinLayout {
         return outputMapping;
     }
 
-    public Row combineForPredicate(RowEnvelope left, RowEnvelope right) {return new Row();}
+    public Row combineForPredicate(RowEnvelope left, RowEnvelope right) {return Row.of(List.of());}
 
-    public RowEnvelope combineForOutput(RowEnvelope left, RowEnvelope right) {return new RowEnvelope();}
+    public RowEnvelope combineForOutput(RowEnvelope left, RowEnvelope right) {return RowEnvelope.of(Row.of(List.of()));}
 
     private Map<String,RecordRef> mergeOrigins(RowEnvelope left, RowEnvelope right) {return new HashMap<String,RecordRef>();}
 
@@ -36,11 +36,4 @@ public class JoinLayout {
 
 }
 
-class Schema {}
-class Row {
-    public Row(){}
-}
-class RowEnvelope{
-    public RowEnvelope(){}
-}
 class RecordRef {}

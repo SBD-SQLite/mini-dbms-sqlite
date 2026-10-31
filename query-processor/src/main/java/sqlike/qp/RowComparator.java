@@ -1,13 +1,15 @@
-package sort;
+package sqlike.qp;
 import java.util.Comparator;
+import sqlike.shared.ColumnRef;
+import sqlike.shared.SortDirection;
 
 public class RowComparator implements Comparator<RowEnvelope> {
     private int keyOffset;
     private SortDirection direction;
     private IValueComparator values;
 
-    public RowComparator(Schema schema, ColumnId column, SortDirection direction, IValueComparator values) {
-        keyOffset = schema.indexOf(column);
+    public RowComparator(Schema schema, ColumnRef column, SortDirection direction, IValueComparator values) {
+        keyOffset = schema.findColumnOffset(column);
         this.direction = direction;
         this.values = values;
     }
