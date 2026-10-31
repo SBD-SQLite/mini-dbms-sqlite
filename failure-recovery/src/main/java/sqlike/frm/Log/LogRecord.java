@@ -1,4 +1,4 @@
-package sqlike.frm.Log;
+package sqlike.frm.log;
 
 import java.time.Instant;
 import java.util.Objects;
