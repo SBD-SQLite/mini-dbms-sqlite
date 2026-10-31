@@ -2,6 +2,7 @@ package sqlike.frm.log;
 import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.locks.ReentrantLock;
+import sqlike.frm.checkpoint.CheckpointInfo;
 
 import sqlike.shared.DataChange;
 
@@ -44,7 +45,7 @@ public class LogManager implements IWalDurability {
     // CheckpointManager yang bakal nyelesaian tahapan checkpoint 
     public CheckpointInfo logCheckpoint(long flushedThroughLSN){
         // TODO : alokasi LSN sama catat penanda checkpoint selesai
-        return new CheckpointInfo(1L, 0L, Instant.EPOCH);
+        return new CheckpointInfo(1L, 0L, Instant.EPOCH, "mock-ss");
     }
 
     @Override 
@@ -72,7 +73,7 @@ public class LogManager implements IWalDurability {
 
     public long getLastLsn() {
         // TODO : Kembaliin LSN terakhir
-        return 0L;
+        return nextLSN - 1L;
     }
 
     public String archiveActiveLog(){
