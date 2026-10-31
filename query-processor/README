@@ -1,1 +1,87 @@
-Query Processor
+# QP5 - QP-10 through QP-13
+
+Java 17+, standard libraries only. INSERT, UPDATE, transaction coordination, and
+index execution contain working QP5 logic. SQL is parsed by the existing QO;
+there is no canned SQL-to-plan stub or duplicate Value/Expression/RID definition.
+All changes in this contribution are confined to `query-processor`.
+
+## Run
+
+From the repository root in PowerShell:
+
+```powershell
+./query-processor/run-tests.ps1
+```
+
+Use `-JdkHome 'C:\path\to\jdk'` to choose a JDK explicitly. The script compiles
+existing QO/CCM sources and QP sources with `--release 17 -Xlint:all -Werror`.
+Build outputs and fixture snapshots go into the system temporary directory.
+Failed compilation or failed checks return a nonzero result. No commit/push is performed.
+
+## Files and boundaries
+
+| Location | Responsibility |
+| --- | --- |
+| `src/main/java/sqlike/qp/` | Six QP5 classes: Insert/Update/CreateIndexExecutor and Transaction/Access/MutationCoordinator. |
+| `IndexScanOperator.java` | QP-13 index lookup then RID fetch; coordinate ownership with QP3 before integration. |
+| `port/QpContracts.java` | Local QP contracts around existing shared types, plus missing dependency interfaces. These are provisional contracts, not stub behavior. |
+| `port/StorageAdapter.java` | Adapts the QP storage API to the existing `sqlike.contract.IStorageManager`. |
+| `src/stubs/.../StubRuntime.java` | STUB ONLY: QP1 session, QP2 bases/expression evaluator, and QP3 target collector. |
+| `src/stubs/.../StubQueryRunner.java` | STUB ONLY: limited single-table QP1/QP2/QP3 wiring, filters/projection, and result formatting. Calls existing QO for arbitrary supported SQL. |
+| `src/stubs/.../StubStorage.java` | STUB ONLY: functional SM fake with transaction overlays, file snapshots, and map-backed indexes. |
+| `src/stubs/.../StubTransactions.java` | STUB ONLY: combined CCM/FRM fake with IDs/states, scripted grants/WAIT/denial, event traces, permits, and rollback. |
+| `src/test/.../Qp5AcceptanceTest.java` | Nine focused QP-10 through QP-13 acceptance scenarios, including separate-process restart. |
+
+Thin wrappers bridge local QP types such as
+`Row`, `Schema`, `Expr`, and `Rid` to existing shared `Value`, `TableSchema`,
+`Expression`, and `RID`. No files in QO, CCM, SM, or FRM were edited/copied.
+
+## Execution rules
+
+- QP1 must serialize each session's commands. The runner demonstrates begin/ensure,
+  access acquisition, execution/resource cleanup, implicit completion, runtime
+  failure rollback, and disconnect cleanup. The real QP1 server/CLI is not supplied.
+- Access is table scoped. WRITE permits the reads needed by UPDATE. CCM owns actual
+  locking and waiting policy; `waitAccess` should block/notify rather than busy-spin.
+- INSERT reserves a RID before authorizing its change. Every mutation sends full
+  before/after images through CCM before applying it with an LSN and apply lease.
+  QP never writes WAL or performs physical rollback itself.
+- UPDATE materializes/deduplicates targets before writes and calculates one SET
+  column from each original row. Counts represent values actually changed; assigning
+  the existing value reports zero. Integer-to-FLOAT assignment is allowed; incompatible
+  types/columns fail. The functional evaluator stub handles the QO expression tree.
+- Only COMMITTED/ABORTED clear session state. Rejected/incomplete completion retains
+  the ID for ABORT/retry. Auto-commit rejection is an error. Runtime failures abort
+  the whole active transaction through CCM. Syntax/plan failures before execution
+  do not silently replace an explicit transaction.
+- Index creation delegates type/table/column to SM. IndexScan calls lookup then
+  RID fetch and never falls back to scan. Automatic index choice remains QO's job.
+
+## What the checks prove
+
+Nine scenarios cover all 16 acceptance bullets of QP-10 through QP-13. Each scenario
+has a named method and explicit result checks. Supported SQL is processed by the
+actual parser and optimizer facade in this branch. The UPDATE persistence check
+launches distinct writer/reader JVMs and verifies committed arithmetic results
+from disk. The test file has no separate demo or unrelated regression scenarios.
+
+Passing means component acceptance with explicitly substituted remaining services.
+It does not certify full-system ACID/WAL, real SM pages/B+Tree, or multi-client
+isolation. The existing QO Binder/CostModel and parts of access-path optimization
+are still placeholders; this contribution does not claim to complete them.
+IndexScan is tested with an actual QO `PlanNodes.indexScan` plan because automatic
+index selection is not available yet. The real CLI's rendering is represented by
+the runner's tested result messages.
+
+Stub SM persists committed overlays through a flushed, atomically replaced fixture
+snapshot and a transaction-sequence sidecar. Rollback discards only that transaction's
+overlay. HASH uses maps; BPLUS_TREE range behavior examines indexed keys in a map,
+not a B+Tree algorithm. Only committed index definitions are searchable in this fake.
+Snapshots use bounded Java `writeUTF` strings. No persistent WAL/crash recovery is
+implemented. The optional `TransactionScope` adapter hook exists only for fixture
+overlays; a real SM uses the agreed concurrency/recovery protocol.
+
+Before integration, reconcile the provisional QP concurrency port with CCM's final
+API, replace the four explicit stub files with the owning teams' implementations,
+and coordinate IndexScan with QP3. Re-run these scenarios against real dependencies.
+This submission does not complete the whole QP, reports, or a milestone release.
