@@ -490,5 +490,9 @@ public class QP3TestDriver {
         @Override
         public void flushAll() {
         }
+
+        @Override
+        public void close() {
+        }
     }
 }

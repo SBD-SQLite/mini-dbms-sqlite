@@ -1,33 +1,32 @@
 package sqlike.qp;
-
+import java.nio.charset.StandardCharsets;
+import java.util.Objects;
 import sqlike.shared.Value;
 
-/**
- * RowSizeEstimator stub matching CLASS DIAGRAM FIX (owned by QP4 role).
- * Provided as a mock placeholder for Milestone 1 dependency wiring.
- */
 public class RowSizeEstimator {
-    public RowSizeEstimator() {
-        // TODO(M1-MOCK): Default constructor
-    }
+
+    public RowSizeEstimator() {}
 
     public long estimate(RowEnvelope row) {
-        // TODO(M1-MOCK): Estimate total byte size of row values
-        if (row == null || row.row() == null) return 0L;
-        long total = 0L;
-        for (Value v : row.row().values()) {
-            total += valueBytes(v);
+        Objects.requireNonNull(row);
+        long bytes = 16;
+        for (Value value : row.row().values()) {
+            bytes = Math.addExact(bytes, 4 + valueBytes(value));
         }
-        return total;
+        return Math.addExact(bytes, row.rid().isPresent() ? 16 : 0);
     }
 
     private long valueBytes(Value value) {
-        // TODO(M1-MOCK): Estimate bytes per value based on DataType
-        if (value == null) return 0L;
         return switch (value.type()) {
-            case INTEGER -> 4L;
-            case FLOAT -> 8L;
-            case CHAR, VARCHAR -> value.textValue().map(s -> (long) s.length()).orElse(0L);
+            case INTEGER -> { value.integerValue().orElseThrow(); yield 4; }
+            case FLOAT -> {
+                if (!Double.isFinite(value.floatValue().orElseThrow())) {
+                    throw new IllegalArgumentException("Non-finite value cannot be estimated");
+                }
+                yield 8;
+            }
+            case CHAR, VARCHAR -> 4L + value.textValue().orElseThrow().getBytes(StandardCharsets.UTF_8).length;
         };
     }
+
 }

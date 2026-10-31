@@ -12,38 +12,38 @@ import sqlike.shared.RecordImage;
 import sqlike.shared.TableSchema;
 import sqlike.shared.TableStatistics;
 import sqlike.shared.Value;
+import sqlike.storage.StorageException;
 
-/**
- * Storage Manager contract interface from SQLike supergroup specification.
- */
 public interface IStorageManager {
-    RecordCursor scan(String table) throws Exception;
+    RecordCursor scan(String table) throws StorageException;
 
-    Optional<Record> fetch(String table, RID rid) throws Exception;
+    Optional<Record> fetch(String table, RID rid) throws StorageException;
 
-    InsertReservation reserveInsert(String table, List<Value> values) throws Exception;
+    InsertReservation reserveInsert(String table, List<Value> values) throws StorageException;
 
-    RID insert(InsertReservation reservation, long lsn) throws Exception;
+    RID insert(InsertReservation reservation, long lsn) throws StorageException;
 
-    void update(String table, RID rid, List<Value> values, long lsn) throws Exception;
+    void update(String table, RID rid, List<Value> values, long lsn) throws StorageException;
 
-    void delete(String table, RID rid, long lsn) throws Exception;
+    void delete(String table, RID rid, long lsn) throws StorageException;
 
-    void releaseReservation(InsertReservation reservation) throws Exception;
+    void releaseReservation(InsertReservation reservation) throws StorageException;
 
-    void restoreRecord(String table, RID rid, RecordImage image, long lsn) throws Exception;
+    void restoreRecord(String table, RID rid, RecordImage image, long lsn) throws StorageException;
 
-    List<String> listTables() throws Exception;
+    List<String> listTables() throws StorageException;
 
-    TableSchema getSchema(String table) throws Exception;
+    TableSchema getSchema(String table) throws StorageException;
 
-    TableStatistics getStatistics(String table) throws Exception;
+    TableStatistics getStatistics(String table) throws StorageException;
 
-    void createIndex(IndexMetadata definition) throws Exception;
+    void createIndex(IndexMetadata definition) throws StorageException;
 
-    List<IndexMetadata> getIndexes(String table) throws Exception;
+    List<IndexMetadata> getIndexes(String table) throws StorageException;
 
-    List<RID> lookupIndex(String name, IndexCondition condition) throws Exception;
+    List<RID> lookupIndex(String name, IndexCondition condition) throws StorageException;
 
-    void flushAll() throws Exception;
+    void flushAll() throws StorageException;
+
+    void close() throws StorageException;
 }
