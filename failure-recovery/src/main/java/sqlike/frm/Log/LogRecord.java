@@ -1,11 +1,11 @@
-package sqlike.frm.Log;
+package sqlike.frm.log;
 
 import java.time.Instant;
 import java.util.Objects;
 import java.util.Optional;
 import sqlike.shared.DataChange;
+import sqlike.frm.checkpoint.CheckpointInfo;
 
-// CheckpointInfo belum ada
 public record LogRecord(long lsn, Instant time, Optional<Long> txID, LogType type, Optional<DataChange> change, Optional<CheckpointInfo> checkpoint){
     public LogRecord{
         if (lsn <= 0) throw new IllegalArgumentException("LSN harus positif!");

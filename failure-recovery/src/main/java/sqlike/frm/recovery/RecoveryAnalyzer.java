@@ -2,43 +2,28 @@ package sqlike.frm.recovery;
 
 import sqlike.frm.Log.LogRecord;
 import sqlike.frm.model.RecoveryPlan;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 
-/**
- * FR5: Bertanggung jawab melakukan fase ANALYSIS.
- * Membaca log mundur/maju, mencari checkpoint terakhir, dan menentukan status transaksi.
- */
 public class RecoveryAnalyzer {
-
-    public RecoveryAnalyzer() {
-        // TODO: Inisialisasi jika diperlukan
-    }
-
-    /**
-     * Menganalisis seluruh catatan log untuk membangun RecoveryPlan.
-     */
+    
     public RecoveryPlan analyze(List<LogRecord> records) {
-        // TODO: Panggil findLastCheckpoint() dan classify()
-        // TODO: Tentukan startLsn (dari checkpoint + 1, atau awal log jika tidak ada)
-        throw new UnsupportedOperationException("TODO: Implementasi analyze()");
-    }
-
-    /**
-     * Mencari penanda CHECKPOINT terakhir yang selesai.
-     */
-    private LogRecord findLastCheckpoint(List<LogRecord> records) {
-        // TODO: Iterasi log dari belakang, cari LogType.CHECKPOINT
-        throw new UnsupportedOperationException("TODO: Implementasi findLastCheckpoint()");
-    }
-
-    /**
-     * Mengklasifikasikan transaksi: committed, aborted, atau uncommitted (aktif saat crash).
-     */
-    private RecoveryPlan classify(List<LogRecord> records, int startLsn) {
-        // TODO: Tentukan transaksi mana yang punya COMMIT, ABORT, atau tidak punya keduanya.
-        // TODO: Transaksi tanpa COMMIT/ABORT adalah uncommitted, dan masuk ke dalam list undoChanges.
-        // TODO: Transaksi committed masuk ke list redoChanges.
-        // TODO: Cari maxTxId tertinggi dari seluruh log.
-        throw new UnsupportedOperationException("TODO: Implementasi classify()");
+        RecoveryPlan plan = new RecoveryPlan();
+        plan.startLsn = 0;
+        plan.checkpointLsn = null;
+        plan.committedTx = new HashSet<>();
+        plan.uncommittedTx = new HashSet<>();
+        plan.needsAbortTx = new HashSet<>();
+        plan.undoChanges = Collections.emptyList();
+        plan.redoChanges = Collections.emptyList();
+        plan.maxTxId = 0;
+        
+        // TODO: Implementasi findLastCheckpoint() untuk mencari CHECKPOINT terakhir
+        // TODO: Implementasi classify() untuk menentukan status transaksi
+        // CATATAN: Transaksi yang memiliki ABORT tapi belum sampai ke disk juga harus masuk ke uncommittedTx (perlu di-undo)
+        // CATATAN: txOutcome dihitung dari SELURUH log, sedangkan redo/undoChanges hanya dihitung dari startLsn
+        
+        return plan;
     }
 }

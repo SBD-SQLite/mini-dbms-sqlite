@@ -1,16 +1,18 @@
 package sqlike.frm.model;
 
-// Laporan status akhir setelah proses crash recovery selesai
+import sqlike.frm.RecoveryError;
+import sqlike.frm.TxOutcome;
+import java.util.Map;
+
 public class RecoveryReport {
     public boolean success;
-    public String errorCode;
+    public RecoveryError errorCode; 
     public String errorMessage;
-    public int checkpointLsn;
+    public Integer checkpointLsn;   
     public int committedCount;
     public int undoCount;
     public int redoCount;
     public int lastLsn;
     public int maxTxId;
-
-    // TODO: Sesuaikan constructor atau getter/setter jika diperlukan
+    public Map<Integer, TxOutcome> txOutcome; 
 }
