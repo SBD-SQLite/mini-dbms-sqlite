@@ -1,87 +1,159 @@
-# QP5 - QP-10 through QP-13
+# Query Processor (QP) - SQLike DBMS
 
-Java 17+, standard libraries only. INSERT, UPDATE, transaction coordination, and
-index execution contain working QP5 logic. SQL is parsed by the existing QO;
-there is no canned SQL-to-plan stub or duplicate Value/Expression/RID definition.
-All changes in this contribution are confined to `query-processor`.
+Komponen **Query Processor (QP)** adalah mesin eksekusi kueri utama pada sistem mini-DBMS **SQLike**. Query Processor bertugas menerima perintah SQL atau pohon rencana kueri (*Query Plan*) dari **Query Optimizer (QO)**, mengoordinasikan transaksi dan izin akses bersama **Concurrency Control Manager (CCM)**, serta mengeksekusi operasi baca-tulis fisik ke disk melalui **Storage Manager (SM)**.
 
-## Run
+---
 
-From the repository root in PowerShell:
+## 1. Arsitektur dan Pembagian Modul (QP1 - QP5)
 
-```powershell
-./query-processor/run-tests.ps1
+Arsitektur Query Processor dirancang modular dengan membagi tanggung jawab ke dalam 5 sub-komponen:
+
+```
+                  +-----------------------------------+
+                  |         Client Terminal           |
+                  +-----------------------------------+
+                                    |
+                                    v
++-------------------------------------------------------------------------+
+|                         QUERY PROCESSOR (QP)                            |
+|                                                                         |
+|  [QP1] Query Processor Facade & Client Connection                       |
+|        - QueryProcessor, SessionManager, StatementReader, ResultPrinter |
+|                                   |                                     |
+|                                   v                                     |
+|  [QP2] Plan Translator & Expression Evaluator                           |
+|        - PlanTranslator, PlanValidator                                  |
+|        - ExpressionEvaluator, ValueComparator                           |
+|                                   |                                     |
+|        +--------------------------+--------------------------+          |
+|        | (SELECT Queries)                                    | (DML/DDL)|
+|        v                                                     v          |
+|  [QP4 & QP5] Relational & Sort Operators       [QP3 & QP5] DML Executors|
+|        - TableScan, IndexScan (QP3)            - InsertExecutor         |
+|        - FilterOperator, ProjectOperator (QP4) - UpdateExecutor         |
+|        - BlockNestedLoopJoinOperator (QP4)     - DeleteExecutor         |
+|        - SortOperator (QP5)                    - CreateIndexExecutor    |
+|                                   |                                     |
+|                                   v                                     |
+|  [QP1 & QP5] Coordination Layer                                         |
+|        - TransactionCoordinator, AccessCoordinator, MutationCoordinator|
++-------------------------------------------------------------------------+
+            |                                           |
+            v                                           v
++-----------------------+                   +-----------------------+
+|  Concurrency Control  |                   |    Storage Manager    |
+|      (CCM / FRM)      |                   |         (SM)          |
++-----------------------+                   +-----------------------+
 ```
 
-Use `-JdkHome 'C:\path\to\jdk'` to choose a JDK explicitly. The script compiles
-existing QO/CCM sources and QP sources with `--release 17 -Xlint:all -Werror`.
-Build outputs and fixture snapshots go into the system temporary directory.
-Failed compilation or failed checks return a nonzero result. No commit/push is performed.
+### Rincian Tanggung Jawab Peran:
+- **QP1 — Coordinator & Client Session:**  
+  Mengelola koneksi dan status sesi klien (`SessionManager`, `SessionState`), membaca batch statement (`StatementReader`), mencetak format keluaran kueri (`ResultPrinter`), dan mengorkestrasi eksekusi statement melalui *facade* `QueryProcessor`.
+- **QP2 — Plan Translator & Expression Evaluator:**  
+  Menerjemahkan 11 simpul pohon rencana (`PlanNode` dari QO) menjadi rantai iterator fisik (`Operator`) atau pelaksana perintah (`CommandExecutor`), memvalidasi struktur pohon dan mencegah siklus eksekusi (`PlanValidator`), serta mengevaluasi ekspresi skalar, perbandingan kondisi, dan promosi numerik (`ExpressionEvaluator`, `ValueComparator`).
+- **QP3 — Access Methods & Physical Scan:**  
+  Menyediakan operator pembacaan data baris dari penyimpanan fisik tabel (`TableScanOperator`) dan traversal indeks (`IndexScanOperator`).
+- **QP4 — Relational Operators (Filter, Project, Join):**  
+  Mengimplementasikan operator aljabar relasional: penyaringan predikat baris (`FilterOperator`), pemotongan kolom (`ProjectOperator`), dan penggabungan multi-tabel (`BlockNestedLoopJoinOperator`).
+- **QP5 — Sorting, DML, & Mutation Coordination:**  
+  Mengimplementasikan pengurutan baris data (`SortOperator`), eksekutor mutasi penyimpanan (`InsertExecutor`, `UpdateExecutor`, `DeleteExecutor`, `CreateIndexExecutor`), dan sinkronisasi hak tulis transaksi (`MutationCoordinator`, `AccessCoordinator`).
 
-## Files and boundaries
+---
 
-| Location | Responsibility |
-| --- | --- |
-| `src/main/java/sqlike/qp/` | Six QP5 classes: Insert/Update/CreateIndexExecutor and Transaction/Access/MutationCoordinator. |
-| `IndexScanOperator.java` | QP-13 index lookup then RID fetch; coordinate ownership with QP3 before integration. |
-| `port/QpContracts.java` | Local QP contracts around existing shared types, plus missing dependency interfaces. These are provisional contracts, not stub behavior. |
-| `port/StorageAdapter.java` | Adapts the QP storage API to the existing `sqlike.contract.IStorageManager`. |
-| `src/stubs/.../StubRuntime.java` | STUB ONLY: QP1 session, QP2 bases/expression evaluator, and QP3 target collector. |
-| `src/stubs/.../StubQueryRunner.java` | STUB ONLY: limited single-table QP1/QP2/QP3 wiring, filters/projection, and result formatting. Calls existing QO for arbitrary supported SQL. |
-| `src/stubs/.../StubStorage.java` | STUB ONLY: functional SM fake with transaction overlays, file snapshots, and map-backed indexes. |
-| `src/stubs/.../StubTransactions.java` | STUB ONLY: combined CCM/FRM fake with IDs/states, scripted grants/WAIT/denial, event traces, permits, and rollback. |
-| `src/test/.../Qp5AcceptanceTest.java` | Nine focused QP-10 through QP-13 acceptance scenarios, including separate-process restart. |
+## 2. Struktur Direktori
 
-Thin wrappers bridge local QP types such as
-`Row`, `Schema`, `Expr`, and `Rid` to existing shared `Value`, `TableSchema`,
-`Expression`, and `RID`. No files in QO, CCM, SM, or FRM were edited/copied.
+```
+query-processor/
+├── docs/                               # Diagram arsitektur & Class Diagram QP
+│   ├── qp-class-diagram.draw.io
+│   └── qp-class-diagram.draw.io.png
+├── src/
+│   ├── main/java/sqlike/
+│   │   ├── contract/                   # Kontrak antarmuka lintas komponen
+│   │   │   ├── IStorageManager.java
+│   │   │   ├── IConcurrencyControlManager.java
+│   │   │   ├── IQueryOptimizer.java
+│   │   │   └── IQueryProcessor.java
+│   │   ├── shared/                     # DTO & Tipe data bersama Supergroup
+│   │   │   ├── PlanNode.java, Expression.java, QueryResult.java, Record.java, dll.
+│   │   └── qp/                         # Implementasi Inti Query Processor
+│   │       ├── QueryProcessor.java     # (QP1) Facade eksekusi
+│   │       ├── SessionManager.java     # (QP1) Manajemen sesi klien
+│   │       ├── PlanTranslator.java     # (QP2) Penerjemah pohon QO -> Operator QP
+│   │       ├── PlanValidator.java      # (QP2) Validator pohon & deteksi siklus
+│   │       ├── ExpressionEvaluator.java# (QP2) Evaluasi rumus & kondisi
+│   │       ├── ValueComparator.java    # (QP2) Komparasi tipe data & string UTF-8
+│   │       ├── TableScanOperator.java  # (QP3) Scan sekuensial tabel
+│   │       ├── IndexScanOperator.java  # (QP3) Scan menggunakan indeks
+│   │       ├── FilterOperator.java     # (QP4) Penyaringan baris data
+│   │       ├── ProjectOperator.java    # (QP4) Proyeksi kolom hasil
+│   │       ├── BlockNestedLoopJoinOperator.java # (QP4) Operasi Join antar-tabel
+│   │       ├── SortOperator.java       # (QP5) Pengurutan baris (ASC/DESC)
+│   │       ├── InsertExecutor.java     # (QP5) Eksekusi INSERT
+│   │       ├── UpdateExecutor.java     # (QP5) Eksekusi UPDATE
+│   │       ├── DeleteExecutor.java     # (QP5) Eksekusi DELETE
+│   │       └── MutationCoordinator.java# (QP5) Koordinasi mutasi & concurrency lease
+│   └── test/java/sqlike/qp/            # Test Driver & Verifikasi Unit Test
+│       ├── QP1Driver.java              # Driver interaktif & pengujian sesi QP1
+│       ├── QP2TestDriver.java          # Pengujian translasi, validasi, dan ekspresi QP2 (39 tes)
+│       ├── QP3TestDriver.java          # Pengujian akses data baris QP3
+│       ├── QP4TestDriver.java          # Pengujian operator Join, Filter, Sort QP4
+│       └── Qp5AcceptanceTest.java      # Pengujian skenario transaksi tulis QP5
+└── run-tests.sh                        # Skrip pengujian otomatis universal (Bash / Linux / macOS)
+```
 
-## Execution rules
+---
 
-- QP1 must serialize each session's commands. The runner demonstrates begin/ensure,
-  access acquisition, execution/resource cleanup, implicit completion, runtime
-  failure rollback, and disconnect cleanup. The real QP1 server/CLI is not supplied.
-- Access is table scoped. WRITE permits the reads needed by UPDATE. CCM owns actual
-  locking and waiting policy; `waitAccess` should block/notify rather than busy-spin.
-- INSERT reserves a RID before authorizing its change. Every mutation sends full
-  before/after images through CCM before applying it with an LSN and apply lease.
-  QP never writes WAL or performs physical rollback itself.
-- UPDATE materializes/deduplicates targets before writes and calculates one SET
-  column from each original row. Counts represent values actually changed; assigning
-  the existing value reports zero. Integer-to-FLOAT assignment is allowed; incompatible
-  types/columns fail. The functional evaluator stub handles the QO expression tree.
-- Only COMMITTED/ABORTED clear session state. Rejected/incomplete completion retains
-  the ID for ABORT/retry. Auto-commit rejection is an error. Runtime failures abort
-  the whole active transaction through CCM. Syntax/plan failures before execution
-  do not silently replace an explicit transaction.
-- Index creation delegates type/table/column to SM. IndexScan calls lookup then
-  RID fetch and never falls back to scan. Automatic index choice remains QO's job.
+## 3. Batasan dan Status Milestone 1 (M1-MOCK)
 
-## What the checks prove
+Sesuai panduan kontrak Milestone 1:
+1. **Compilable Baseline:** Seluruh kontrak antarmuka dan metode konkret wajib memiliki implementasi dasar/tiruan (*mock/stub*) yang dapat dikompilasi dengan nol error/warning.
+2. **Komentar Penanda:** Setiap method konkret yang belum mengimplementasikan algoritma disk penuh ditandai dengan komentar `// TODO(M1-MOCK)` untuk memudahkan penggantian dengan algoritma fisik riil pada Milestone 2.
+3. **Logika In-Memory Mandiri:** Evaluasi ekspresi skalar, perbandingan tipe data, translasi 11 node kueri, dan navigasi sesi klien sudah berfungsi penuh dalam memori.
 
-Nine scenarios cover all 16 acceptance bullets of QP-10 through QP-13. Each scenario
-has a named method and explicit result checks. Supported SQL is processed by the
-actual parser and optimizer facade in this branch. The UPDATE persistence check
-launches distinct writer/reader JVMs and verifies committed arithmetic results
-from disk. The test file has no separate demo or unrelated regression scenarios.
+---
 
-Passing means component acceptance with explicitly substituted remaining services.
-It does not certify full-system ACID/WAL, real SM pages/B+Tree, or multi-client
-isolation. The existing QO Binder/CostModel and parts of access-path optimization
-are still placeholders; this contribution does not claim to complete them.
-IndexScan is tested with an actual QO `PlanNodes.indexScan` plan because automatic
-index selection is not available yet. The real CLI's rendering is represented by
-the runner's tested result messages.
+## 4. Cara Kompilasi dan Menjalankan Tes
 
-Stub SM persists committed overlays through a flushed, atomically replaced fixture
-snapshot and a transaction-sequence sidecar. Rollback discards only that transaction's
-overlay. HASH uses maps; BPLUS_TREE range behavior examines indexed keys in a map,
-not a B+Tree algorithm. Only committed index definitions are searchable in this fake.
-Snapshots use bounded Java `writeUTF` strings. No persistent WAL/crash recovery is
-implemented. The optional `TransactionScope` adapter hook exists only for fixture
-overlays; a real SM uses the agreed concurrency/recovery protocol.
+### Persyaratan Lingkungan:
+- **Java Development Kit (JDK):** Versi 17 atau yang lebih baru (disarankan OpenJDK 17 atau 21).
+- **Sistem Operasi:** Linux / macOS / Windows (via Git Bash / WSL).
 
-Before integration, reconcile the provisional QP concurrency port with CCM's final
-API, replace the four explicit stub files with the owning teams' implementations,
-and coordinate IndexScan with QP3. Re-run these scenarios against real dependencies.
-This submission does not complete the whole QP, reports, or a milestone release.
+### A. Menggunakan Skrip Otomatis
+
+Cukup jalankan satu perintah dari root repositori:
+```bash
+./query-processor/run-tests.sh
+```
+Atau uji per-komponen secara spesifik:
+```bash
+./query-processor/run-tests.sh qp2     # Menjalankan 39 unit test PlanTranslator & Evaluator
+./query-processor/run-tests.sh qp1     # Menjalankan skenario otomatis QP1
+./query-processor/run-tests.sh qp4     # Menjalankan test operator QP4
+```
+
+### B. Menjalankan Manual
+
+1. **Kompilasi Seluruh Komponen QP:**
+   ```bash
+   javac -d out/classes $(find concurrency-control/src/main/java query-processor/src/main/java query-processor/src/test/java -name "*.java")
+   ```
+
+2. **Menjalankan Driver Pengujian QP2:**
+   ```bash
+   java -cp out/classes sqlike.qp.QP2TestDriver
+   ```
+
+3. **Menjalankan Driver Pengujian QP1:**
+   ```bash
+   java -cp out/classes sqlike.qp.QP1Driver --test
+   ```
+
+---
+
+## 5. Rencana Pengembangan Milestone 2 (MS2)
+
+1. **Penyambungan Operator Fisik Riil:** Menggantikan `MockOperator` pada `PlanTranslator` dengan instansiasi riil dari `TableScanOperator`, `BlockNestedLoopJoinOperator`, dan `SortOperator`.
+2. **Penyelarasan Tipe Data Lintas Anggota:** Mengonsolidasikan port sementara `QpContracts` ke tipe kanonik `sqlike.qp.*` dan `sqlike.shared.*` agar seluruh sub-komponen terhubung sempurna tanpa duplikasi.
+3. **Integrasi Transaksi ACID Nyata:** Menghubungkan `TransactionCoordinator` dengan `IConcurrencyControlManager` dan `IFailureRecoveryManager` riil untuk pengelolaan lock dan persistensi log transaksi ke WAL.
+4. **Integrasi Storage Manager:** Menghubungkan pembacaan record dan B-Tree Index langsung ke berkas penyimpanan fisik disk.
