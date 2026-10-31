@@ -18,6 +18,7 @@ public class QueryOptimizer implements IQueryOptimizer {
     private final Lexer lexer;
     private final QueryParser queryParser;
     private final Binder binder;
+    private final SelectionProjectionRewriter selectionProjectionRewriter;
     private final JoinAccessPathOptimizer optimizer;
     private final CostModel costModel;
     private final PlanPrinter printer;
@@ -28,6 +29,7 @@ public class QueryOptimizer implements IQueryOptimizer {
         this.lexer = new Lexer();
         this.queryParser = new QueryParser(new SelectParser(expr), new StatementParser());
         this.binder = new Binder(storage);
+        this.selectionProjectionRewriter = new SelectionProjectionRewriter();
         this.optimizer = new JoinAccessPathOptimizer();
         this.costModel = new CostModel(storage);
         this.printer = new PlanPrinter();
@@ -47,7 +49,8 @@ public class QueryOptimizer implements IQueryOptimizer {
         if (st == StatementType.BEGIN || st == StatementType.COMMIT || st == StatementType.ABORT)
             throw QoErrors.invalidState("transaction statements are not optimized (" + st + ")");
         PlanNode bound = binder.bind(query);
-        PlanNode best = optimizer.optimize(bound);
+        PlanNode rewritten = selectionProjectionRewriter.rewrite(bound);
+        PlanNode best = optimizer.optimize(rewritten);
         return new QueryPlan(best, costModel.getCost(best));
     }
 
