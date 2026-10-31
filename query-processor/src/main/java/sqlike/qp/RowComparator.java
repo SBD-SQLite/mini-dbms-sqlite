@@ -1,5 +1,6 @@
 package sqlike.qp;
 import java.util.Comparator;
+import java.util.Objects;
 import sqlike.shared.ColumnRef;
 import sqlike.shared.SortDirection;
 
@@ -9,9 +10,9 @@ public class RowComparator implements Comparator<RowEnvelope> {
     private IValueComparator values;
 
     public RowComparator(Schema schema, ColumnRef column, SortDirection direction, IValueComparator values) {
-        keyOffset = schema.findColumnOffset(column);
-        this.direction = direction;
-        this.values = values;
+        keyOffset = Objects.requireNonNull(schema).findColumnOffset(column);
+        this.direction = direction == null ? SortDirection.ASC : direction;
+        this.values = Objects.requireNonNull(values);
     }
 
     public int getKeyOffset() {
@@ -27,6 +28,9 @@ public class RowComparator implements Comparator<RowEnvelope> {
     }
 
     @Override
-    public int compare(RowEnvelope left, RowEnvelope right) {throw new UnsupportedOperationException("Perbandingan row belum diimplementasikan");}
+    public int compare(RowEnvelope left, RowEnvelope right) {
+        int result = Integer.signum(values.compare(left.row().getValue(keyOffset), right.row().getValue(keyOffset)));
+        return direction == SortDirection.DESC ? -result : result;
+    }
 
 }

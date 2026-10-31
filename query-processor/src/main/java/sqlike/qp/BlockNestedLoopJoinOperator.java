@@ -1,9 +1,14 @@
 package sqlike.qp;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
+import sqlike.shared.ErrorCode;
+import sqlike.shared.JoinAlgorithm;
 import sqlike.shared.JoinSpec;
+import sqlike.shared.JoinType;
 
+/** shortcut: M1 uses registered output rows, execute BNLJ against children in the next milestone. */
 public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
     private JoinSpec spec;
     private JoinLayout layout;
@@ -17,14 +22,32 @@ public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
     private long batchBytes;
     private long maxOuterBytes;
     private boolean outerEnded;
+    private List<RowEnvelope> mockRows;
+    private int mockPosition;
 
     public BlockNestedLoopJoinOperator(Operator left, Operator right, JoinSpec spec, JoinLayout layout, IExpressionEvaluator evaluator, IValueComparator comparator, RowSizeEstimator estimator, Schema schema) {
         super(left, right, schema);
-        this.spec = spec;
-        this.layout = layout;
-        this.evaluator = evaluator;
-        this.comparator = comparator;
-        this.estimator = estimator;
+        this.spec = Objects.requireNonNull(spec);
+        this.layout = Objects.requireNonNull(layout);
+        this.evaluator = Objects.requireNonNull(evaluator);
+        this.comparator = Objects.requireNonNull(comparator);
+        this.estimator = Objects.requireNonNull(estimator);
+        if (spec.algorithm() != JoinAlgorithm.BLOCK_NESTED_LOOP || spec.joinType() == null
+                || !schema.equals(layout.getOutputSchema())) {
+            throw new IllegalArgumentException("Join fixture requires BNLJ and the layout output schema");
+        }
+        if (spec.joinType() == JoinType.THETA && spec.condition().isEmpty()) {
+            throw new IllegalArgumentException("THETA fixture requires a bound join condition");
+        }
+        var columns = new ArrayList<>(left.schema().columns());
+        columns.addAll(right.schema().columns());
+        if (!columns.equals(layout.getInputSchema().columns())) {
+            throw new IllegalArgumentException("Join layout must match both child schemas");
+        }
+        for (String column : spec.commonColumns()) {
+            left.schema().findColumnOffset(null, column);
+            right.schema().findColumnOffset(null, column);
+        }
         outerBatch = new ArrayList<>();
         pendingOuter = Optional.empty();
         currentInner = Optional.empty();
@@ -54,32 +77,62 @@ public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
         return estimator;
     }
 
-    protected void doOpen() {throw new UnsupportedOperationException("BNLJ belum diimplementasikan");}
+    public void setMockRows(List<RowEnvelope> rows) {
+        if (getState() != OperatorState.NEW && getState() != OperatorState.CLOSED) {
+            throw new QpException(ErrorCode.INVALID_STATE, "Close join before changing its fixture");
+        }
+        List<RowEnvelope> copy = List.copyOf(rows);
+        for (RowEnvelope row : copy) {
+            if (row.row().size() != schema().columnCount() || row.rid().isPresent()) {
+                throw new IllegalArgumentException("Join fixture requires output-width rows without a physical RID");
+            }
+        }
+        mockRows = copy;
+    }
 
-    protected Optional<RowEnvelope> doNext() {throw new UnsupportedOperationException("BNLJ belum diimplementasikan");}
+    @Override
+    protected void doOpen() {
+        if (mockRows == null) {
+            throw new QpException(ErrorCode.INVALID_STATE, "Register M1 join rows before open");
+        }
+        clearBatch();
+        pendingOuter = Optional.empty();
+        currentInner = Optional.empty();
+        outerEnded = false;
+        mockPosition = 0;
+        super.doOpen();
+    }
 
-    protected void doClose() {throw new UnsupportedOperationException("BNLJ belum diimplementasikan");}
+    @Override
+    protected Optional<RowEnvelope> doNext() {
+        return mockPosition < mockRows.size() ? Optional.of(mockRows.get(mockPosition++)) : Optional.empty();
+    }
 
-    private boolean fillOuterBatch() {throw new UnsupportedOperationException("BNLJ belum diimplementasikan");}
+    @Override
+    protected void doClose() {
+        try {
+            super.doClose();
+        } finally {
+            clearBatch();
+            pendingOuter = Optional.empty();
+            currentInner = Optional.empty();
+            mockPosition = 0;
+            outerEnded = false;
+        }
+    }
 
-    private void reopenInner() {throw new UnsupportedOperationException("BNLJ belum diimplementasikan");}
+    // shortcut: helper algoritma masih dummy M1, aktifkan saat BNLJ penuh mulai dikerjakan.
+    private boolean fillOuterBatch() {return false;}
 
-    private boolean matches(RowEnvelope left, RowEnvelope right) {throw new UnsupportedOperationException("BNLJ belum diimplementasikan");}
+    private void reopenInner() {}
 
-    private boolean naturalMatches(RowEnvelope left, RowEnvelope right) {throw new UnsupportedOperationException("BNLJ belum diimplementasikan");}
+    private boolean matches(RowEnvelope left, RowEnvelope right) {return false;}
 
-    private void clearBatch() {throw new UnsupportedOperationException("BNLJ belum diimplementasikan");}
+    private boolean naturalMatches(RowEnvelope left, RowEnvelope right) {return false;}
 
-}
-
-class AbstractBinaryOperator {
-    protected Operator left;
-    protected Operator right;
-    protected Schema outputSchema;
-
-    protected AbstractBinaryOperator(Operator left, Operator right, Schema outputSchema) {
-        this.left = left;
-        this.right = right;
-        this.outputSchema = outputSchema;
+    private void clearBatch() {
+        outerBatch.clear();
+        batchBytes = 0;
+        outerIndex = 0;
     }
 }
