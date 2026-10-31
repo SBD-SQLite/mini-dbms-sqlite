@@ -14,7 +14,7 @@ import sqlike.shared.*;
  * JoinAccessPathOptimizer (QO3/QO5) and ExpressionParser/StatementParser (QO2) are MOCK placeholders.
  */
 public class QueryOptimizer implements IQueryOptimizer {
-    private final IStorageManager storage;
+
     private final Lexer lexer;
     private final QueryParser queryParser;
     private final Binder binder;
@@ -24,7 +24,7 @@ public class QueryOptimizer implements IQueryOptimizer {
     private final PlanPrinter printer;
 
     public QueryOptimizer(IStorageManager storage) {
-        this.storage = storage;
+        if (storage == null) throw new IllegalArgumentException("storage is required");
         ExpressionParser expr = new ExpressionParser();
         this.lexer = new Lexer();
         this.queryParser = new QueryParser(new SelectParser(expr), new StatementParser());
