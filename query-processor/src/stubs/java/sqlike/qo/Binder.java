@@ -82,7 +82,7 @@ public final class Binder {
                 if (ref.tableName().isPresent() && outputs.size() == expandedBefore)
                     throw QoErrors.semantic("table '" + ref.tableName().get() + "' has no visible columns");
             } else {
-                ColumnRef resolved = resolve(ref, scope(child));
+                ColumnRef resolved = resolveInChild(ref, child);
                 ColumnSchema column = columnSchema(resolved);
                 bound.add(resolved);
                 outputs.add(new ResultColumn(resolved.columnName(), Optional.of(resolved), column.dataType()));
@@ -123,9 +123,21 @@ public final class Binder {
     private PlanNode bindSort(PlanNode node) {
         PlanNode child = bindNode(node.children().get(0));
         SortSpec sort = node.sort().orElseThrow();
-        ColumnRef resolved = resolve(sort.column(), scope(child));
+        ColumnRef resolved = resolveInChild(sort.column(), child);
         return copy(node, List.of(child), child.outputColumns(), node.scan(), node.predicate(), node.projection(), node.join(),
                 Optional.of(new SortSpec(resolved, sort.direction())), node.mutation(), node.createIndex());
+    }
+
+    private ColumnRef resolveInChild(ColumnRef ref, PlanNode child) {
+        if (ref.tableName().isEmpty() && child.outputColumns() != null && !child.outputColumns().isEmpty()) {
+            List<ResultColumn> visible = child.outputColumns().stream()
+                    .filter(c -> same(c.name(), ref.columnName()) && c.source().isPresent())
+                    .toList();
+            if (visible.size() == 1) {
+                return visible.get(0).source().get();
+            }
+        }
+        return resolve(ref, scope(child));
     }
 
     private PlanNode bindMutation(PlanNode node) {

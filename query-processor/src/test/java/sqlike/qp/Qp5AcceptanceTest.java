@@ -34,6 +34,7 @@ public final class Qp5AcceptanceTest {
         test("QP-12 COMMIT success and rejection", Qp5AcceptanceTest::commitResults);
         test("QP-13 CREATE INDEX and confirmation", Qp5AcceptanceTest::createIndexes);
         test("QP-13 IndexScan without table scan", Qp5AcceptanceTest::indexScan);
+        test("QP-05..QP-09 SELECT, WHERE, JOIN, NATURAL JOIN, ORDER BY, DELETE end-to-end", Qp5AcceptanceTest::joinSortAndDeleteEndToEnd);
         System.out.println("RESULT: " + passed + " passed, " + failed + " failed");
         if (failed > 0) throw new AssertionError("Acceptance checks failed");
     }
@@ -234,6 +235,42 @@ public final class Qp5AcceptanceTest {
         assertEquals(0, database.storage.scans);
         assertEquals(1, database.storage.lookups);
         assertEquals(1, database.storage.fetches);
+    }
+
+    private static void joinSortAndDeleteEndToEnd() throws Exception {
+        TestDatabase database = new TestDatabase();
+        database.storage.define(new TableSchema("2", "departments", List.of(
+                new ColumnSchema("id", DataType.INTEGER, Optional.empty()),
+                new ColumnSchema("dept_name", DataType.VARCHAR, Optional.of(32)))));
+        database.execute("INSERT INTO employees VALUES (1, 3000);");
+        database.execute("INSERT INTO employees VALUES (2, 1000);");
+        database.execute("INSERT INTO employees VALUES (3, 2000);");
+        database.execute("INSERT INTO departments VALUES (1, 'Engineering');");
+        database.execute("INSERT INTO departments VALUES (2, 'Finance');");
+
+        // JOIN ... ON with table.column prefix and ORDER BY ASC
+        Result joined = database.execute(
+                "SELECT employees.id, departments.dept_name, employees.salary "
+                + "FROM employees JOIN departments ON employees.id = departments.id "
+                + "ORDER BY employees.salary ASC;");
+        assertEquals(
+                List.of(List.of(2, "Finance", 1000.0), List.of(1, "Engineering", 3000.0)),
+                values(joined));
+
+        // NATURAL JOIN on common column id with ORDER BY DESC
+        Result natural = database.execute(
+                "SELECT id, dept_name, salary FROM employees NATURAL JOIN departments ORDER BY id DESC;");
+        assertEquals(
+                List.of(List.of(2, "Finance", 1000.0), List.of(1, "Engineering", 3000.0)),
+                values(natural));
+
+        // DELETE with WHERE and rollback on ABORT
+        database.execute("BEGIN;");
+        Result deleted = database.execute("DELETE FROM employees WHERE id = 2;");
+        assertAffected(1, deleted);
+        assertEquals(List.of(List.of(1, 3000.0), List.of(3, 2000.0)), database.rows());
+        database.execute("ABORT;");
+        assertEquals(List.of(List.of(1, 3000.0), List.of(2, 1000.0), List.of(3, 2000.0)), database.rows());
     }
 
     private static void restartPhase(String phase, Path snapshot) {

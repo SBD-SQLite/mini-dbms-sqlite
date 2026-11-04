@@ -1,6 +1,5 @@
 package sqlike.qp.port;
 
-import java.nio.file.Path;
 import java.util.*;
 import sqlike.shared.*;
 import sqlike.qp.*;
@@ -15,6 +14,7 @@ public final class QpContracts {
     public record Lsn(long value) { }
     public record ChangeId(TxId txId, long sequence) { }
     public enum TransactionState { ACTIVE, PARTIALLY_COMMITTED, FAILED, ABORTED, COMMITTED }
+    public enum TransactionEvent { BEGIN, COMMIT, ABORT }
     public enum AccessMode { READ, WRITE }
     public record Expr(Expression value) { }
     public record IndexSearch(IndexCondition value) { }
@@ -24,8 +24,6 @@ public final class QpContracts {
     public record LogRecord(ChangeRecord change, Lsn lsn) { }
     public enum RecoveryDirection { UNDO, REDO }
     public record RecoveryContext(String description) { }
-    public record QpConfiguration(int port, int maxClients, long joinBufferBytes,
-                                  IndexType defaultIndexKind, Path temporaryDirectory) { }
     public record DbmsError(String message) { }
     public record ResourceKey(TableId tableId, Optional<Rid> rid) {
         public static ResourceKey table(TableId table) { return new ResourceKey(table, Optional.empty()); }
@@ -51,6 +49,13 @@ public final class QpContracts {
         WriteLease acquireApplyLease(WritePermit permit); void confirmApplied(ChangeId changeId);
         TransactionState getState(TxId txId); CancellationToken getCancellationToken(TxId txId);
         TransactionState commit(TxId txId); TransactionState abort(TxId txId, String reason);
+    }
+    public interface IFailureRecovery {
+        Lsn appendEvent(TxId txId, TransactionEvent event);
+        Lsn appendChange(ChangeRecord change);
+        void forceLog(Lsn lsn);
+        void rollback(TxId txId);
+        RecoveryReport recover();
     }
     public interface IStorageManager {
         Schema getSchema(TableId tableId);
