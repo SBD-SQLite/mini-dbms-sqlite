@@ -21,7 +21,7 @@ public class PlanPrinter {
 
     private void render(PlanNode n, int depth, StringBuilder sb) {
         sb.append("  ".repeat(depth)).append(describe(n));
-        n.estimatedRows().ifPresent(r -> sb.append("  (rows~").append(r).append(")"));
+        n.estimatedRows().ifPresent(r -> sb.append("  (rows~").append(Math.round(r)).append(")"));
         sb.append('\n');
         for (PlanNode c : n.children()) render(c, depth + 1, sb);
     }
