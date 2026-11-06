@@ -19,9 +19,8 @@ import sqlike.shared.TransactionStatus;
 /**
  * CCM facade called by QP and FRM (CC1).
  *
- * <p>Milestone 1 MOCK: every contract method is callable and wired to {@link TransactionManager},
- * the active {@link IConcurrencyProtocol}, {@link FRMBridge}, and {@link ScheduleRecorder}. The
- * decisions themselves come from those components, which are still mocks where marked.
+ * <p>Connects transactions, the active protocol, the FRM bridge, and the schedule recorder.
+ * Lifecycle and WAL work that is still pending is marked with TODO comments.
  */
 public class ConcurrencyControlManager implements IConcurrencyControlManager {
 
@@ -110,17 +109,19 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
             return unknownTransaction(txId);
         }
         Transaction tx = found.get();
-        if (!tx.isActive()) {
-            return withError(tx, error(ErrorCode.INVALID_STATE, "Transaction " + txId + " is " + tx.getStatus()));
-        }
+        synchronized (tx) {
+            if (!tx.isActive()) {
+                return withError(tx, error(ErrorCode.INVALID_STATE, "Transaction " + txId + " is " + tx.getStatus()));
+            }
 
-        transactions.setStatus(txId, TransactionStatus.PARTIALLY_COMMITTED);
-        // TODO(CC3): if COMMIT is not durable, the transaction must not become COMMITTED; abort instead.
-        frmBridge.logCommit(txId);
-        transactions.setStatus(txId, TransactionStatus.COMMITTED);
-        protocol.release(tx);
-        recorder.markCommitted(txId);
-        return tx.toResponse();
+            transactions.setStatus(txId, TransactionStatus.PARTIALLY_COMMITTED);
+            // TODO(CC3): handle WAL failure and an uncertain commit result before releasing locks.
+            frmBridge.logCommit(txId);
+            transactions.setStatus(txId, TransactionStatus.COMMITTED);
+            protocol.release(tx);
+            recorder.markCommitted(txId);
+            return tx.toResponse();
+        }
     }
 
     @Override
@@ -189,13 +190,20 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
      * Protocol state is kept until rollback has finished.
      */
     private TransactionResponse handleAbort(Transaction tx, ErrorInfo reason) {
-        long txId = tx.getTxId();
-        transactions.setStatus(txId, TransactionStatus.FAILED);
-        // TODO(CC3): if rollback fails, keep the transaction FAILED and keep its protocol state.
-        frmBridge.rollbackThenLogAbort(txId);
-        transactions.setStatus(txId, TransactionStatus.ABORTED);
-        protocol.release(tx);
-        return reason == null ? tx.toResponse() : withError(tx, reason);
+        // A deadlock callback and a waiting request can reach this method at the same time.
+        synchronized (tx) {
+            long txId = tx.getTxId();
+            TransactionStatus status = tx.getStatus();
+            if (status == TransactionStatus.COMMITTED || status == TransactionStatus.ABORTED) {
+                return withError(tx, error(ErrorCode.INVALID_STATE, "Transaction " + txId + " is " + status));
+            }
+            transactions.setStatus(txId, TransactionStatus.FAILED);
+            // TODO(CC3): if rollback fails, keep the transaction FAILED and keep its protocol state.
+            frmBridge.rollbackThenLogAbort(txId);
+            transactions.setStatus(txId, TransactionStatus.ABORTED);
+            protocol.release(tx);
+            return reason == null ? tx.toResponse() : withError(tx, reason);
+        }
     }
 
     private AccessResponse abortedAccess(Transaction tx, String message) {
@@ -204,9 +212,17 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
         return new AccessResponse(AccessStatus.ABORTED, Optional.empty(), Optional.empty(), Optional.of(reason));
     }
 
-    private static IConcurrencyProtocol createProtocol(ProtocolType type) {
+    private void abortDeadlockVictim(long txId) {
+        TransactionResponse response = abort(txId);
+        if (response.status() != TransactionStatus.ABORTED
+                && response.status() != TransactionStatus.COMMITTED) {
+            throw new IllegalStateException("Deadlock victim could not finish abort: " + txId);
+        }
+    }
+
+    private IConcurrencyProtocol createProtocol(ProtocolType type) {
         return switch (type) {
-            case LOCK_BASED -> new LockBasedProtocol(new DeadlockHandler());
+            case LOCK_BASED -> new LockBasedProtocol(new DeadlockHandler(), this::abortDeadlockVictim);
             case TIMESTAMP_BASED -> new TimestampProtocol();
         };
     }

@@ -3,10 +3,17 @@ Concurrency Control Manager (CCM)
 Class diagram: docs/ccm-class-diagram.drawio (PNG export next to it).
 Contract: IConcurrencyControlManager and IFailureRecoveryManager follow the SQLike supergroup report (section 2.1).
 
-Milestone 1 status
+Current status
 - Every IConcurrencyControlManager method is callable through sqlike.ccm.ConcurrencyControlManager,
   so QP and FRM can integrate against it now.
 - Parts that are still mocks are marked TODO(CCx), where CCx is the role that implements them.
+- LockBasedProtocol now uses table-level shared/exclusive locks, FIFO waiting, and rigorous 2PL.
+  RECORD requests lock their table. CATALOG requests use a separate catalog resource.
+- DeadlockHandler detects wait-for cycles and chooses the youngest transaction. The protocol calls
+  the CCM facade to abort it, keeping locks held until rollback finishes. Blocked requests recheck
+  cycles on wake-up, with a 100 ms wait interval.
+- TransactionManager and FRMBridge still have the lifecycle, maintenance, and WAL work marked for
+  CC1 and CC3. The new write-access and apply-guard APIs from the PRD are not wired here yet.
 
 Packages (src/main/java)
 - sqlike.contract  IConcurrencyControlManager (CCM) and IFailureRecoveryManager (FRM), copied from the contract
@@ -25,3 +32,9 @@ Build and run the driver (JDK 17 or newer), from the repository root:
   java -cp out sqlike.ccm.CCMDriver
 The driver runs every scenario against ConcurrencyControlManager with MockFRM and prints
 "Total: N/N skenario LULUS" when all of them pass.
+
+Run the CC2 concurrent tests and the existing driver from the repository root:
+  ./concurrency-control/run-tests.sh
+The tests cover S/X conflicts, FIFO, repeated locks, upgrades, deadlocks, rollback protection,
+interruption, reset, catalog access, and the facade's abort callback. They use controlled in-memory
+rollback callbacks. Full FRM/SM recovery still needs integration with the owning components.
