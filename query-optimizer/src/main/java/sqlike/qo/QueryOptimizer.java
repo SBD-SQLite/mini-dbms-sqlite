@@ -22,8 +22,8 @@ public class QueryOptimizer implements IQueryOptimizer {
         this.queryParser = new QueryParser(new SelectParser(expr), new StatementParser());
         this.binder = new Binder(storage);
         this.selectionProjectionRewriter = new SelectionProjectionRewriter();
-        this.optimizer = new JoinAccessPathOptimizer();
         this.costModel = new CostModel(storage);
+        this.optimizer = new JoinAccessPathOptimizer(costModel);
         this.printer = new PlanPrinter();
         this.annotator = new PlanAnnotator(new CardinalityEstimator(storage));
     }
