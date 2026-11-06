@@ -37,8 +37,8 @@ public class SelectParser {
             if (ts.peek().isSymbol("("))
                 throw QoErrors.unsupported("functions/aggregates are not part of the agreed contract", first.offset());
             if (ts.matchSymbol(".")) {
-                if (ts.matchSymbol("*")) cols.add(ColumnRef.of(first.text(), "*"));
-                else cols.add(ColumnRef.of(first.text(), ts.expectIdentifier("column name").text()));
+                if (ts.matchSymbol("*")) cols.add(Refs.column(first.text(), "*"));
+                else cols.add(Refs.column(first.text(), ts.expectIdentifier("column name").text()));
             } else {
                 cols.add(new ColumnRef(Optional.empty(), first.text()));
             }
@@ -89,7 +89,7 @@ public class SelectParser {
         ts.expectKeyword(Keyword.BY);
         Token first = ts.expectIdentifier("column name");
         ColumnRef col = ts.matchSymbol(".")
-                ? ColumnRef.of(first.text(), ts.expectIdentifier("column name").text())
+                ? Refs.column(first.text(), ts.expectIdentifier("column name").text())
                 : new ColumnRef(Optional.empty(), first.text());
         SortDirection dir = SortDirection.ASC;
         if (ts.matchKeyword(Keyword.DESC)) dir = SortDirection.DESC;

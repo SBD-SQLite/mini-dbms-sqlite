@@ -103,8 +103,8 @@ public class ExpressionParser {
         if (token.type() == TokenType.IDENTIFIER) {
             String first = ts.next().text();
             ColumnRef column = ts.matchSymbol(".")
-                    ? ColumnRef.of(first, ts.expectIdentifier("column name").text())
-                    : ColumnRef.of(null, first);
+                    ? Refs.column(first, ts.expectIdentifier("column name").text())
+                    : Refs.column(null, first);
             return new Expression(ExpressionKind.COLUMN, Optional.empty(), Optional.of(column), Optional.empty(), List.of());
         }
         throw QoErrors.syntax("expected literal, column reference, or parenthesized expression", token.offset());

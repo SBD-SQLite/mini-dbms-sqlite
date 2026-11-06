@@ -34,6 +34,8 @@ public final class Binder {
             case SORT -> bindSort(node);
             case INSERT, UPDATE, DELETE -> bindMutation(node);
             case CREATE_INDEX -> bindCreateIndex(node);
+            case LIMIT -> bindLimit(node);
+            case CREATE_TABLE, DROP_TABLE -> throw QoErrors.unsupported(node.kind() + " binding is not implemented", 0);
         };
     }
 
@@ -46,7 +48,7 @@ public final class Binder {
             if (!found) throw QoErrors.semantic("unknown index '" + scan.indexName().orElseThrow() + "'");
         }
         List<ResultColumn> outputs = schema.columns().stream()
-                .map(c -> new ResultColumn(c.name(), Optional.of(ColumnRef.of(schema.tableName(), c.name())), c.dataType()))
+                .map(c -> new ResultColumn(c.name(), Optional.of(Refs.column(schema.tableName(), c.name())), c.dataType()))
                 .toList();
         return copy(node, List.of(), outputs, Optional.of(scan), node.predicate(), node.projection(), node.join(), node.sort(), node.mutation(), node.createIndex());
     }
@@ -122,6 +124,12 @@ public final class Binder {
         ColumnRef resolved = resolve(sort.column(), scope(child));
         return copy(node, List.of(child), child.outputColumns(), node.scan(), node.predicate(), node.projection(), node.join(),
                 Optional.of(new SortSpec(resolved, sort.direction())), node.mutation(), node.createIndex());
+    }
+
+    private PlanNode bindLimit(PlanNode node) {
+        PlanNode child = bindNode(node.children().get(0));
+        return copy(node, List.of(child), child.outputColumns(), node.scan(), node.predicate(), node.projection(), node.join(),
+                node.sort(), node.mutation(), node.createIndex());
     }
 
     private PlanNode bindMutation(PlanNode node) {
@@ -216,16 +224,16 @@ public final class Binder {
         if (candidates.isEmpty()) throw QoErrors.semantic("unknown column '" + render(ref) + "'");
         if (candidates.size() > 1) throw QoErrors.semantic("ambiguous column '" + ref.columnName() + "'");
         ColumnSchema col = column(candidates.get(0), ref.columnName());
-        return ColumnRef.of(candidates.get(0).tableName(), col.name());
+        return Refs.column(candidates.get(0).tableName(), col.name());
     }
 
     private List<TableSchema> scope(PlanNode node) {
-        Map<Long, TableSchema> found = new LinkedHashMap<>();
+        Map<String, TableSchema> found = new LinkedHashMap<>();
         collectSchemas(node, found);
         return List.copyOf(found.values());
     }
 
-    private void collectSchemas(PlanNode node, Map<Long, TableSchema> found) {
+    private void collectSchemas(PlanNode node, Map<String, TableSchema> found) {
         node.scan().ifPresent(s -> {
             TableSchema schema = table(s.tableName());
             found.putIfAbsent(schema.tableId(), schema);
@@ -234,7 +242,7 @@ public final class Binder {
     }
 
     private List<TableSchema> mergeScope(List<TableSchema> left, List<TableSchema> right) {
-        Map<Long, TableSchema> merged = new LinkedHashMap<>();
+        Map<String, TableSchema> merged = new LinkedHashMap<>();
         left.forEach(t -> merged.put(t.tableId(), t));
         right.forEach(t -> merged.put(t.tableId(), t));
         return List.copyOf(merged.values());
@@ -298,6 +306,7 @@ public final class Binder {
     private PlanNode copy(PlanNode n, List<PlanNode> children, List<ResultColumn> outputs, Optional<ScanSpec> scan,
                           Optional<Expression> predicate, List<ColumnRef> projection, Optional<JoinSpec> join,
                           Optional<SortSpec> sort, Optional<MutationSpec> mutation, Optional<IndexMetadata> createIndex) {
-        return new PlanNode(n.kind(), children, outputs, n.estimatedRows(), scan, predicate, projection, join, sort, mutation, createIndex);
+        return new PlanNode(n.kind(), children, outputs, n.estimatedRows(), scan, predicate, projection, join, sort, mutation, createIndex,
+                n.limit(), n.createTable(), n.dropTable());
     }
 }
