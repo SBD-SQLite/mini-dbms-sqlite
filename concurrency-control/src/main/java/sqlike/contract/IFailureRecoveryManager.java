@@ -3,9 +3,10 @@ package sqlike.contract;
 import sqlike.shared.DataChange;
 import sqlike.shared.RecoveryResult;
 import sqlike.shared.RecoveryTarget;
+import sqlike.shared.SchemaChange;
 
 /**
- * FRM contract from the SQLike supergroup report (section 2.1), owned by the FRM group.
+ * FRM contract from the SQLike supergroup report (section 2.1) and PRD §3.5, owned by the FRM group.
  *
  * <p>Copied here only so CCM can compile against it; the FRM group's definition is authoritative.
  */
@@ -37,4 +38,9 @@ public interface IFailureRecoveryManager {
 
     /** Restores the database to a point in time or to a committed transaction, in maintenance mode. */
     void recoverTo(RecoveryTarget target);
+
+    /** Logs a schema change (CREATE/DROP TABLE, CREATE INDEX, CASCADE FK update) and returns its LSN (PRD §3.5). */
+    default long logSchemaChange(long txId, SchemaChange change) {
+        return 1L;
+    }
 }
