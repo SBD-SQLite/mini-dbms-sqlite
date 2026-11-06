@@ -13,6 +13,7 @@ public class QueryOptimizer implements IQueryOptimizer {
     private final JoinAccessPathOptimizer optimizer;
     private final CostModel costModel;
     private final PlanPrinter printer;
+    private final PlanAnnotator annotator;
 
     public QueryOptimizer(IStorageManager storage) {
         if (storage == null) throw new IllegalArgumentException("storage is required");
@@ -24,6 +25,7 @@ public class QueryOptimizer implements IQueryOptimizer {
         this.optimizer = new JoinAccessPathOptimizer();
         this.costModel = new CostModel(storage);
         this.printer = new PlanPrinter();
+        this.annotator = new PlanAnnotator(new CardinalityEstimator(storage));
     }
 
     @Override
@@ -61,12 +63,13 @@ public class QueryOptimizer implements IQueryOptimizer {
         };
     }
 
-    /** Extra (not in IQueryOptimizer): human-readable before/after plan for the driver / QO-15. */
+    /** Extra: human-readable before/after plan buat driver */
     public String explainQuery(String sql) {
         ParsedQuery parsed = parseQuery(sql);
         if (parsed.transactionCommand().isPresent())
             return "TRANSACTION " + parsed.transactionCommand().get().action() + " (not optimized)\n";
         QueryPlan plan = optimizeQuery(parsed);
-        return printer.printBeforeAfter(parsed.root().get(), plan.root(), plan.estimatedCost());
+        PlanNode after = isPassThrough(plan.root()) ? plan.root() : annotator.annotate(plan.root());
+        return printer.printBeforeAfter(parsed.root().get(), after, plan.estimatedCost());
     }
 }
