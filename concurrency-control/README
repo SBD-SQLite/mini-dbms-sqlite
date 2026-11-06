@@ -1,1 +1,27 @@
-Concurrency Control
+Concurrency Control Manager (CCM)
+
+Class diagram: docs/ccm-class-diagram.drawio (PNG export next to it).
+Contract: IConcurrencyControlManager and IFailureRecoveryManager follow the SQLike supergroup report (section 2.1).
+
+Milestone 1 status
+- Every IConcurrencyControlManager method is callable through sqlike.ccm.ConcurrencyControlManager,
+  so QP and FRM can integrate against it now.
+- Parts that are still mocks are marked TODO(CCx), where CCx is the role that implements them.
+
+Packages (src/main/java)
+- sqlike.contract  IConcurrencyControlManager (CCM) and IFailureRecoveryManager (FRM), copied from the contract
+- sqlike.shared    shared data types copied from the contract; delete once a supergroup shared package exists
+- sqlike.ccm       CCM classes:
+    ConcurrencyControlManager, CCMConfig, TransactionManager, Transaction   transactions and protocol choice (CC-01, CC-02)
+    FRMBridge                                                                WAL logging, abort, recovery (CC-03, CC-04, CC-05)
+    IConcurrencyProtocol, LockBasedProtocol                                  lock-based access (CC-06)
+    DeadlockHandler                                                          deadlock handling (CC-07)
+    TimestampProtocol                                                        timestamp-based access (CC-08)
+    ScheduleOperation, ScheduleRecorder, SerializabilityVerifier             serializability check (CC-09)
+    CCMDriver, Scenario, MockFRM                                             standalone driver (CC-10)
+
+Build and run the driver (JDK 17 or newer), from the repository root:
+  javac --release 17 -d out $(find concurrency-control/src/main/java -name '*.java')
+  java -cp out sqlike.ccm.CCMDriver
+The driver runs every scenario against ConcurrencyControlManager with MockFRM and prints
+"Total: N/N skenario LULUS" when all of them pass.

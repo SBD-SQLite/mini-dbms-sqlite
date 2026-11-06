@@ -1,0 +1,10 @@
+package sqlike.shared;
+
+import java.util.List;
+
+public record InsertReservation(
+        String reservationId,
+        String tableName,
+        RID rid,
+        List<Value> values) {
+}
