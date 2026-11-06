@@ -276,10 +276,11 @@ public final class Binder {
     }
 
     private static boolean compatible(DataType a, DataType b) {
-        return a == b || numeric(a) && numeric(b);
+        return a == b || numeric(a) && numeric(b) || text(a) && text(b);
     }
 
     private static boolean numeric(DataType type) { return type == DataType.INTEGER || type == DataType.FLOAT; }
+    private static boolean text(DataType type) { return type == DataType.CHAR || type == DataType.VARCHAR; }
     private static boolean isComparison(ExpressionOperator op) {
         return op == ExpressionOperator.EQ || op == ExpressionOperator.NE || op == ExpressionOperator.GT ||
                 op == ExpressionOperator.GE || op == ExpressionOperator.LT || op == ExpressionOperator.LE;

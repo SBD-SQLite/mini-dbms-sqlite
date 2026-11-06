@@ -35,10 +35,10 @@ type-mismatch        | SEMANTIC_ERROR        | SELECT * FROM students WHERE name
 insert-arity         | SEMANTIC_ERROR        | INSERT INTO dept VALUES (30)
 index-unknown-column | SEMANTIC_ERROR        | CREATE INDEX ix ON students(nocol)
 
-# --- known issues (XFAIL = passes while the bug still reproduces; fix the bug, then change to OK) ---
+# --- QO3 regressions ---
 natural-join-3-tables | OK | SELECT * FROM students NATURAL JOIN dept NATURAL JOIN takes
-insert-char-column   | XFAIL SEMANTIC_ERROR  | INSERT INTO dept VALUES (30, 'Math')
-char-column-compare  | XFAIL SEMANTIC_ERROR  | SELECT * FROM takes WHERE grade = 'E'
+insert-char-column   | OK | INSERT INTO dept VALUES (30, 'Math')
+char-column-compare  | OK | SELECT * FROM takes WHERE grade = 'E'
 
 # --- outside the agreed contract / invalid values ---
 or-unsupported       | UNSUPPORTED_OPERATION | SELECT * FROM students WHERE id = 1 OR id = 2

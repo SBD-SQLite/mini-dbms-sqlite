@@ -19,14 +19,14 @@ final class MockStorageManager {
         add(schemas, stats, "students", List.of(
                 col("id", DataType.INTEGER, null), col("name", DataType.VARCHAR, 20),
                 col("gpa", DataType.FLOAT, null), col("dept_id", DataType.INTEGER, null)),
-                new TableStatistics(5000, 250, 40, 20, Map.of("id", 5000L, "name", 4800L, "gpa", 400L, "dept_id", 20L)));
+                new TableStatistics(5000, 50, 40, 102, Map.of("id", 5000L, "name", 4800L, "gpa", 400L, "dept_id", 20L)));
         add(schemas, stats, "dept", List.of(
                 col("dept_id", DataType.INTEGER, null), col("dname", DataType.CHAR, 10)),
-                new TableStatistics(20, 1, 24, 20, Map.of("dept_id", 20L, "dname", 20L)));
+                new TableStatistics(20, 1, 24, 170, Map.of("dept_id", 20L, "dname", 20L)));
         add(schemas, stats, "takes", List.of(
                 col("id", DataType.INTEGER, null), col("course_id", DataType.INTEGER, null),
                 col("grade", DataType.CHAR, 2)),
-                new TableStatistics(10000, 400, 16, 25, Map.of("id", 4500L, "course_id", 200L, "grade", 10L)));
+                new TableStatistics(10000, 40, 16, 256, Map.of("id", 4500L, "course_id", 200L, "grade", 10L)));
         return (IStorageManager) Proxy.newProxyInstance(MockStorageManager.class.getClassLoader(),
                 new Class<?>[] { IStorageManager.class }, (proxy, method, args) -> switch (method.getName()) {
                     case "listTables" -> new ArrayList<>(schemas.keySet());
