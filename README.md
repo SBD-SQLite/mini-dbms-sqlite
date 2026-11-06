@@ -28,6 +28,7 @@ Components talk only through the interfaces and shared data types agreed in the 
 | Component | Entry point |
 |---|---|
 | QP | `query-processor/run-tests.sh` |
+| QO | `sqlike.qo.QODriver` |
 | SM | `sqlike.storage.StorageDriver` |
 | CCM | `sqlike.ccm.CCMDriver` |
 | FRM | `sqlike.frm.driver.FRMDriver` |
