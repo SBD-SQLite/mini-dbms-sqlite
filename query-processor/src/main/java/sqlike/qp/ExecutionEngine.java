@@ -103,12 +103,17 @@ public final class ExecutionEngine implements PlanExecutor {
         if (kind == PlanNodeKind.INSERT
                 || kind == PlanNodeKind.UPDATE
                 || kind == PlanNodeKind.DELETE
-                || kind == PlanNodeKind.CREATE_INDEX) {
+                || kind == PlanNodeKind.CREATE_INDEX
+                || kind == PlanNodeKind.CREATE_TABLE
+                || kind == PlanNodeKind.DROP_TABLE) {
             CommandExecutor cmd = translator.translateCommand(root);
             long affected = executeCommand(cmd, context);
-            String msg = kind == PlanNodeKind.CREATE_INDEX
-                    ? "Index created successfully"
-                    : affected + " row(s) affected";
+            String msg = switch (kind) {
+                case CREATE_INDEX -> "Index created successfully";
+                case CREATE_TABLE -> "Table " + root.createTable().map(c -> c.tableName()).orElse("") + " created successfully";
+                case DROP_TABLE -> "Table " + root.dropTable().map(d -> d.tableName()).orElse("") + " dropped successfully";
+                default -> affected + " row(s) affected";
+            };
             return new QueryResult(ResultKind.AFFECTED_ROWS, List.of(), List.of(), affected, msg, Optional.empty());
         } else {
             Operator op = translator.translateSelect(root);

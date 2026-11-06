@@ -334,10 +334,14 @@ public final class QueryProcessor implements IQueryProcessor {
             throw new IllegalArgumentException("PreparedStatement and plan root cannot be null");
         }
         translator.validate(statement);
-        if (statement.root().kind() == PlanNodeKind.CREATE_INDEX && session.isExplicitTransaction()) {
+        PlanNodeKind kind = statement.root().kind();
+        if ((kind == PlanNodeKind.CREATE_INDEX
+                || kind == PlanNodeKind.CREATE_TABLE
+                || kind == PlanNodeKind.DROP_TABLE)
+                && session.isExplicitTransaction()) {
             throw new QpException(
                     ErrorCode.INVALID_STATE,
-                    "CREATE INDEX is not allowed within an explicit transaction");
+                    kind + " is not allowed within an explicit transaction");
         }
     }
 
@@ -351,12 +355,17 @@ public final class QueryProcessor implements IQueryProcessor {
         if (kind == PlanNodeKind.INSERT
                 || kind == PlanNodeKind.UPDATE
                 || kind == PlanNodeKind.DELETE
-                || kind == PlanNodeKind.CREATE_INDEX) {
+                || kind == PlanNodeKind.CREATE_INDEX
+                || kind == PlanNodeKind.CREATE_TABLE
+                || kind == PlanNodeKind.DROP_TABLE) {
             CommandExecutor cmd = translator.translateCommand(root);
             long count = engine.executeCommand(cmd, context);
-            String msg = kind == PlanNodeKind.CREATE_INDEX
-                    ? "Index " + root.createIndex().map(m -> m.indexName()).orElse("") + " created successfully"
-                    : count + " row(s) affected";
+            String msg = switch (kind) {
+                case CREATE_INDEX -> "Index " + root.createIndex().map(m -> m.indexName()).orElse("") + " created successfully";
+                case CREATE_TABLE -> "Table " + root.createTable().map(c -> c.tableName()).orElse("") + " created successfully";
+                case DROP_TABLE -> "Table " + root.dropTable().map(d -> d.tableName()).orElse("") + " dropped successfully";
+                default -> count + " row(s) affected";
+            };
             return ExecutionSummary.ok(count, msg);
         }
         Operator op = translator.translateSelect(root);

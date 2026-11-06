@@ -2,6 +2,7 @@ package sqlike.contract;
 
 import java.util.List;
 import java.util.Optional;
+import sqlike.shared.DropBehavior;
 import sqlike.shared.IndexCondition;
 import sqlike.shared.IndexMetadata;
 import sqlike.shared.InsertReservation;
@@ -9,6 +10,7 @@ import sqlike.shared.RID;
 import sqlike.shared.Record;
 import sqlike.shared.RecordCursor;
 import sqlike.shared.RecordImage;
+import sqlike.shared.SchemaImage;
 import sqlike.shared.TableSchema;
 import sqlike.shared.TableStatistics;
 import sqlike.shared.Value;
@@ -45,5 +47,38 @@ public interface IStorageManager {
     void flushAll();
 
     default void close() {
+    }
+
+    // Class diagram Tab 6 signatures
+    default void createTable(TableSchema schema) {
+        createTable(schema, 1L);
+    }
+
+    default void dropTable(String table, DropBehavior behavior) {
+        dropTable(table, behavior, 1L);
+    }
+
+    // PRD §3.3 LSN-bearing schema & snapshot signatures
+    default void createTable(TableSchema schema, long lsn) {
+        throw new UnsupportedOperationException("createTable is not implemented");
+    }
+
+    default void dropTable(String table, DropBehavior behavior, long lsn) {
+        throw new UnsupportedOperationException("dropTable is not implemented");
+    }
+
+    default void restoreSchema(SchemaImage image, long lsn) {
+        throw new UnsupportedOperationException("restoreSchema is not implemented");
+    }
+
+    default void createIndex(IndexMetadata definition, long lsn) {
+        createIndex(definition);
+    }
+
+    default String createSnapshot() {
+        return "snap-0";
+    }
+
+    default void restoreSnapshot(String snapshotId) {
     }
 }

@@ -20,8 +20,9 @@ public final class CardinalityEstimator {
                     selectivity(node.predicate().orElseThrow(), node.children().get(0)));
             case JOIN, CARTESIAN -> joinRows(node);
             case PROJECT, SORT, UPDATE, DELETE -> node.children().isEmpty() ? 0 : estimateRows(node.children().get(0));
+            case LIMIT -> node.children().isEmpty() ? 0 : Math.min(node.limit().orElseThrow().count(), estimateRows(node.children().get(0)));
             case INSERT -> 1;
-            case CREATE_INDEX -> 0;
+            case CREATE_INDEX, CREATE_TABLE, DROP_TABLE -> 0;
         };
     }
 

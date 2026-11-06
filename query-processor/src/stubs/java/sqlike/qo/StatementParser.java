@@ -7,7 +7,15 @@ import java.util.Optional;
 import sqlike.shared.*;
 
 public class StatementParser {
-    private final ExpressionParser expressionParser = new ExpressionParser();
+    private final ExpressionParser expressionParser;
+
+    public StatementParser() {
+        this(new ExpressionParser());
+    }
+
+    public StatementParser(ExpressionParser expressionParser) {
+        this.expressionParser = expressionParser;
+    }
 
     public ParsedQuery parseTransaction(TokenStream ts) {
         Token token = ts.next();
@@ -92,11 +100,102 @@ public class StatementParser {
     }
 
     public ParsedQuery parseCreateTable(TokenStream ts) {
-        throw QoErrors.unsupported("CREATE TABLE is not part of the agreed contract", ts.peek().offset());
+        ts.expectKeyword(Keyword.CREATE);
+        ts.expectKeyword(Keyword.TABLE);
+        String table = identifier(ts, "table name");
+        ts.expectSymbol("(");
+        List<ColumnSchema> columns = new ArrayList<>();
+        List<String> primaryKey = new ArrayList<>();
+        List<ForeignKeySpec> foreignKeys = new ArrayList<>();
+        do {
+            if (ts.matchKeyword(Keyword.PRIMARY)) {
+                ts.expectKeyword(Keyword.KEY);
+                primaryKey.addAll(parseColumnNameList(ts));
+            } else if (ts.matchKeyword(Keyword.FOREIGN)) {
+                ts.expectKeyword(Keyword.KEY);
+                List<String> localCols = parseColumnNameList(ts);
+                ts.expectKeyword(Keyword.REFERENCES);
+                String refTable = identifier(ts, "referenced table name");
+                List<String> refCols = parseColumnNameList(ts);
+                foreignKeys.add(new ForeignKeySpec(localCols, refTable, refCols));
+            } else {
+                String colName = identifier(ts, "column name");
+                ColumnSchema colSchema = parseColumnDefinition(ts, colName);
+                columns.add(colSchema);
+                while (true) {
+                    if (ts.matchKeyword(Keyword.PRIMARY)) {
+                        ts.expectKeyword(Keyword.KEY);
+                        if (!primaryKey.contains(colName)) primaryKey.add(colName);
+                    } else if (ts.matchKeyword(Keyword.REFERENCES)) {
+                        String refTable = identifier(ts, "referenced table name");
+                        List<String> refCols = ts.peek().isSymbol("(")
+                                ? parseColumnNameList(ts)
+                                : List.of(colName);
+                        foreignKeys.add(new ForeignKeySpec(List.of(colName), refTable, refCols));
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } while (ts.matchSymbol(","));
+        ts.expectSymbol(")");
+        ts.expectEndOfStatement();
+        CreateTableSpec spec = new CreateTableSpec(table, columns, primaryKey, foreignKeys);
+        return query(StatementType.CREATE_TABLE, PlanNodes.createTable(spec));
+    }
+
+    private ColumnSchema parseColumnDefinition(TokenStream ts, String colName) {
+        Token typeTok = ts.next();
+        String typeText = typeTok.text().toUpperCase(Locale.ROOT);
+        DataType dataType = switch (typeText) {
+            case "INTEGER", "INT" -> DataType.INTEGER;
+            case "FLOAT" -> DataType.FLOAT;
+            case "CHAR" -> DataType.CHAR;
+            case "VARCHAR" -> DataType.VARCHAR;
+            default -> throw QoErrors.syntax("unsupported data type '" + typeTok.text() + "'", typeTok.offset());
+        };
+        Optional<Integer> maxLen = Optional.empty();
+        if (dataType == DataType.CHAR || dataType == DataType.VARCHAR) {
+            ts.expectSymbol("(");
+            Token lenTok = ts.next();
+            if (lenTok.type() != TokenType.INTEGER)
+                throw QoErrors.syntax("expected positive integer length for " + dataType, lenTok.offset());
+            int len;
+            try {
+                len = Integer.parseInt(lenTok.text());
+            } catch (NumberFormatException e) {
+                throw QoErrors.invalidValue("invalid length for " + dataType, lenTok.offset());
+            }
+            if (len <= 0) throw QoErrors.invalidValue(dataType + " length must be positive", lenTok.offset());
+            maxLen = Optional.of(len);
+            ts.expectSymbol(")");
+        }
+        return new ColumnSchema(colName, dataType, maxLen);
+    }
+
+    private List<String> parseColumnNameList(TokenStream ts) {
+        ts.expectSymbol("(");
+        List<String> cols = new ArrayList<>();
+        cols.add(identifier(ts, "column name"));
+        while (ts.matchSymbol(",")) {
+            cols.add(identifier(ts, "column name"));
+        }
+        ts.expectSymbol(")");
+        return cols;
     }
 
     public ParsedQuery parseDropTable(TokenStream ts) {
-        throw QoErrors.unsupported("DROP TABLE is not part of the agreed contract", ts.peek().offset());
+        ts.expectKeyword(Keyword.DROP);
+        ts.expectKeyword(Keyword.TABLE);
+        String table = identifier(ts, "table name");
+        DropBehavior behavior = DropBehavior.RESTRICT;
+        if (ts.matchKeyword(Keyword.CASCADE)) {
+            behavior = DropBehavior.CASCADE;
+        } else if (ts.matchKeyword(Keyword.RESTRICT)) {
+            behavior = DropBehavior.RESTRICT;
+        }
+        ts.expectEndOfStatement();
+        return query(StatementType.DROP_TABLE, PlanNodes.dropTable(new DropTableSpec(table, behavior)));
     }
 
     private Value parseInsertValue(TokenStream ts) {

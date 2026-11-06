@@ -8,9 +8,18 @@ import sqlike.shared.*;
 
 public class SelectParser {
     private final ExpressionParser expressionParser;
-    public SelectParser(ExpressionParser expressionParser) { this.expressionParser = expressionParser; }
+    public SelectParser(ExpressionParser expressionParser) {
+        this.expressionParser = expressionParser;
+        this.expressionParser.setSelectParser(this);
+    }
 
     public ParsedQuery parseSelect(TokenStream ts) {
+        PlanNode node = parseSelectNode(ts);
+        ts.expectEndOfStatement();
+        return new ParsedQuery(StatementType.SELECT, Optional.of(node), Optional.empty());
+    }
+
+    public PlanNode parseSelectNode(TokenStream ts) {
         ts.expectKeyword(Keyword.SELECT);
         if (ts.peek().isKeyword(Keyword.DISTINCT))
             throw QoErrors.unsupported("DISTINCT is not part of the agreed contract", ts.peek().offset());
@@ -21,9 +30,9 @@ public class SelectParser {
         if (ts.peek().isKeyword(Keyword.ORDER)) node = PlanNodes.sort(node, parseOrderBy(ts));
         if (ts.peek().isKeyword(Keyword.GROUP) || ts.peek().isKeyword(Keyword.HAVING))
             throw QoErrors.unsupported("GROUP BY/HAVING are not part of the agreed contract", ts.peek().offset());
-        ts.expectEndOfStatement();
         node = PlanNodes.project(node, columns);
-        return new ParsedQuery(StatementType.SELECT, Optional.of(node), Optional.empty());
+        if (ts.matchKeyword(Keyword.LIMIT)) node = PlanNodes.limit(node, parseLimit(ts));
+        return node;
     }
 
     private List<ColumnRef> parseSelectList(TokenStream ts) {
@@ -76,12 +85,34 @@ public class SelectParser {
 
     private PlanNode parseTableRef(TokenStream ts) {
         if (ts.peek().isSymbol("("))
-            throw QoErrors.unsupported("subquery is not part of the agreed contract", ts.peek().offset());
+            throw QoErrors.unsupported("subquery in FROM is not part of the agreed contract", ts.peek().offset());
         Token name = ts.expectIdentifier("table name");
-        Token p = ts.peek();
-        if (p.isKeyword(Keyword.AS) || p.type() == TokenType.IDENTIFIER)
-            throw QoErrors.unsupported("table alias is not part of the agreed contract", p.offset());
-        return PlanNodes.scan(name.text());
+        Optional<String> alias = Optional.empty();
+        if (ts.matchKeyword(Keyword.AS)) {
+            alias = Optional.of(ts.expectIdentifier("table alias").text());
+        } else if (ts.peek().type() == TokenType.IDENTIFIER) {
+            alias = Optional.of(ts.next().text());
+        }
+        return PlanNodes.scan(name.text(), alias);
+    }
+
+    private LimitSpec parseLimit(TokenStream ts) {
+        if (ts.matchSymbol("-")) {
+            throw QoErrors.invalidValue("LIMIT must be non-negative", ts.peek().offset());
+        }
+        Token tok = ts.next();
+        if (tok.type() != TokenType.INTEGER) {
+            throw QoErrors.syntax("expected non-negative integer after LIMIT", tok.offset());
+        }
+        try {
+            long maxRows = Long.parseLong(tok.text());
+            if (maxRows < 0) {
+                throw QoErrors.invalidValue("LIMIT must be non-negative", tok.offset());
+            }
+            return new LimitSpec(maxRows);
+        } catch (NumberFormatException e) {
+            throw QoErrors.invalidValue("invalid LIMIT value", tok.offset());
+        }
     }
 
     private SortSpec parseOrderBy(TokenStream ts) {

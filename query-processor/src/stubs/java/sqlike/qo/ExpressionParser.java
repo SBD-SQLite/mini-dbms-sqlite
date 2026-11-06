@@ -5,6 +5,19 @@ import java.util.Optional;
 import sqlike.shared.*;
 
 public class ExpressionParser {
+    private SelectParser selectParser;
+
+    public void setSelectParser(SelectParser selectParser) {
+        this.selectParser = selectParser;
+    }
+
+    private SelectParser selectParser() {
+        if (selectParser == null) {
+            selectParser = new SelectParser(this);
+        }
+        return selectParser;
+    }
+
     public Expression parseExpression(TokenStream ts) {
         if (ts.isAtEnd()) throw ts.unexpected("expected expression");
         Expression expression = parseAnd(ts);
@@ -21,7 +34,31 @@ public class ExpressionParser {
     }
 
     private Expression parseCompare(TokenStream ts) {
+        if (ts.matchKeyword(Keyword.EXISTS)) {
+            ts.expectSymbol("(");
+            PlanNode subPlan = selectParser().parseSelectNode(ts);
+            ts.expectSymbol(")");
+            return new Expression(
+                    ExpressionKind.SUBQUERY,
+                    Optional.empty(),
+                    Optional.empty(),
+                    Optional.empty(),
+                    List.of(),
+                    Optional.of(new SubquerySpec(SubqueryType.EXISTS, subPlan, false)));
+        }
         Expression expression = parseAdditive(ts);
+        if (ts.matchKeyword(Keyword.IN)) {
+            ts.expectSymbol("(");
+            PlanNode subPlan = selectParser().parseSelectNode(ts);
+            ts.expectSymbol(")");
+            return new Expression(
+                    ExpressionKind.SUBQUERY,
+                    Optional.empty(),
+                    Optional.empty(),
+                    Optional.empty(),
+                    List.of(expression),
+                    Optional.of(new SubquerySpec(SubqueryType.IN, subPlan, false)));
+        }
         ExpressionOperator operator = comparisonOperator(ts.peek());
         if (operator == null) return expression;
         ts.next();
@@ -78,6 +115,17 @@ public class ExpressionParser {
     private Expression parseAtom(TokenStream ts) {
         Token token = ts.peek();
         if (ts.matchSymbol("(")) {
+            if (ts.peek().isKeyword(Keyword.SELECT)) {
+                PlanNode subPlan = selectParser().parseSelectNode(ts);
+                ts.expectSymbol(")");
+                return new Expression(
+                        ExpressionKind.SUBQUERY,
+                        Optional.empty(),
+                        Optional.empty(),
+                        Optional.empty(),
+                        List.of(),
+                        Optional.of(new SubquerySpec(SubqueryType.SCALAR, subPlan, false)));
+            }
             Expression expression = parseAnd(ts);
             ts.expectSymbol(")");
             return expression;

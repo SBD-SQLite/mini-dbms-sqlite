@@ -74,6 +74,9 @@ public class PlanTranslator {
         this.collector = collector != null ? collector : new MutationTargetCollector(storage);
         this.estimator = estimator != null ? estimator : new RowSizeEstimator();
         this.validator = validator != null ? validator : new PlanValidator();
+        if (this.evaluator instanceof ExpressionEvaluator ee) {
+            ee.setPlanTranslator(this);
+        }
     }
 
     public void validate(PreparedStatement statement) {
@@ -143,6 +146,16 @@ public class PlanTranslator {
                         .orElseThrow(() -> new IllegalArgumentException("CREATE_INDEX node missing IndexMetadata"));
                 yield buildCreateIndex(root, spec);
             }
+            case CREATE_TABLE -> {
+                var spec = root.createTable()
+                        .orElseThrow(() -> new IllegalArgumentException("CREATE_TABLE node missing CreateTableSpec"));
+                yield buildCreateTable(root, spec);
+            }
+            case DROP_TABLE -> {
+                var spec = root.dropTable()
+                        .orElseThrow(() -> new IllegalArgumentException("DROP_TABLE node missing DropTableSpec"));
+                yield buildDropTable(root, spec);
+            }
             default -> throw new IllegalArgumentException("Unsupported command kind: " + root.kind());
         };
     }
@@ -162,7 +175,7 @@ public class PlanTranslator {
                 ScanSpec scan = node.scan()
                         .orElseThrow(() -> new IllegalArgumentException("INDEX_SCAN node missing ScanSpec"));
                 IndexScanSpec spec = IndexScanSpec.fromScanSpec(scan);
-                yield buildIndexScan(node, spec);
+                yield buildIndexScan(node, spec, scan.alias());
             }
             case FILTER -> {
                 var expr = node.predicate()
@@ -189,28 +202,39 @@ public class PlanTranslator {
                         .orElseThrow(() -> new IllegalArgumentException("SORT node missing SortSpec"));
                 yield buildSort(node, spec);
             }
+            case LIMIT -> {
+                var spec = node.limit()
+                        .orElseThrow(() -> new IllegalArgumentException("LIMIT node missing LimitSpec"));
+                yield buildLimit(node, spec);
+            }
             default -> throw new IllegalArgumentException("Unsupported read node kind: " + node.kind());
         };
     }
 
     private Operator buildScan(PlanNode node, ScanSpec spec) {
+        String qualifier = spec.alias().filter(a -> !a.isBlank()).orElse(spec.tableName());
         if (!hasStorage()) {
-            Schema outputSchema = Schema.of(spec.tableName(), List.of());
+            Schema outputSchema = Schema.of(qualifier, List.of());
             return new MockOperator(PlanNodeKind.SCAN, outputSchema, List.of());
         }
-        Schema outputSchema = resolveTableSchema(spec.tableName(), node);
+        Schema baseSchema = resolveTableSchema(spec.tableName(), node);
+        Schema outputSchema = Schema.of(qualifier, baseSchema.columns());
         if (qpStorage != null) {
             return new TableScanOperator(qpStorage, spec, outputSchema);
         }
         return new TableScanOperator(storage, spec, outputSchema);
     }
 
-    private Operator buildIndexScan(PlanNode node, IndexScanSpec spec) {
+    private Operator buildIndexScan(PlanNode node, IndexScanSpec spec, Optional<String> alias) {
+        String qualifier = alias != null && alias.isPresent() && !alias.get().isBlank()
+                ? alias.get()
+                : spec.tableName();
         if (!hasStorage()) {
-            Schema outputSchema = Schema.of(spec.tableName(), List.of());
+            Schema outputSchema = Schema.of(qualifier, List.of());
             return new MockOperator(PlanNodeKind.INDEX_SCAN, outputSchema, List.of());
         }
-        Schema outputSchema = resolveTableSchema(spec.tableName(), node);
+        Schema baseSchema = resolveTableSchema(spec.tableName(), node);
+        Schema outputSchema = Schema.of(qualifier, baseSchema.columns());
         if (qpStorage != null) {
             return new IndexScanOperator(qpStorage, spec, outputSchema);
         }
@@ -333,6 +357,14 @@ public class PlanTranslator {
         return new SortOperator(child, spec, rowComp, child.schema());
     }
 
+    private Operator buildLimit(PlanNode node, sqlike.shared.LimitSpec spec) {
+        Operator child = translateRead(node.children().get(0));
+        if (!hasStorage()) {
+            return new MockOperator(PlanNodeKind.LIMIT, child.schema(), List.of(child));
+        }
+        return new LimitOperator(child, spec, child.schema());
+    }
+
     private CommandExecutor buildInsert(PlanNode node, InsertSpec spec) {
         if (!hasStorage() || mutations == null) {
             return new MockCommandExecutor(PlanNodeKind.INSERT);
@@ -367,6 +399,26 @@ public class PlanTranslator {
         return new CreateIndexExecutor(spec, storage);
     }
 
+    private CommandExecutor buildCreateTable(PlanNode node, sqlike.shared.CreateTableSpec spec) {
+        if (!hasStorage()) {
+            return new MockCommandExecutor(PlanNodeKind.CREATE_TABLE);
+        }
+        if (qpStorage != null) {
+            return new CreateTableExecutor(spec, qpStorage, null);
+        }
+        return new CreateTableExecutor(spec, storage);
+    }
+
+    private CommandExecutor buildDropTable(PlanNode node, sqlike.shared.DropTableSpec spec) {
+        if (!hasStorage()) {
+            return new MockCommandExecutor(PlanNodeKind.DROP_TABLE);
+        }
+        if (qpStorage != null) {
+            return new DropTableExecutor(spec, qpStorage, null);
+        }
+        return new DropTableExecutor(spec, storage);
+    }
+
     private boolean hasStorage() {
         return storage != null || qpStorage != null;
     }
@@ -395,7 +447,9 @@ public class PlanTranslator {
         return kind == PlanNodeKind.INSERT
                 || kind == PlanNodeKind.UPDATE
                 || kind == PlanNodeKind.DELETE
-                || kind == PlanNodeKind.CREATE_INDEX;
+                || kind == PlanNodeKind.CREATE_INDEX
+                || kind == PlanNodeKind.CREATE_TABLE
+                || kind == PlanNodeKind.DROP_TABLE;
     }
 
     // Getters for dependency verification in testing

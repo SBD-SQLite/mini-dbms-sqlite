@@ -20,6 +20,7 @@ import sqlike.qp.port.QpContracts.IConcurrencyControl;
 import sqlike.qp.port.QpContracts.Lsn;
 import sqlike.qp.port.QpContracts.RecoveryReport;
 import sqlike.qp.port.QpContracts.ResourceKey;
+import sqlike.qp.port.QpContracts.SchemaChangeRecord;
 import sqlike.qp.port.QpContracts.SessionId;
 import sqlike.qp.port.QpContracts.TransactionState;
 import sqlike.qp.port.QpContracts.TxId;
@@ -159,6 +160,35 @@ public final class ConcurrencyAdapter implements IConcurrencyControl {
     }
 
     @Override
+    public WritePermit authorizeSchemaChange(SchemaChangeRecord change) {
+        if (getState(change.txId()) != TransactionState.ACTIVE) {
+            throw failure("Transaction not active: " + change.txId().value());
+        }
+        AccessResponse resp = ccm.requestSchemaWrite(change.txId().value(), change.value());
+        if (resp != null && resp.error().isPresent()) {
+            if (resp.error().get().code() == ErrorCode.TRANSACTION_ABORTED
+                    || resp.status() == AccessStatus.ABORTED) {
+                states.put(change.txId(), TransactionState.ABORTED);
+                getCancellationToken(change.txId()).cancel();
+            }
+            throw new QpException(resp.error().get());
+        }
+        if (resp != null && resp.status() == AccessStatus.ABORTED) {
+            states.put(change.txId(), TransactionState.ABORTED);
+            getCancellationToken(change.txId()).cancel();
+            throw failure("CCM aborted transaction on requestSchemaWrite");
+        }
+        long lsn = (resp != null && resp.changeLSN().isPresent())
+                ? resp.changeLSN().get()
+                : (frm != null
+                        ? frm.logSchemaChange(change.txId().value(), change.value())
+                        : fallbackLsn.incrementAndGet());
+        WritePermit permit = new WritePermit(change.id(), new Lsn(lsn));
+        permits.put(change.id(), permit);
+        return permit;
+    }
+
+    @Override
     public WriteLease acquireApplyLease(WritePermit permit) {
         if (getState(permit.changeId().txId()) != TransactionState.ACTIVE) {
             throw failure("Transaction not active");
@@ -166,7 +196,19 @@ public final class ConcurrencyAdapter implements IConcurrencyControl {
         if (!permit.equals(permits.get(permit.changeId())) || !leases.add(permit.changeId())) {
             throw failure("Invalid apply lease");
         }
-        return () -> leases.remove(permit.changeId());
+        long txId = permit.changeId().txId().value();
+        long lsn = permit.lsn().value();
+        if (!ccm.beginApply(txId, lsn)) {
+            leases.remove(permit.changeId());
+            throw failure("CCM rejected beginApply for txId=" + txId + " lsn=" + lsn);
+        }
+        return () -> {
+            try {
+                ccm.endApply(txId, lsn);
+            } finally {
+                leases.remove(permit.changeId());
+            }
+        };
     }
 
     @Override

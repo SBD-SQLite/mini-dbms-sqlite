@@ -44,7 +44,11 @@ import static sqlike.qp.port.QpContracts.failure;
  * with external component stubs (SM and CCM/FRM).
  */
 public final class StubQueryRunner {
-    public record Result(boolean success, long affected, List<Row> rows, String message) { }
+    public record Result(boolean success, long affected, List<Row> rows, String message, Schema schema) {
+        public Result(boolean success, long affected, List<Row> rows, String message) {
+            this(success, affected, rows, message, Schema.of(List.of()));
+        }
+    }
 
     public final IQueryOptimizer optimizer;
     public final StorageAdapter storage;
@@ -113,8 +117,11 @@ public final class StubQueryRunner {
                 PlanNodes.validate(plan);
                 PreparedStatement prepared = PreparedStatement.of(new QueryPlan(plan, 0.0));
                 translator.validate(prepared);
-                if (plan.kind() == PlanNodeKind.CREATE_INDEX && session.isExplicitTransaction()) {
-                    throw failure("CREATE INDEX is not allowed within an explicit transaction");
+                if ((plan.kind() == PlanNodeKind.CREATE_INDEX
+                        || plan.kind() == PlanNodeKind.CREATE_TABLE
+                        || plan.kind() == PlanNodeKind.DROP_TABLE)
+                        && session.isExplicitTransaction()) {
+                    throw failure(plan.kind() + " is not allowed within an explicit transaction");
                 }
                 context = transactions.ensureTransaction(session);
                 access.acquireAll(prepared, context);
@@ -122,14 +129,19 @@ public final class StubQueryRunner {
                 boolean isCommand = plan.kind() == PlanNodeKind.INSERT
                         || plan.kind() == PlanNodeKind.UPDATE
                         || plan.kind() == PlanNodeKind.DELETE
-                        || plan.kind() == PlanNodeKind.CREATE_INDEX;
+                        || plan.kind() == PlanNodeKind.CREATE_INDEX
+                        || plan.kind() == PlanNodeKind.CREATE_TABLE
+                        || plan.kind() == PlanNodeKind.DROP_TABLE;
 
                 if (!isCommand) {
                     var rows = new ArrayList<Row>();
+                    final Schema[] capturedSchema = new Schema[]{Schema.of(List.of())};
                     Operator source = translator.translateSelect(plan);
                     engine.executeSelect(source, context, new ResultSink() {
                         @Override
-                        public void onSchema(Schema schema) {}
+                        public void onSchema(Schema schema) {
+                            capturedSchema[0] = schema;
+                        }
 
                         @Override
                         public void onRow(Row row) {
@@ -140,25 +152,27 @@ public final class StubQueryRunner {
                         public void onFinish(ExecutionSummary summary) {}
                     });
                     transactions.finishImplicit(session, context);
-                    return new Result(true, 0, List.copyOf(rows), rows.size() + " row(s) read");
+                    return new Result(true, 0, List.copyOf(rows), rows.size() + " row(s) read", capturedSchema[0]);
                 }
 
                 CommandExecutor executor = translator.translateCommand(plan);
                 long count = engine.executeCommand(executor, context);
                 transactions.finishImplicit(session, context);
-                return new Result(
-                        true,
-                        count,
-                        List.of(),
-                        plan.kind() == PlanNodeKind.CREATE_INDEX
-                                ? "Index " + plan.createIndex().orElseThrow().indexName() + " created successfully"
-                                : count + " row(s) affected");
+                String msg = switch (plan.kind()) {
+                    case CREATE_INDEX -> "Index " + plan.createIndex().orElseThrow().indexName() + " created successfully";
+                    case CREATE_TABLE -> "Table " + plan.createTable().orElseThrow().tableName() + " created successfully";
+                    case DROP_TABLE -> "Table " + plan.dropTable().orElseThrow().tableName() + " dropped successfully";
+                    default -> count + " row(s) affected";
+                };
+                return new Result(true, count, List.of(), msg);
             } catch (RuntimeException e) {
-                boolean isExplicitCreateIndexRejection = plan != null
-                        && plan.kind() == PlanNodeKind.CREATE_INDEX
+                boolean isExplicitDdlRejection = plan != null
+                        && (plan.kind() == PlanNodeKind.CREATE_INDEX
+                                || plan.kind() == PlanNodeKind.CREATE_TABLE
+                                || plan.kind() == PlanNodeKind.DROP_TABLE)
                         && e.getMessage() != null
-                        && e.getMessage().contains("CREATE INDEX is not allowed within an explicit transaction");
-                if (context != null && !isExplicitCreateIndexRejection) {
+                        && e.getMessage().contains("is not allowed within an explicit transaction");
+                if (context != null && !isExplicitDdlRejection) {
                     try {
                         transactions.handleRuntimeFailure(session, context, new DbmsError(e.getMessage()));
                     } catch (RuntimeException cleanup) {

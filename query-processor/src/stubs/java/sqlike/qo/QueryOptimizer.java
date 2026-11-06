@@ -27,7 +27,7 @@ public class QueryOptimizer implements IQueryOptimizer {
         if (storage == null) throw new IllegalArgumentException("storage is required");
         ExpressionParser expr = new ExpressionParser();
         this.lexer = new Lexer();
-        this.queryParser = new QueryParser(new SelectParser(expr), new StatementParser());
+        this.queryParser = new QueryParser(new SelectParser(expr), new StatementParser(expr));
         this.binder = new Binder(storage);
         this.selectionProjectionRewriter = new SelectionProjectionRewriter();
         this.optimizer = new JoinAccessPathOptimizer();

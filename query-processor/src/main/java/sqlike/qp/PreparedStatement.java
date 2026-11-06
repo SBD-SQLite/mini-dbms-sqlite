@@ -78,12 +78,41 @@ public record PreparedStatement(String sql, QueryPlan plan, List<AccessRequest> 
                     out.add(new AccessRequest(ResourceKey.table(new TableId(ci.tableName())), AccessMode.WRITE));
                 }
             });
+            case CREATE_TABLE -> node.createTable().ifPresent(ct -> {
+                if (ct.tableName() != null && !ct.tableName().isBlank()) {
+                    out.add(new AccessRequest(ResourceKey.table(new TableId(ct.tableName())), AccessMode.WRITE));
+                }
+            });
+            case DROP_TABLE -> node.dropTable().ifPresent(dt -> {
+                if (dt.tableName() != null && !dt.tableName().isBlank()) {
+                    out.add(new AccessRequest(ResourceKey.table(new TableId(dt.tableName())), AccessMode.WRITE));
+                }
+            });
             default -> {
             }
         }
+        node.predicate().ifPresent(expr -> collectExpressionAccessRequests(expr, out));
+        node.join().flatMap(sqlike.shared.JoinSpec::condition)
+                .ifPresent(expr -> collectExpressionAccessRequests(expr, out));
+        node.mutation().flatMap(sqlike.shared.MutationSpec::updateExpression)
+                .ifPresent(expr -> collectExpressionAccessRequests(expr, out));
         if (node.children() != null) {
             for (PlanNode child : node.children()) {
                 collectAccessRequests(child, out);
+            }
+        }
+    }
+
+    private static void collectExpressionAccessRequests(sqlike.shared.Expression expr, List<AccessRequest> out) {
+        if (expr == null) {
+            return;
+        }
+        if (expr.kind() == sqlike.shared.ExpressionKind.SUBQUERY) {
+            expr.subquery().ifPresent(sub -> collectAccessRequests(sub.root(), out));
+        }
+        if (expr.operands() != null) {
+            for (var operand : expr.operands()) {
+                collectExpressionAccessRequests(operand, out);
             }
         }
     }

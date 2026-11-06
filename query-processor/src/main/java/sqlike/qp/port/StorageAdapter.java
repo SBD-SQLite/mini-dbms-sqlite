@@ -121,6 +121,50 @@ public final class StorageAdapter implements IStorageManager {
             throw failure(e.getMessage());
         }
     }
+    @Override public List<String> listTables() {
+        try {
+            return storage.listTables();
+        } catch (StorageException e) {
+            throw failure(e.getMessage());
+        }
+    }
+    @Override public sqlike.shared.TableSchema getTableSchema(TableId table) {
+        try {
+            return storage.getSchema(table.value());
+        } catch (StorageException e) {
+            throw failure(e.getMessage());
+        }
+    }
+    @Override public List<sqlike.shared.IndexMetadata> getIndexes(TableId table) {
+        try {
+            return storage.getIndexes(table.value());
+        } catch (StorageException e) {
+            throw failure(e.getMessage());
+        }
+    }
+    @Override public String createSnapshot() {
+        try {
+            return storage.createSnapshot();
+        } catch (StorageException e) {
+            throw failure(e.getMessage());
+        }
+    }
+    @Override public void createTable(sqlike.shared.TableSchema schema, ExecutionContext context, AccessGrant grant, long lsn) {
+        access(new TableId(schema.tableName()), context, grant, AccessMode.WRITE);
+        try {
+            storage.createTable(schema, lsn);
+        } catch (StorageException e) {
+            throw failure(e.getMessage());
+        }
+    }
+    @Override public void dropTable(TableId table, sqlike.shared.DropBehavior behavior, ExecutionContext context, AccessGrant grant, long lsn) {
+        access(table, context, grant, AccessMode.WRITE);
+        try {
+            storage.dropTable(table.value(), behavior, lsn);
+        } catch (StorageException e) {
+            throw failure(e.getMessage());
+        }
+    }
     @Override public void applyRecovery(LogRecord record, RecoveryDirection direction, RecoveryContext context) {
         var change = record.change().value();
         try {

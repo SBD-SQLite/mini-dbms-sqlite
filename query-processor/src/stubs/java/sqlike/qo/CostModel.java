@@ -35,10 +35,12 @@ public final class CostModel {
             case PROJECT -> costProject(node);
             case JOIN, CARTESIAN -> costJoinBNLJ(node);
             case SORT -> costSort(node);
+            case LIMIT -> 0.0;
             case INSERT -> costInsert(node);
             case UPDATE -> costUpdate(node);
             case DELETE -> costDelete(node);
             case CREATE_INDEX -> costCreateIndex(node);
+            case CREATE_TABLE, DROP_TABLE -> 1.0;
         };
     }
 

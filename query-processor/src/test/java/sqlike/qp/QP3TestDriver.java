@@ -41,6 +41,7 @@ public class QP3TestDriver {
             testIndexScanOperator();
             testFilterOperator();
             testProjectOperator();
+            testLimitOperator();
             testMutationTargetCollector();
             testDeleteExecutor();
             System.out.println("RESULT: All " + testsPassed + " / " + testsRun + " tests PASSED successfully!");
@@ -270,6 +271,32 @@ public class QP3TestDriver {
         assertEquals(intVal(1), first.get().row().getValue(1), "Column 1 must be projected 'id'");
         assertTrue(first.get().rid().isPresent(), "ProjectOperator must preserve source RID");
         projectOp.close();
+    }
+
+    // 4b. LimitOperator Tests (QP-16* Bonus)
+    private static void testLimitOperator() {
+        System.out.println("[TEST] LimitOperator (LIMIT k, LIMIT 0 header preservation, early close)...");
+        InMemoryMockStorage storage = seedStudentStorage();
+        Schema baseSchema = studentSchema();
+        TableScanOperator scanOp = new TableScanOperator(
+                storage, new ScanSpec("students", Optional.empty(), Optional.empty()), baseSchema);
+
+        LimitOperator limit2 = new LimitOperator(scanOp, new sqlike.shared.LimitSpec(2));
+        ExecutionContext ctx = ExecutionContext.of(1041L);
+        limit2.open(ctx);
+        Optional<RowEnvelope> r1 = limit2.next();
+        Optional<RowEnvelope> r2 = limit2.next();
+        Optional<RowEnvelope> r3 = limit2.next();
+        assertTrue(r1.isPresent() && r2.isPresent() && r3.isEmpty(), "LIMIT 2 yields exactly 2 rows");
+        assertEquals(OperatorState.CLOSED, scanOp.getState(), "LimitOperator closes child immediately once limit is reached");
+        limit2.close();
+
+        LimitOperator limit0 = new LimitOperator(scanOp, new sqlike.shared.LimitSpec(0));
+        limit0.open(ctx);
+        assertEquals(4, limit0.schema().columnCount(), "LIMIT 0 preserves output schema columns");
+        assertTrue(limit0.next().isEmpty(), "LIMIT 0 yields 0 rows");
+        assertEquals(OperatorState.CLOSED, scanOp.getState(), "LIMIT 0 closes child immediately");
+        limit0.close();
     }
 
     // 5. MutationTargetCollector Tests

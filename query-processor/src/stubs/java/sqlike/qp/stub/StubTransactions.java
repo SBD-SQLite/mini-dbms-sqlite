@@ -56,6 +56,10 @@ public final class StubTransactions implements IConcurrencyControl {
         active(change.txId()); log("FRM.CHANGE"); WritePermit permit = new WritePermit(change.id(), new Lsn(lsn.incrementAndGet()));
         permits.put(change.id(), permit); return permit;
     }
+    @Override public WritePermit authorizeSchemaChange(SchemaChangeRecord change) {
+        active(change.txId()); log("FRM.SCHEMA_CHANGE"); WritePermit permit = new WritePermit(change.id(), new Lsn(lsn.incrementAndGet()));
+        permits.put(change.id(), permit); return permit;
+    }
     @Override public WriteLease acquireApplyLease(WritePermit permit) {
         active(permit.changeId().txId());
         if (!permit.equals(permits.get(permit.changeId())) || !leases.add(permit.changeId())) throw failure("Invalid apply lease");

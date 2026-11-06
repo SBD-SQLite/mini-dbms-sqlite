@@ -28,7 +28,7 @@ public class PlanPrinter {
 
     private String describe(PlanNode n) {
         return switch (n.kind()) {
-            case SCAN -> "SCAN " + n.scan().get().tableName();
+            case SCAN -> "SCAN " + n.scan().get().tableName() + n.scan().get().alias().map(a -> " AS " + a).orElse("");
             case INDEX_SCAN -> "INDEX_SCAN " + n.scan().get().tableName() + " using " + n.scan().get().indexName().orElse("?");
             case FILTER -> "FILTER " + expr(n.predicate().get());
             case PROJECT -> "PROJECT [" + n.projection().stream().map(PlanPrinter::col).collect(Collectors.joining(", ")) + "]";
@@ -37,6 +37,7 @@ public class PlanPrinter {
                     + (n.join().get().commonColumns().isEmpty() ? "" : " common=" + n.join().get().commonColumns());
             case CARTESIAN -> "CARTESIAN";
             case SORT -> "SORT " + col(n.sort().get().column()) + " " + n.sort().get().direction();
+            case LIMIT -> "LIMIT " + n.limit().get().count();
             case INSERT -> "INSERT INTO " + n.mutation().get().tableName() + " (" + n.mutation().get().insertValues().size() + " values)";
             case UPDATE -> "UPDATE " + n.mutation().get().tableName() + " SET "
                     + n.mutation().get().updateColumn().map(PlanPrinter::col).orElse("?") + " = "
@@ -44,6 +45,8 @@ public class PlanPrinter {
             case DELETE -> "DELETE FROM " + n.mutation().get().tableName();
             case CREATE_INDEX -> "CREATE_INDEX " + n.createIndex().get().indexName() + " ON "
                     + n.createIndex().get().tableName() + "(" + n.createIndex().get().columnName() + ") " + n.createIndex().get().indexType();
+            case CREATE_TABLE -> "CREATE_TABLE " + n.createTable().get().tableName();
+            case DROP_TABLE -> "DROP_TABLE " + n.dropTable().get().tableName() + " " + n.dropTable().get().behavior();
         };
     }
 
@@ -55,6 +58,7 @@ public class PlanPrinter {
             case COLUMN -> col(e.column().get());
             case UNARY -> "-(" + expr(e.operands().get(0)) + ")";
             case BINARY -> "(" + expr(e.operands().get(0)) + " " + op(e.operator().get()) + " " + expr(e.operands().get(1)) + ")";
+            case SUBQUERY -> "SUBQUERY(" + e.subquery().map(s -> s.type().name()).orElse("?") + ")";
         };
     }
 

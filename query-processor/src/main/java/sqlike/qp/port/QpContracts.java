@@ -19,6 +19,7 @@ public final class QpContracts {
     public record Expr(Expression value) { }
     public record IndexSearch(IndexCondition value) { }
     public record ChangeRecord(ChangeId id, TxId txId, DataChange value) { }
+    public record SchemaChangeRecord(ChangeId id, TxId txId, SchemaChange value) { }
     public record WritePermit(ChangeId changeId, Lsn lsn) { }
     public record RecoveryReport(boolean success, long lastTxId) { }
     public record LogRecord(ChangeRecord change, Lsn lsn) { }
@@ -46,6 +47,9 @@ public final class QpContracts {
         void initialize(RecoveryReport report); TxId begin(SessionId sessionId);
         AccessDecision acquireAccess(TxId txId, ResourceKey resource, AccessMode mode);
         AccessDecision waitAccess(UUID requestId); WritePermit authorizeChange(ChangeRecord change);
+        default WritePermit authorizeSchemaChange(SchemaChangeRecord change) {
+            return new WritePermit(change.id(), new Lsn(1L));
+        }
         WriteLease acquireApplyLease(WritePermit permit); void confirmApplied(ChangeId changeId);
         TransactionState getState(TxId txId); CancellationToken getCancellationToken(TxId txId);
         TransactionState commit(TxId txId); TransactionState abort(TxId txId, String reason);
@@ -67,6 +71,19 @@ public final class QpContracts {
         RidCursor findIndex(TableId tableId, String indexId, IndexSearch search, ExecutionContext context, AccessGrant grant);
         void createIndex(CreateIndexSpec spec, ExecutionContext context, AccessGrant grant);
         void applyRecovery(LogRecord record, RecoveryDirection direction, RecoveryContext context);
+        default List<String> listTables() { return List.of(); }
+        default TableSchema getTableSchema(TableId tableId) {
+            Schema s = getSchema(tableId);
+            return new TableSchema(tableId.value(), tableId.value(), s != null ? s.columns() : List.of());
+        }
+        default List<IndexMetadata> getIndexes(TableId tableId) { return List.of(); }
+        default String createSnapshot() { return "snap-0"; }
+        default void createTable(TableSchema schema, ExecutionContext context, AccessGrant grant, long lsn) {
+            throw failure("createTable is not implemented");
+        }
+        default void dropTable(TableId tableId, DropBehavior behavior, ExecutionContext context, AccessGrant grant, long lsn) {
+            throw failure("dropTable is not implemented");
+        }
     }
     public static IllegalStateException failure(String message) { return new IllegalStateException(message); }
     public static Object payload(Value value) {

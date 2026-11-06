@@ -101,6 +101,7 @@ public final class SelectionProjectionRewriter {
             return copyUnary(current, sorted);
         }
         if (child.kind() == PlanNodeKind.FILTER) {
+            if (containsSubquery(child.predicate().orElseThrow())) return current;
             LinkedHashSet<ColumnRef> required = new LinkedHashSet<>(requested);
             required.addAll(columns(child.predicate().orElseThrow()));
             PlanNode belowFilter = pushProjection(child.children().get(0), List.copyOf(required));
@@ -118,6 +119,7 @@ public final class SelectionProjectionRewriter {
         if (containsWildcard(required)) return node;
         if (node.kind() == PlanNodeKind.PROJECT) return node;
         if (node.kind() == PlanNodeKind.FILTER) {
+            if (containsSubquery(node.predicate().orElseThrow())) return PlanNodes.project(node, required);
             LinkedHashSet<ColumnRef> union = new LinkedHashSet<>(required);
             union.addAll(columns(node.predicate().orElseThrow()));
             return copyUnary(node, pushProjection(node.children().get(0), List.copyOf(union)));
@@ -177,6 +179,7 @@ public final class SelectionProjectionRewriter {
     }
 
     private Side predicateSide(Expression expression, PlanNode left, PlanNode right) {
+        if (containsSubquery(expression)) return Side.UNKNOWN;
         List<ColumnRef> refs = columns(expression);
         if (refs.isEmpty()) return Side.UNKNOWN;
         Side found = Side.UNKNOWN;
@@ -187,6 +190,11 @@ public final class SelectionProjectionRewriter {
             found = side;
         }
         return found;
+    }
+
+    private boolean containsSubquery(Expression expression) {
+        if (expression.kind() == ExpressionKind.SUBQUERY) return true;
+        return expression.operands().stream().anyMatch(this::containsSubquery);
     }
 
     private Side columnSide(ColumnRef ref, PlanNode left, PlanNode right) {
@@ -226,7 +234,7 @@ public final class SelectionProjectionRewriter {
     }
 
     private void collectTables(PlanNode node, Set<String> result) {
-        node.scan().ifPresent(s -> result.add(s.tableName()));
+        node.scan().ifPresent(s -> result.add(s.alias().orElse(s.tableName())));
         node.children().forEach(child -> collectTables(child, result));
     }
 
@@ -248,7 +256,18 @@ public final class SelectionProjectionRewriter {
     private void collectColumns(Expression expression, Set<ColumnRef> result) {
         if (expression.kind() == ExpressionKind.COLUMN)
             expression.column().ifPresent(result::add);
+        if (expression.kind() == ExpressionKind.SUBQUERY) {
+            expression.subquery().ifPresent(s -> collectPlanColumns(s.root(), result));
+        }
         expression.operands().forEach(child -> collectColumns(child, result));
+    }
+
+    private void collectPlanColumns(PlanNode node, Set<ColumnRef> result) {
+        node.predicate().ifPresent(p -> collectColumns(p, result));
+        node.join().flatMap(j -> j.condition()).ifPresent(c -> collectColumns(c, result));
+        result.addAll(node.projection());
+        node.sort().ifPresent(s -> result.add(s.column()));
+        node.children().forEach(c -> collectPlanColumns(c, result));
     }
 
     private boolean isSubset(List<ColumnRef> requested, List<ColumnRef> available) {
@@ -262,7 +281,7 @@ public final class SelectionProjectionRewriter {
 
     private PlanNode withChildren(PlanNode n, List<PlanNode> children) {
         return new PlanNode(n.kind(), children, n.outputColumns(), n.estimatedRows(), n.scan(), n.predicate(),
-                n.projection(), n.join(), n.sort(), n.mutation(), n.createIndex());
+                n.projection(), n.join(), n.sort(), n.mutation(), n.createIndex(), n.limit(), n.createTable(), n.dropTable());
     }
 
     private PlanNode copyUnary(PlanNode n, PlanNode child) {

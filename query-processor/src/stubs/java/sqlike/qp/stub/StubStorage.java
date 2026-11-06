@@ -105,6 +105,35 @@ public final class StubStorage implements IStorageManager, TransactionScope {
             throw failure("Index already exists: " + definition.indexName());
         newIndexes.computeIfAbsent(tx(), key -> new ArrayList<>()).add(definition); trace.add("SM.createIndex." + definition.indexType());
     }
+    @Override public void createTable(TableSchema schema, long lsn) {
+        if (lsn <= 0) throw failure("Schema write requires a logged LSN");
+        if (schemas.containsKey(schema.tableName())) throw failure("Table already exists: " + schema.tableName());
+        schemas.put(schema.tableName(), schema);
+        trace.add("SM.createTable." + schema.tableName());
+    }
+    @Override public void dropTable(String table, DropBehavior behavior, long lsn) {
+        if (lsn <= 0) throw failure("Schema write requires a logged LSN");
+        TableSchema removed = schemas.remove(table);
+        if (removed == null) throw failure("Unknown table: " + table);
+        rows.keySet().removeIf(rid -> rid.pageId().tableId().equalsIgnoreCase(table));
+        changes.values().forEach(m -> m.keySet().removeIf(rid -> rid.pageId().tableId().equalsIgnoreCase(table)));
+        definitions.removeIf(idx -> idx.tableName().equalsIgnoreCase(table));
+        newIndexes.values().forEach(list -> list.removeIf(idx -> idx.tableName().equalsIgnoreCase(table)));
+        if (behavior == DropBehavior.CASCADE) {
+            for (var entry : new ArrayList<>(schemas.entrySet())) {
+                TableSchema ts = entry.getValue();
+                var remainingFks = ts.foreignKeys().stream()
+                        .filter(fk -> !fk.referencedTable().equalsIgnoreCase(table))
+                        .toList();
+                if (remainingFks.size() != ts.foreignKeys().size()) {
+                    schemas.put(entry.getKey(), new TableSchema(
+                            ts.tableId(), ts.tableName(), ts.columns(), ts.primaryKey(), remainingFks));
+                }
+            }
+        }
+        rebuild();
+        trace.add("SM.dropTable." + table + "." + behavior);
+    }
     @Override public List<RID> lookupIndex(String name, IndexCondition condition) {
         lookups++; trace.add("SM.lookupIndex");
         var definition = definitions.stream().filter(i -> i.indexName().equals(name)).findFirst().orElseThrow(() -> failure("Unknown index: " + name));
