@@ -1,0 +1,46 @@
+# QO-16 scenarios. Format:  name | expected | SQL
+# expected: OK, or an ErrorCode (SYNTAX_ERROR, SEMANTIC_ERROR, UNSUPPORTED_OPERATION, INVALID_VALUE, INVALID_STATE)
+# Catalog (MockStorageManager): students(id,name,gpa,dept_id)  dept(dept_id,dname)  takes(id,course_id,grade)
+
+# --- valid queries ---
+select-all           | OK                    | SELECT * FROM students
+select-where         | OK                    | SELECT name FROM students WHERE id = 5
+select-mixed-case    | OK                    | SeLeCt NaMe FrOm StUdEnTs WhErE Id = 5
+select-and           | OK                    | SELECT name FROM students WHERE gpa >= 3.5 AND dept_id = 2
+select-order-by      | OK                    | SELECT name FROM students WHERE id > 10 ORDER BY name DESC
+select-join-on       | OK                    | SELECT students.name, dept.dname FROM students JOIN dept ON students.dept_id = dept.dept_id
+select-natural-join  | OK                    | SELECT * FROM students NATURAL JOIN dept
+select-comma-join    | OK                    | SELECT students.name FROM students, dept WHERE students.dept_id = dept.dept_id AND students.id > 3
+select-three-tables  | OK                    | SELECT * FROM students JOIN takes ON students.id = takes.id JOIN dept ON students.dept_id = dept.dept_id
+insert-row           | OK                    | INSERT INTO students VALUES (1, 'Ada', 3.5, 2)
+update-row           | OK                    | UPDATE students SET gpa = gpa + 0.1 WHERE id = 1
+delete-row           | OK                    | DELETE FROM takes WHERE course_id = 100
+create-index         | OK                    | CREATE INDEX ix_name ON students(name) USING BPLUS_TREE
+
+# --- syntax errors ---
+bad-keyword          | SYNTAX_ERROR          | SELEC * FROM students
+missing-select-list  | SYNTAX_ERROR          | SELECT FROM students
+clause-order         | SYNTAX_ERROR          | SELECT name WHERE id = 1 FROM students
+unterminated-string  | SYNTAX_ERROR          | SELECT * FROM students WHERE name = 'abc
+unclosed-paren       | SYNTAX_ERROR          | SELECT * FROM students WHERE (id = 1
+trailing-tokens      | SYNTAX_ERROR          | SELECT * FROM students WHERE id = 1 2
+table-alias          | UNSUPPORTED_OPERATION | SELECT * FROM students s
+missing-table        | SYNTAX_ERROR          | SELECT * FROM
+
+# --- semantic validation ---
+unknown-table        | SEMANTIC_ERROR        | SELECT * FROM nosuch
+unknown-column       | SEMANTIC_ERROR        | SELECT nocol FROM students
+ambiguous-column     | SEMANTIC_ERROR        | SELECT dept_id FROM students, dept
+type-mismatch        | SEMANTIC_ERROR        | SELECT * FROM students WHERE name = 5
+insert-arity         | SEMANTIC_ERROR        | INSERT INTO dept VALUES (30)
+index-unknown-column | SEMANTIC_ERROR        | CREATE INDEX ix ON students(nocol)
+
+# --- known issues (XFAIL = passes while the bug still reproduces; fix the bug, then change to OK) ---
+natural-join-3-tables | XFAIL SEMANTIC_ERROR | SELECT * FROM students NATURAL JOIN dept NATURAL JOIN takes
+insert-char-column   | XFAIL SEMANTIC_ERROR  | INSERT INTO dept VALUES (30, 'Math')
+char-column-compare  | XFAIL SEMANTIC_ERROR  | SELECT * FROM takes WHERE grade = 'E'
+
+# --- outside the agreed contract / invalid values ---
+or-unsupported       | UNSUPPORTED_OPERATION | SELECT * FROM students WHERE id = 1 OR id = 2
+subquery-unsupported | UNSUPPORTED_OPERATION | SELECT * FROM students WHERE id IN (SELECT id FROM takes)
+int-overflow         | INVALID_VALUE         | SELECT * FROM students WHERE id = 2147483648

@@ -10,10 +10,20 @@ public final class QODriver {
             if (runAllTests() != 0) System.exit(1);
             return;
         }
+        if (args.length >= 1 && args[0].equals("--scenarios")) {
+            java.nio.file.Path file = args.length > 1 ? java.nio.file.Path.of(args[1]) : QO1Test.DEFAULT_SCENARIOS;
+            if (QO1Test.runScenarios(file, true) != 0) System.exit(1);
+            return;
+        }
+        if (args.length >= 2 && args[0].equals("--explain")) {
+            try { System.out.print(new QueryOptimizer(MockStorageManager.create()).explainQuery(args[1])); }
+            catch (QoException e) { System.out.println(e.getInfo().code() + e.getInfo().position().map(p -> " at " + p).orElse("") + ": " + e.getMessage()); System.exit(1); }
+            return;
+        }
         Scanner input = new Scanner(System.in);
         QueryParser parser = new QueryParser(new SelectParser(new ExpressionParser()), new StatementParser());
         while (true) {
-            System.out.println("\n1. Parse SQL\n2. Run all tests\n0. Exit");
+            System.out.println("\n1. Parse SQL\n2. Run all tests\n3. Explain SQL (plan before/after + cost)\n4. Run scenario file\n0. Exit");
             System.out.print("> ");
             if (!input.hasNextLine()) return;
             switch (input.nextLine().trim()) {
@@ -32,6 +42,21 @@ public final class QODriver {
                     }
                 }
                 case "2" -> runAllTests();
+                case "3" -> {
+                    System.out.print("SQL (one statement): ");
+                    if (!input.hasNextLine()) return;
+                    try {
+                        System.out.print(new QueryOptimizer(MockStorageManager.create()).explainQuery(input.nextLine()));
+                    } catch (QoException e) {
+                        System.out.println(e.getInfo().code() + e.getInfo().position().map(p -> " at " + p).orElse("") + ": " + e.getMessage());
+                    }
+                }
+                case "4" -> {
+                    System.out.print("Scenario file [" + QO1Test.DEFAULT_SCENARIOS + "]: ");
+                    if (!input.hasNextLine()) return;
+                    String path = input.nextLine().trim();
+                    QO1Test.runScenarios(path.isEmpty() ? QO1Test.DEFAULT_SCENARIOS : java.nio.file.Path.of(path), true);
+                }
                 default -> System.out.println("Choose 0, 1, or 2.");
             }
         }
