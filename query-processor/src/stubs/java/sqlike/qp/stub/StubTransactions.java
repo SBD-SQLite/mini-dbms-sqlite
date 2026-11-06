@@ -8,7 +8,7 @@ import sqlike.qp.port.QpContracts.*;
 import static sqlike.qp.port.QpContracts.failure;
 
 /** STUB ONLY: CCM/FRM fake with scripted access, event traces, and overlay rollback; no locks or WAL. */
-public final class StubTransactions implements IConcurrencyControl {
+public final class StubTransactions implements IConcurrencyControl, IFailureRecovery {
     private final StubStorage storage;
     private final List<String> trace;
     private final AtomicLong ids;
@@ -90,4 +90,9 @@ public final class StubTransactions implements IConcurrencyControl {
         leases.removeIf(id -> id.txId().equals(tx)); states.put(tx, TransactionState.ABORTED); getCancellationToken(tx).cancel();
         trace.add("FRM.ABORT." + tx.value()); return TransactionState.ABORTED;
     }
+    @Override public Lsn appendEvent(TxId txId, TransactionEvent event) { log("FRM." + event + "." + txId.value()); return new Lsn(lsn.incrementAndGet()); }
+    @Override public Lsn appendChange(ChangeRecord change) { log("FRM.CHANGE." + change.id().sequence()); return new Lsn(lsn.incrementAndGet()); }
+    @Override public void forceLog(Lsn lsn) { trace.add("FRM.FORCE." + lsn.value()); }
+    @Override public void rollback(TxId txId) { storage.discard(txId); }
+    @Override public RecoveryReport recover() { trace.add("FRM.RECOVER"); return new RecoveryReport(true, storage.lastTxId()); }
 }

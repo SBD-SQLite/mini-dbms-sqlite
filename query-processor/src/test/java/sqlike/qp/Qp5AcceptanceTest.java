@@ -39,6 +39,7 @@ public final class Qp5AcceptanceTest {
         test("QP-15* DROP TABLE RESTRICT vs CASCADE", Qp5AcceptanceTest::dropTableRestrictAndCascade);
         test("QP-16* LIMIT and AS table alias (including self-join)", Qp5AcceptanceTest::limitAndTableAlias);
         test("QP-16* Subquery in WHERE (SCALAR, IN, EXISTS, correlated, 0-row NULL, >1-row error)", Qp5AcceptanceTest::subqueriesInWhere);
+        test("QP-01/QP-14 TCP QueryServer, CliClient, QpBootstrap, and disconnect auto-abort", Qp5AcceptanceTest::tcpServerMultiClientAndDisconnectAbort);
         System.out.println("RESULT: " + passed + " passed, " + failed + " failed");
         if (failed > 0) throw new AssertionError("Acceptance checks failed");
     }
@@ -422,6 +423,66 @@ public final class Qp5AcceptanceTest {
                 "SELECT e.id FROM employees AS e "
                 + "WHERE EXISTS (SELECT p.id FROM projects AS p WHERE p.lead_id = e.id AND p.budget > 60000);");
         assertEquals(List.of(List.of(3)), values(existsCorrelated));
+    }
+
+    private static void tcpServerMultiClientAndDisconnectAbort() throws Exception {
+        TestDatabase database = new TestDatabase();
+        SessionManager sessionManager = new SessionManager();
+        QueryProcessor qp = new QueryProcessor(
+                database.runner.optimizer,
+                database.runner.translator,
+                database.runner.engine,
+                sessionManager,
+                database.runner.transactions,
+                database.runner.access);
+        QpConfiguration config = new QpConfiguration(0, 4, 4096, IndexType.HASH, Path.of("."));
+        QueryServer server = new QueryServer(qp, config);
+        QpBootstrap bootstrap = new QpBootstrap(database.transactions, database.transactions, server);
+        bootstrap.start();
+        try {
+            assertEquals(SystemState.READY, bootstrap.getState());
+            int port = server.getBoundPort();
+            assertTrue(port > 0, "Server bound to ephemeral TCP port");
+
+            // Client 1: begins explicit transaction, inserts a row, and disconnects abruptly without COMMIT
+            java.io.StringWriter c1Out = new java.io.StringWriter();
+            try (CliClient client1 = new CliClient(
+                    new ProtocolCodec(),
+                    new StatementReader(),
+                    new ConsoleResultSink(new java.io.PrintWriter(c1Out, true)))) {
+                client1.connect("127.0.0.1", port);
+                client1.run(new java.io.BufferedReader(new java.io.StringReader(
+                        "BEGIN;\nINSERT INTO employees VALUES (77, 7700);\n")));
+            }
+
+            // Wait briefly for server handler to process EOF and close/abort session
+            long deadline = System.currentTimeMillis() + 3000;
+            while (!sessionManager.activeSessions().isEmpty() && System.currentTimeMillis() < deadline) {
+                Thread.sleep(20);
+            }
+            assertEquals(0, sessionManager.activeSessions().size());
+            // Uncommitted row (77, 7700) must have been rolled back on client1 disconnect
+            assertEquals(List.of(), database.rows());
+
+            // Client 2: executes auto-commit INSERT and SELECT over TCP
+            java.io.StringWriter c2Out = new java.io.StringWriter();
+            try (CliClient client2 = new CliClient(
+                    new ProtocolCodec(),
+                    new StatementReader(),
+                    new ConsoleResultSink(new java.io.PrintWriter(c2Out, true)))) {
+                client2.connect("127.0.0.1", port);
+                client2.run(new java.io.BufferedReader(new java.io.StringReader(
+                        "INSERT INTO employees VALUES (88, 8800);\nSELECT id, salary FROM employees;\n\\q\n")));
+            }
+            String rendered = c2Out.toString();
+            assertTrue(rendered.contains("1 row(s) affected"), rendered);
+            assertTrue(rendered.contains("| 88 | 8800.0 |"), rendered);
+            assertTrue(rendered.contains("1 row(s) returned"), rendered);
+            assertEquals(List.of(List.of(88, 8800.0)), database.rows());
+        } finally {
+            bootstrap.stop();
+            assertEquals(SystemState.STOPPED, bootstrap.getState());
+        }
     }
 
     private static void restartPhase(String phase, Path snapshot) {

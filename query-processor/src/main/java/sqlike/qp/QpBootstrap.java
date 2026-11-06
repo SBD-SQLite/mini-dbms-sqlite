@@ -32,6 +32,9 @@ public final class QpBootstrap {
             RecoveryReport report = recovery.recover();
             validateRecovery(report);
             concurrency.initialize(report);
+            if (server.getProcessor() instanceof QueryProcessor qp) {
+                qp.markReady();
+            }
             server.start();
             state.set(SystemState.READY);
         } catch (RuntimeException e) {
@@ -43,6 +46,9 @@ public final class QpBootstrap {
     public void stop() {
         try {
             server.stop();
+            if (server.getProcessor() instanceof QueryProcessor qp) {
+                qp.shutdown();
+            }
         } finally {
             state.set(SystemState.STOPPED);
         }

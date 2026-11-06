@@ -67,6 +67,10 @@ public final class QueryServer implements AutoCloseable {
         return listener != null ? listener.getLocalPort() : configuration.getPort();
     }
 
+    public IQueryProcessor getProcessor() {
+        return processor;
+    }
+
     private void acceptLoop() {
         while (running.get() && listener != null && !listener.isClosed()) {
             try {

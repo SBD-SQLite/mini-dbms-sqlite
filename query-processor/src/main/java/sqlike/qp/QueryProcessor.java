@@ -195,6 +195,10 @@ public final class QueryProcessor implements IQueryProcessor {
         return state;
     }
 
+    void markReady() {
+        this.state = SystemState.READY;
+    }
+
     public synchronized void shutdown() {
         for (SessionState session : sessions.activeSessions()) {
             closeSession(session.getId());
