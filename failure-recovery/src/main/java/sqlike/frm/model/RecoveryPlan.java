@@ -1,6 +1,6 @@
 package sqlike.frm.model;
 
-import sqlike.frm.Log.LogRecord;
+import sqlike.frm.log.LogRecord;
 import sqlike.frm.TxOutcome;
 import java.util.List;
 import java.util.Map;

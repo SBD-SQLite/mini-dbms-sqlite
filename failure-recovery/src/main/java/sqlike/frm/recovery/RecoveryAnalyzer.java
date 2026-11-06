@@ -1,6 +1,6 @@
 package sqlike.frm.recovery;
 
-import sqlike.frm.Log.LogRecord;
+import sqlike.frm.log.LogRecord;
 import sqlike.frm.model.RecoveryPlan;
 import java.util.Collections;
 import java.util.HashSet;

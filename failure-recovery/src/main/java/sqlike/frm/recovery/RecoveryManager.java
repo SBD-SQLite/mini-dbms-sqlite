@@ -1,6 +1,6 @@
 package sqlike.frm.recovery;
 
-import sqlike.frm.Log.LogManager;
+import sqlike.frm.log.LogManager;
 import sqlike.frm.RecoveryError;
 import sqlike.frm.RecoveryState;
 import sqlike.frm.port.CcmPort;
