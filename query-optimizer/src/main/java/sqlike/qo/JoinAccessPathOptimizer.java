@@ -22,8 +22,8 @@ public class JoinAccessPathOptimizer {
 
     private boolean isOptimizable(PlanNode plan) {
         return switch (plan.kind()) {
-            case SCAN, INDEX_SCAN, FILTER, PROJECT, JOIN, CARTESIAN, SORT -> true;
-            case INSERT, UPDATE, DELETE, CREATE_INDEX -> false;
+            case SCAN, INDEX_SCAN, FILTER, PROJECT, JOIN, CARTESIAN, SORT, LIMIT -> true;
+            case INSERT, UPDATE, DELETE, CREATE_INDEX, CREATE_TABLE, DROP_TABLE -> false;
         };
     }
 }

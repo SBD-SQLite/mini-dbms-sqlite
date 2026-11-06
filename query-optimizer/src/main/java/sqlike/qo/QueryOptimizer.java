@@ -4,15 +4,6 @@ import sqlike.contract.IQueryOptimizer;
 import sqlike.contract.IStorageManager;
 import sqlike.shared.*;
 
-/**
- * QO facade (QO-01, QO-15, QO-16). Hidden internal class: QP only sees {@link IQueryOptimizer}.
- * Flow: parseQuery = Lexer -> QueryParser; optimizeQuery = Binder.bind -> JoinAccessPathOptimizer.optimize
- * -> QueryPlan(root, CostModel.getCost). Stateless, so it is safe for concurrent QP clients.
- * Errors are thrown as {@link QoException} (carries ErrorInfo); QP turns them into QueryResult.ERROR.
- *
- * Milestone 1: the facade wiring and parsing of SELECT/transactions are real; Binder, CostModel and
- * JoinAccessPathOptimizer (QO3/QO5) and ExpressionParser/StatementParser (QO2) are MOCK placeholders.
- */
 public class QueryOptimizer implements IQueryOptimizer {
 
     private final Lexer lexer;
@@ -49,6 +40,7 @@ public class QueryOptimizer implements IQueryOptimizer {
         if (st == StatementType.BEGIN || st == StatementType.COMMIT || st == StatementType.ABORT)
             throw QoErrors.invalidState("transaction statements are not optimized (" + st + ")");
         PlanNode bound = binder.bind(query);
+        if (isPassThrough(bound)) return new QueryPlan(bound, 0.0);
         PlanNode rewritten = selectionProjectionRewriter.rewrite(bound);
         PlanNode best = optimizer.optimize(rewritten);
         return new QueryPlan(best, costModel.getCost(best));
@@ -57,7 +49,16 @@ public class QueryOptimizer implements IQueryOptimizer {
     @Override
     public double getCost(QueryPlan plan) {
         if (plan == null) throw QoErrors.invalidValue("QueryPlan is null", 0);
+        if (plan.root() != null && isPassThrough(plan.root())) return 0.0;
         return costModel.getCost(plan.root());
+    }
+
+    /** Statements that are validated but not optimized: no I/O cost model applies, so getCost is safe to call on them */
+    private static boolean isPassThrough(PlanNode root) {
+        return switch (root.kind()) {
+            case CREATE_INDEX, CREATE_TABLE, DROP_TABLE -> true;
+            default -> false;
+        };
     }
 
     /** Extra (not in IQueryOptimizer): human-readable before/after plan for the driver / QO-15. */

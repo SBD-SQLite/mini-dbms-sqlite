@@ -157,7 +157,7 @@ public final class SelectionProjectionRewriter {
             else return null;
         }
         for (String name : commonColumns) {
-            ColumnRef common = ColumnRef.of(null, name);
+            ColumnRef common = Refs.column(null, name);
             leftNeeded.add(common);
             rightNeeded.add(common);
         }
@@ -262,7 +262,8 @@ public final class SelectionProjectionRewriter {
 
     private PlanNode withChildren(PlanNode n, List<PlanNode> children) {
         return new PlanNode(n.kind(), children, n.outputColumns(), n.estimatedRows(), n.scan(), n.predicate(),
-                n.projection(), n.join(), n.sort(), n.mutation(), n.createIndex());
+                n.projection(), n.join(), n.sort(), n.mutation(), n.createIndex(),
+                n.limit(), n.createTable(), n.dropTable());
     }
 
     private PlanNode copyUnary(PlanNode n, PlanNode child) {

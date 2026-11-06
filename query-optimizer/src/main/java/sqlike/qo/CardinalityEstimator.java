@@ -22,6 +22,9 @@ public final class CardinalityEstimator {
             case PROJECT, SORT, UPDATE, DELETE -> node.children().isEmpty() ? 0 : estimateRows(node.children().get(0));
             case INSERT -> 1;
             case CREATE_INDEX -> 0;
+            case LIMIT -> node.children().isEmpty() ? 0
+                    : Math.min(estimateRows(node.children().get(0)), node.limit().orElseThrow().count());
+            case CREATE_TABLE, DROP_TABLE -> 0;
         };
     }
 

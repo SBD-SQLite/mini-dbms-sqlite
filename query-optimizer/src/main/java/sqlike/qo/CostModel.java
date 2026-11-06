@@ -39,6 +39,8 @@ public final class CostModel {
             case UPDATE -> costUpdate(node);
             case DELETE -> costDelete(node);
             case CREATE_INDEX -> costCreateIndex(node);
+            // no extra disk I/O: LIMIT di pipeline, table DDL di passthrough
+            case LIMIT, CREATE_TABLE, DROP_TABLE -> 0.0;
         };
     }
 

@@ -1,7 +1,6 @@
 package sqlike.qo;
 
 import java.util.List;
-import sqlike.shared.QoException;
 
 /** cursor over the tokens produced by {@link Lexer}, selalu diakhiri with one EOF token */
 public final class TokenStream {
