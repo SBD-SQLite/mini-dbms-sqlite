@@ -23,7 +23,7 @@ public class QueryOptimizer implements IQueryOptimizer {
         this.binder = new Binder(storage);
         this.selectionProjectionRewriter = new SelectionProjectionRewriter();
         this.costModel = new CostModel(storage);
-        this.optimizer = new JoinAccessPathOptimizer(costModel);
+        this.optimizer = new JoinAccessPathOptimizer(costModel, storage);
         this.printer = new PlanPrinter();
         this.annotator = new PlanAnnotator(new CardinalityEstimator(storage));
     }

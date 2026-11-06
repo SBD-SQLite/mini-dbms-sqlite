@@ -6,7 +6,7 @@ import java.util.Optional;
 import sqlike.shared.*;
 import static sqlike.qo.QO5TestSupport.*;
 
-/** QO-11/QO-12 acceptance and regression checks; invoked by the existing QODriver. */
+/** QO-11 through QO-14 acceptance and regression checks; invoked by the existing QODriver. */
 public final class QO5Test {
     private static int passed, failed;
     private QO5Test() { }
@@ -42,6 +42,7 @@ public final class QO5Test {
         test("four natural joins remain equivalent in bushy candidates", QO5Test::fourNatural);
         test("disconnected join inputs keep every Cartesian combination", QO5Test::disconnectedInputs);
         test("candidate equivalence holds for varied fixture contents", QO5Test::variedContents);
+        QO5AccessPathTest.run(QO5Test::test);
         System.out.printf("QO5: %d passed, %d failed%n", passed, failed);
         return failed;
     }

@@ -27,6 +27,13 @@ final class QO5Plans {
                 || expression.operands().stream().anyMatch(QO5Plans::hasSubquery);
     }
 
+    static boolean hasSubquery(PlanNode plan) {
+        return plan.predicate().map(QO5Plans::hasSubquery).orElse(false)
+                || plan.join().flatMap(JoinSpec::condition).map(QO5Plans::hasSubquery).orElse(false)
+                || plan.mutation().flatMap(MutationSpec::updateExpression).map(QO5Plans::hasSubquery).orElse(false)
+                || plan.children().stream().anyMatch(QO5Plans::hasSubquery);
+    }
+
     static List<Expression> conjuncts(Expression expression) {
         List<Expression> result = new ArrayList<>();
         split(expression, result);
