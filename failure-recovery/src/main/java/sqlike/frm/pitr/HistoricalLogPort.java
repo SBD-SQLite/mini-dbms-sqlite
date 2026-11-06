@@ -1,14 +1,27 @@
 package sqlike.frm.pitr;
 
-import sqlike.frm.port.SmPort;
-import sqlike.shared.RecoveryTarget;
+import java.util.List;
 
-/** Historical-log operations required by point-in-time recovery. */
+import sqlike.frm.log.LogRecord;
+
+/**
+ * Write-ahead-log history a point-in-time recovery needs.
+ *
+ * <p>The log only provides and separates records; choosing the target LSN, the base snapshot,
+ * and the committed changes to replay belongs to {@link HistoricalRecoveryPlanner}.
+ */
 public interface HistoricalLogPort {
 
-    /** Resolves a validated user target to a base snapshot and inclusive WAL boundary. */
-    HistoricalRecoveryPlan planFor(RecoveryTarget target);
+    /**
+     * Returns every valid record of the archived logs and the active log, in ascending LSN order.
+     * Needs LSN, txId, type, COMMIT time, and before/after images.
+     */
+    List<LogRecord> readHistory();
 
-    /** Replays committed changes after the snapshot through the plan's target LSN. */
-    void replay(HistoricalRecoveryPlan plan, SmPort storageManager);
+    /**
+     * Moves the active log into the archive and opens a new active log that continues LSNs after
+     * the last one. Called after a historical restore so crash recovery never redoes the
+     * discarded timeline.
+     */
+    void separateHistory();
 }
