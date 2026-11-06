@@ -56,7 +56,7 @@ public class QueryOptimizer implements IQueryOptimizer {
     /** Statements that are validated but not optimized: no I/O cost model applies, so getCost is safe to call on them */
     private static boolean isPassThrough(PlanNode root) {
         return switch (root.kind()) {
-            case CREATE_INDEX, CREATE_TABLE, DROP_TABLE -> true;
+            case CREATE_TABLE, DROP_TABLE -> true;
             default -> false;
         };
     }

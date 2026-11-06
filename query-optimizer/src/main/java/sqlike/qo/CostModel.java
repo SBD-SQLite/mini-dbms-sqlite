@@ -1,14 +1,16 @@
 package sqlike.qo;
 
 import sqlike.contract.IStorageManager;
+import sqlike.shared.IndexMetadata;
 import sqlike.shared.PlanNode;
-import sqlike.shared.PlanNodeKind;
 
-/** Cost-model skeleton. Costs are intended to be elapsed I/O time in milliseconds. */
+import sqlike.shared.TableStatistics;
+
+/** Estimates disk I/O time in milliseconds using seek and block-transfer costs. */
 public final class CostModel {
     private static final double SEEK_TIME_MS = 4.0;
     private static final double TRANSFER_TIME_MS = 0.1;
-    // TODO: replace with the actual buffer budget once the contract exposes it.
+    // Temporary assumption: one outer block, one input block, and one output block.
     private static final int BUFFER_BLOCKS = 3;
 
     private final IStorageManager storage;
@@ -20,15 +22,15 @@ public final class CostModel {
         this.estimator = new CardinalityEstimator(storage);
     }
 
-    /** Sum each node's local cost and the costs of its child plans. */
+    /** Returns the sum of each node's local I/O cost and its child-plan costs. */
     public double getCost(PlanNode root) {
         if (root == null) throw QoErrors.invalidValue("plan root is null", 0);
         return costNode(root);
     }
 
     private double costNode(PlanNode node) {
-        double children = node.children().stream().mapToDouble(this::costNode).sum();
-        return children + switch (node.kind()) {
+        double childCost = node.children().stream().mapToDouble(this::costNode).sum();
+        return childCost + switch (node.kind()) {
             case SCAN -> costScan(node);
             case INDEX_SCAN -> costIndexScan(node);
             case FILTER -> costFilter(node);
@@ -39,72 +41,120 @@ public final class CostModel {
             case UPDATE -> costUpdate(node);
             case DELETE -> costDelete(node);
             case CREATE_INDEX -> costCreateIndex(node);
-            // no extra disk I/O: LIMIT di pipeline, table DDL di passthrough
+            // These operators are passed through or pipelined; they add no modeled page I/O.
             case LIMIT, CREATE_TABLE, DROP_TABLE -> 0.0;
         };
     }
 
     private double costScan(PlanNode node) {
-        // TODO: use b_r from SM statistics. Sequential scan estimate: one initial
-        // seek plus b_r block transfers, i.e. tS + b_r * tt (zero if b_r is zero).
-        throw new UnsupportedOperationException("TODO: implement table-scan cost");
+        long blocks = estimator.estimateBlocks(node);
+        return sequentialReadCost(blocks);
     }
 
     private double costIndexScan(PlanNode node) {
-        // TODO: estimate index traversal and qualifying heap-page reads. The SM
-        // contract currently has no tree height or clustering statistic, so agree
-        // on and document a conservative assumption instead of guessing silently.
-        throw new UnsupportedOperationException("TODO: implement index-scan cost");
+        long dataBlocks = estimator.estimateBlocks(node);
+        // The contract has no index height/page count. Model one index-page access,
+        // then a random heap-page access for each distinct qualifying data page.
+        return SEEK_TIME_MS + TRANSFER_TIME_MS
+                + dataBlocks * (SEEK_TIME_MS + TRANSFER_TIME_MS);
     }
 
     private double costFilter(PlanNode node) {
-        // TODO: under a pipelined I/O-only model, filtering adds no disk I/O;
-        // return zero unless the plan materializes filter output. CPU cost is out
-        // of scope for the seek/transfer model.
-        throw new UnsupportedOperationException("TODO: implement filter cost");
+        // Selection is pipelined and CPU comparison cost is outside this disk-I/O model.
+        return 0.0;
     }
 
     private double costProject(PlanNode node) {
-        // TODO: projection is normally pipelined and adds no disk I/O. Return zero
-        // unless projection causes a materialized intermediate result.
-        throw new UnsupportedOperationException("TODO: implement projection cost");
+        // Projection is pipelined and adds no disk I/O unless output is materialized.
+        return 0.0;
     }
 
     private double costJoinBNLJ(PlanNode node) {
-        // TODO: use b_outer + ceil(b_outer / (M - 2)) * b_inner block transfers
-        // for BNLJ, plus seeks for the actual access pattern. Since costNode sums
-        // child costs, define carefully whether those child reads are already
-        // charged, so the first scan of either input is not counted twice.
-        throw new UnsupportedOperationException("TODO: implement BNLJ cost");
+        if (node.children().size() != 2)
+            throw QoErrors.invalidState("BNLJ cost requires two input plans");
+
+        long outerBlocks = estimator.estimateBlocks(node.children().get(0));
+        long innerBlocks = estimator.estimateBlocks(node.children().get(1));
+        if (outerBlocks == 0 || innerBlocks == 0) return 0.0;
+
+        int outerCapacity = Math.max(1, BUFFER_BLOCKS - 2);
+        long batches = ceilDiv(outerBlocks, outerCapacity);
+        long innerRescans = Math.max(0, batches - 1);
+
+        // The child costs already include producing/reading each input once. Charge
+        // only the additional inner scans here, avoiding double-counting the first pass.
+        // This assumes child results can be replayed as materialized relations; temp-file
+        // writes are not represented separately in the current plan model.
+        return innerRescans * (SEEK_TIME_MS + innerBlocks * TRANSFER_TIME_MS);
     }
 
     private double costSort(PlanNode node) {
-        // TODO: external merge-sort estimate: 2*b*(1 + ceil(log_(M-1)(ceil(b/M))))
-        // block transfers, plus seeks for run generation and merge passes.
-        throw new UnsupportedOperationException("TODO: implement sort cost");
+        long blocks = estimator.estimateBlocks(node.children().get(0));
+        if (blocks <= BUFFER_BLOCKS) return 0.0;
+
+        long runs = ceilDiv(blocks, BUFFER_BLOCKS);
+        long mergePasses = 0;
+        long seeks = runs; // one sequential seek per initial run written
+        int fanIn = Math.max(2, BUFFER_BLOCKS - 1);
+        while (runs > 1) {
+            long mergedRuns = ceilDiv(runs, fanIn);
+            seeks += runs + mergedRuns; // input-run seeks plus output-run seeks
+            runs = mergedRuns;
+            mergePasses++;
+        }
+
+        // The child plan already accounts for producing/reading its input. Charge
+        // initial run writes, then one read and write of all blocks per merge pass.
+        double transfers = blocks + 2.0 * blocks * mergePasses;
+        return seeks * SEEK_TIME_MS + transfers * TRANSFER_TIME_MS;
     }
 
     private double costInsert(PlanNode node) {
-        // TODO: estimate target-page access and write/transfer cost. Use the
-        // inserted row and table statistics if the SM contract exposes enough data.
-        throw new UnsupportedOperationException("TODO: implement INSERT cost");
+        // The interface does not expose the destination page. Assume one page access
+        // to insert and persist the row.
+        return SEEK_TIME_MS + TRANSFER_TIME_MS;
     }
 
     private double costUpdate(PlanNode node) {
-        // TODO: include the cost to locate qualifying rows and write changed
-        // pages; avoid charging child-plan reads twice.
-        throw new UnsupportedOperationException("TODO: implement UPDATE cost");
+        return costModifiedPages(node);
     }
 
     private double costDelete(PlanNode node) {
-        // TODO: include the cost to locate qualifying rows and modify/delete their
-        // pages; avoid charging child-plan reads twice.
-        throw new UnsupportedOperationException("TODO: implement DELETE cost");
+        return costModifiedPages(node);
+    }
+
+    private double costModifiedPages(PlanNode node) {
+        if (node.children().isEmpty()) return 0.0;
+        long modifiedBlocks = estimator.estimateBlocks(node.children().get(0));
+        if (modifiedBlocks == 0) return 0.0;
+        // Child costs include finding/reading qualifying rows. Charge one seek and
+        // one transfer per dirty page to persist the modifications.
+        return SEEK_TIME_MS + modifiedBlocks * TRANSFER_TIME_MS;
     }
 
     private double costCreateIndex(PlanNode node) {
-        // TODO: estimate scanning the table and writing/building index pages.
-        // Use table/index statistics when available; otherwise document the model.
-        throw new UnsupportedOperationException("TODO: implement CREATE INDEX cost");
+        IndexMetadata index = node.createIndex().orElseThrow();
+        TableStatistics stats = storage.getStatistics(actualTableName(index.tableName()));
+        long tableBlocks = stats.blockCount();
+        long indexBlocks = stats.recordCount() == 0 ? 0
+                : ceilDiv(stats.recordCount(), Math.max(1, stats.blockingFactor()));
+
+        // Approximate index construction as a sequential table read plus sequential
+        // index-page writes. Index fanout/height and index-page occupancy are unknown.
+        return sequentialReadCost(tableBlocks)
+                + (indexBlocks == 0 ? 0 : SEEK_TIME_MS + indexBlocks * TRANSFER_TIME_MS);
+    }
+
+    private double sequentialReadCost(long blocks) {
+        return blocks <= 0 ? 0.0 : SEEK_TIME_MS + blocks * TRANSFER_TIME_MS;
+    }
+
+    private String actualTableName(String table) {
+        return storage.listTables().stream().filter(name -> name.equalsIgnoreCase(table)).findFirst()
+                .orElseThrow(() -> QoErrors.semantic("unknown table '" + table + "'"));
+    }
+
+    private static long ceilDiv(long numerator, long denominator) {
+        return numerator <= 0 ? 0 : 1 + (numerator - 1) / denominator;
     }
 }

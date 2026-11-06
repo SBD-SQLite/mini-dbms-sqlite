@@ -22,6 +22,12 @@ public class ExpressionParser {
 
     private Expression parseCompare(TokenStream ts) {
         Expression expression = parseAdditive(ts);
+        if (ts.peek().isKeyword(Keyword.IN)) {
+            Token in = ts.next();
+            if (ts.peek().isSymbol("(") && ts.peek(1).isKeyword(Keyword.SELECT))
+                throw QoErrors.unsupported("subqueries are not part of the agreed contract", in.offset());
+            throw QoErrors.unsupported("IN predicates are not part of the agreed contract", in.offset());
+        }
         ExpressionOperator operator = comparisonOperator(ts.peek());
         if (operator == null) return expression;
         ts.next();
@@ -77,6 +83,10 @@ public class ExpressionParser {
 
     private Expression parseAtom(TokenStream ts) {
         Token token = ts.peek();
+        if (ts.peek().isSymbol("(") && ts.peek(1).isKeyword(Keyword.SELECT))
+            throw QoErrors.unsupported("subqueries are not part of the agreed contract", token.offset());
+        if (token.isKeyword(Keyword.EXISTS))
+            throw QoErrors.unsupported("subqueries are not part of the agreed contract", token.offset());
         if (ts.matchSymbol("(")) {
             Expression expression = parseAnd(ts);
             ts.expectSymbol(")");
