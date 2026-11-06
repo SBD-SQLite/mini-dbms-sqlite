@@ -1,24 +1,33 @@
 package sqlike.ccm;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
- * Deadlock checks for the lock-based protocol.
- *
- * <p>Cycle detection is still a milestone 1 mock and returns an empty list.
+ * Finds cycles in the lock protocol's wait-for graph.
  * The CCM facade handles aborting the transaction chosen as the victim.
  */
 public class DeadlockHandler {
 
     private final Map<Long, Set<Long>> waitFor = new HashMap<>();
 
-    public List<Long> detectCycle() {
-        // TODO(CC2): find cycles in the wait-for graph.
+    public synchronized List<Long> detectCycle() {
+        Set<Long> finished = new HashSet<>();
+        Map<Long, Integer> visiting = new HashMap<>();
+        List<Long> path = new ArrayList<>();
+        for (long txId : new TreeSet<>(waitFor.keySet())) {
+            List<Long> cycle = visit(txId, finished, visiting, path);
+            if (!cycle.isEmpty()) {
+                return cycle;
+            }
+        }
         return List.of();
     }
 
@@ -33,7 +42,45 @@ public class DeadlockHandler {
         return Collections.max(cycle);
     }
 
-    void reset() {
+    public synchronized Map<Long, Set<Long>> getWaitForGraph() {
+        Map<Long, Set<Long>> snapshot = new HashMap<>();
+        waitFor.forEach((txId, blockers) -> snapshot.put(txId, Set.copyOf(blockers)));
+        return Map.copyOf(snapshot);
+    }
+
+    synchronized void updateWaitFor(Map<Long, Set<Long>> graph) {
         waitFor.clear();
+        graph.forEach((txId, blockers) -> {
+            if (!blockers.isEmpty()) {
+                waitFor.put(txId, Set.copyOf(blockers));
+            }
+        });
+    }
+
+    synchronized void reset() {
+        waitFor.clear();
+    }
+
+    private List<Long> visit(long txId, Set<Long> finished, Map<Long, Integer> visiting,
+                             List<Long> path) {
+        Integer start = visiting.get(txId);
+        if (start != null) {
+            return List.copyOf(path.subList(start, path.size()));
+        }
+        if (finished.contains(txId)) {
+            return List.of();
+        }
+        visiting.put(txId, path.size());
+        path.add(txId);
+        for (long blocker : new TreeSet<>(waitFor.getOrDefault(txId, Set.of()))) {
+            List<Long> cycle = visit(blocker, finished, visiting, path);
+            if (!cycle.isEmpty()) {
+                return cycle;
+            }
+        }
+        path.remove(path.size() - 1);
+        visiting.remove(txId);
+        finished.add(txId);
+        return List.of();
     }
 }
