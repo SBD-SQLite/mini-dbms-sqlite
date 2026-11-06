@@ -69,10 +69,15 @@ final class QO5TestSupport {
     }
 
     static Rows eval(PlanNode plan, Map<String, List<List<Object>>> data) {
+        return eval(plan, data, catalog());
+    }
+
+    static Rows eval(PlanNode plan, Map<String, List<List<Object>>> data, IStorageManager storage) {
         if (plan.kind() == PlanNodeKind.SCAN)
             return new Rows(plan.outputColumns(), data.get(plan.scan().orElseThrow().tableName().toLowerCase(Locale.ROOT)));
-        if (QO5Plans.isJoin(plan)) return join(plan, data);
-        Rows input = eval(plan.children().get(0), data);
+        if (plan.kind() == PlanNodeKind.INDEX_SCAN) return indexScan(plan, data, storage);
+        if (QO5Plans.isJoin(plan)) return join(plan, data, storage);
+        Rows input = eval(plan.children().get(0), data, storage);
         List<List<Object>> rows = new ArrayList<>();
         switch (plan.kind()) {
             case FILTER -> {
@@ -100,8 +105,8 @@ final class QO5TestSupport {
         return new Rows(plan.outputColumns(), List.copyOf(rows));
     }
 
-    private static Rows join(PlanNode plan, Map<String, List<List<Object>>> data) {
-        Rows left = eval(plan.children().get(0), data), right = eval(plan.children().get(1), data);
+    private static Rows join(PlanNode plan, Map<String, List<List<Object>>> data, IStorageManager storage) {
+        Rows left = eval(plan.children().get(0), data, storage), right = eval(plan.children().get(1), data, storage);
         JoinSpec spec = plan.join().orElseThrow();
         List<ResultColumn> input = new ArrayList<>(left.schema());
         input.addAll(right.schema());
@@ -124,6 +129,46 @@ final class QO5TestSupport {
             }
         }
         return new Rows(plan.outputColumns(), List.copyOf(rows));
+    }
+
+    private static Rows indexScan(PlanNode plan, Map<String, List<List<Object>>> data, IStorageManager storage) {
+        ScanSpec scan = plan.scan().orElseThrow();
+        String table = storage.listTables().stream().filter(name -> name.equalsIgnoreCase(scan.tableName())).findFirst().orElseThrow();
+        IndexMetadata index = storage.getIndexes(table).stream()
+                .filter(metadata -> metadata.indexName().equalsIgnoreCase(scan.indexName().orElseThrow())).findFirst().orElseThrow();
+        IndexCondition condition = scan.condition().orElseThrow();
+        check(index.indexType() == IndexType.BPLUS_TREE || condition.operator() == IndexOperator.EQ, "HASH range lookup");
+        int column = -1;
+        for (int i = 0; i < plan.outputColumns().size(); i++)
+            if (plan.outputColumns().get(i).source().orElseThrow().columnName().equalsIgnoreCase(index.columnName())) column = i;
+        check(column >= 0, "index key column missing");
+        equal(plan.outputColumns().get(column).dataType(), condition.key().type());
+        List<List<Object>> rows = new ArrayList<>();
+        for (List<Object> row : data.get(table.toLowerCase(Locale.ROOT))) {
+            int lower = compare(row.get(column), scalar(condition.key()));
+            boolean matches = switch (condition.operator()) {
+                case EQ -> lower == 0;
+                case GT -> lower > 0;
+                case GE -> lower >= 0;
+                case LT -> lower < 0;
+                case LE -> lower <= 0;
+                case BETWEEN -> {
+                    int upper = compare(row.get(column), scalar(condition.upperBound().orElseThrow()));
+                    yield (condition.lowerInclusive() ? lower >= 0 : lower > 0)
+                            && (condition.upperInclusive() ? upper <= 0 : upper < 0);
+                }
+            };
+            if (matches) rows.add(row);
+        }
+        return new Rows(plan.outputColumns(), List.copyOf(rows));
+    }
+
+    private static Object scalar(Value value) {
+        return switch (value.type()) {
+            case INTEGER -> value.integerValue().orElseThrow();
+            case FLOAT -> value.floatValue().orElseThrow();
+            case CHAR, VARCHAR -> value.textValue().orElseThrow();
+        };
     }
 
     private static int offset(List<ResultColumn> schema, ColumnRef column) {
@@ -171,8 +216,12 @@ final class QO5TestSupport {
     }
 
     static void equivalent(PlanNode before, PlanNode after, Map<String, List<List<Object>>> data) {
+        equivalent(before, after, data, catalog());
+    }
+
+    static void equivalent(PlanNode before, PlanNode after, Map<String, List<List<Object>>> data, IStorageManager storage) {
         PlanNodes.validate(after);
-        Rows expected = eval(before, data), actual = eval(after, data);
+        Rows expected = eval(before, data, storage), actual = eval(after, data, storage);
         equal(expected.schema(), actual.schema());
         equal(bag(expected.values()), bag(actual.values()));
         validateReferences(after);
