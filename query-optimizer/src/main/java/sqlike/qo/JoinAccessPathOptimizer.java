@@ -2,22 +2,37 @@ package sqlike.qo;
 
 import java.util.List;
 import sqlike.shared.PlanNode;
+
+/** QO-11/QO-12 pipeline. Access-path alternatives are added in the next QO5 package. */
 public class JoinAccessPathOptimizer {
+    private final JoinRewriter joinRewriter = new JoinRewriter();
+    private final JoinOrderEnumerator joinEnumerator = new JoinOrderEnumerator();
+    private final PlanSelector planSelector = new PlanSelector();
+    private final CostModel costModel;
+
+    /** Supply the same QO3 model used by the facade; no catalog or cost formula is duplicated. */
+    public JoinAccessPathOptimizer(CostModel costModel) {
+        if (costModel == null) throw new IllegalArgumentException("cost model is required");
+        this.costModel = costModel;
+    }
+
     public PlanNode optimize(PlanNode plan) {
-        if (plan == null || plan.kind() == null)
-            throw QoErrors.invalidState("QO5 requires a plan with a node kind");
+        QO5Plans.requirePlan(plan);
         if (!isOptimizable(plan)) return plan;
 
-        PlanNode candidate = generateCandidates(plan).get(0);
-        return restoreOutputSchema(candidate, plan);
+        PlanNode rewritten = joinRewriter.mergeSelectionIntoJoin(joinRewriter.cartesianToJoin(plan));
+        PlanNode candidate = planSelector.pickCheapest(generateCandidates(rewritten), costModel);
+        PlanNode result = restoreOutputSchema(candidate, plan);
+        PlanNodes.validate(result);
+        return result;
     }
 
     private List<PlanNode> generateCandidates(PlanNode plan) {
-        return List.of(plan);
+        return joinEnumerator.enumerate(plan);
     }
 
     private PlanNode restoreOutputSchema(PlanNode candidate, PlanNode original) {
-        return candidate;
+        return QO5Plans.restore(candidate, original);
     }
 
     private boolean isOptimizable(PlanNode plan) {
