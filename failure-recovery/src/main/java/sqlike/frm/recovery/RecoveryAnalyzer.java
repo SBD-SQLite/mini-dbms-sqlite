@@ -8,6 +8,10 @@ import java.util.*;
 public class RecoveryAnalyzer {
 
     public RecoveryPlan analyze(List<LogRecord> records) throws Exception {
+        if (records == null) {
+            throw new IllegalArgumentException("Daftar log tidak boleh null.");
+        }
+
         RecoveryPlan plan = new RecoveryPlan();
         plan.committedTx = new HashSet<>();
         plan.uncommittedTx = new HashSet<>();
@@ -15,8 +19,8 @@ public class RecoveryAnalyzer {
         plan.undoChanges = new ArrayList<>();
         plan.redoChanges = new ArrayList<>();
         
-        if (records == null || records.isEmpty()) {
-            plan.startLsn = 0; 
+        if (records.isEmpty()) {
+            plan.startLsn = 1;
             plan.lastRecoveredLSN = 0; 
             plan.maxTxId = 0; 
             plan.lastTimestamp = 0;
