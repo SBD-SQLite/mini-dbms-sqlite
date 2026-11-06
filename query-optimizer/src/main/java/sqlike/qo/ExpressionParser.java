@@ -88,7 +88,7 @@ public class ExpressionParser {
         if (token.isKeyword(Keyword.EXISTS))
             throw QoErrors.unsupported("subqueries are not part of the agreed contract", token.offset());
         if (ts.matchSymbol("(")) {
-            Expression expression = parseAnd(ts);
+            Expression expression = parseExpression(ts);
             ts.expectSymbol(")");
             return expression;
         }
