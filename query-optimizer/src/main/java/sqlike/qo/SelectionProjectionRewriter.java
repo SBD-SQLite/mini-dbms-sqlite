@@ -11,6 +11,7 @@ import sqlike.shared.ExpressionOperator;
 import sqlike.shared.JoinType;
 import sqlike.shared.PlanNode;
 import sqlike.shared.PlanNodeKind;
+import sqlike.shared.ResultColumn;
 import sqlike.shared.SortSpec;
 
 /**
@@ -49,7 +50,7 @@ public final class SelectionProjectionRewriter {
             case FILTER -> {
                 // Consecutive selections commute. Keep them as a simple chain;
                 // another pass can push the new predicate farther down.
-                return PlanNodes.filter(pushSelection(predicate, input.children().get(0)),
+                return filterNode(pushSelection(predicate, input.children().get(0)),
                         input.predicate().orElseThrow());
             }
             case SORT -> {
@@ -57,7 +58,7 @@ public final class SelectionProjectionRewriter {
             }
             case PROJECT -> {
                 if (!isAvailableAboveProject(predicate, input.projection()))
-                    return PlanNodes.filter(input, predicate);
+                    return filterNode(input, predicate);
                 PlanNode below = pushSelection(predicate, input.children().get(0));
                 return copyUnary(input, below);
             }
@@ -71,9 +72,9 @@ public final class SelectionProjectionRewriter {
                     PlanNode right = pushSelection(predicate, input.children().get(1));
                     return copyBinary(input, input.children().get(0), right);
                 }
-                return PlanNodes.filter(input, predicate);
+                return filterNode(input, predicate);
             }
-            default -> { return PlanNodes.filter(input, predicate); }
+            default -> { return filterNode(input, predicate); }
         }
     }
 
@@ -116,7 +117,11 @@ public final class SelectionProjectionRewriter {
 
     private PlanNode pushProjection(PlanNode node, List<ColumnRef> required) {
         if (containsWildcard(required)) return node;
-        if (node.kind() == PlanNodeKind.PROJECT) return node;
+        if (node.kind() == PlanNodeKind.PROJECT) {
+            LinkedHashSet<ColumnRef> union = new LinkedHashSet<>(node.projection());
+            union.addAll(required);
+            return projectNode(pushProjection(node.children().get(0), List.copyOf(union)), List.copyOf(union));
+        }
         if (node.kind() == PlanNodeKind.FILTER) {
             LinkedHashSet<ColumnRef> union = new LinkedHashSet<>(required);
             union.addAll(columns(node.predicate().orElseThrow()));
@@ -128,10 +133,10 @@ public final class SelectionProjectionRewriter {
             return copyUnary(node, pushProjection(node.children().get(0), List.copyOf(union)));
         }
         if (node.kind() == PlanNodeKind.JOIN || node.kind() == PlanNodeKind.CARTESIAN) {
-            PlanNode distributed = distributeProjection(PlanNodes.project(node, required), node, required);
+            PlanNode distributed = distributeProjection(projectNode(node, required), node, required);
             if (distributed != null) return distributed;
         }
-        return PlanNodes.project(node, required);
+        return projectNode(node, required);
     }
 
     private PlanNode distributeProjection(PlanNode outerProject, PlanNode join,
@@ -157,15 +162,25 @@ public final class SelectionProjectionRewriter {
             else return null;
         }
         for (String name : commonColumns) {
-            ColumnRef common = Refs.column(null, name);
-            leftNeeded.add(common);
-            rightNeeded.add(common);
+            leftNeeded.add(commonColumnRef(join.children().get(0), name));
+            rightNeeded.add(commonColumnRef(join.children().get(1), name));
         }
 
-        if (leftNeeded.isEmpty() || rightNeeded.isEmpty()) return null;
-        PlanNode left = pushProjection(join.children().get(0), List.copyOf(leftNeeded));
-        PlanNode right = pushProjection(join.children().get(1), List.copyOf(rightNeeded));
+        if (leftNeeded.isEmpty() && rightNeeded.isEmpty()) return null;
+        PlanNode left = leftNeeded.isEmpty()
+                ? join.children().get(0) : pushProjection(join.children().get(0), List.copyOf(leftNeeded));
+        PlanNode right = rightNeeded.isEmpty()
+                ? join.children().get(1) : pushProjection(join.children().get(1), List.copyOf(rightNeeded));
         return copyUnary(outerProject, copyBinary(join, left, right));
+    }
+
+    private ColumnRef commonColumnRef(PlanNode input, String name) {
+        List<ResultColumn> matches = input.outputColumns().stream()
+                .filter(column -> column.name().equalsIgnoreCase(name)
+                        || column.source().map(source -> source.columnName().equalsIgnoreCase(name)).orElse(false))
+                .toList();
+        if (matches.size() == 1 && matches.get(0).source().isPresent()) return matches.get(0).source().get();
+        return Refs.column(null, name);
     }
 
     private boolean isAvailableAboveProject(Expression expression, List<ColumnRef> projection) {
@@ -261,9 +276,67 @@ public final class SelectionProjectionRewriter {
     }
 
     private PlanNode withChildren(PlanNode n, List<PlanNode> children) {
-        return new PlanNode(n.kind(), children, n.outputColumns(), n.estimatedRows(), n.scan(), n.predicate(),
+        List<ResultColumn> outputs = switch (n.kind()) {
+            case FILTER, SORT, LIMIT -> children.isEmpty() ? n.outputColumns() : children.get(0).outputColumns();
+            case PROJECT -> children.isEmpty() ? n.outputColumns() : projectOutputColumns(children.get(0), n.projection());
+            case JOIN, CARTESIAN -> children.size() == 2
+                    ? joinOutputColumns(n, children.get(0), children.get(1)) : n.outputColumns();
+            default -> n.outputColumns();
+        };
+        return new PlanNode(n.kind(), children, outputs, n.estimatedRows(), n.scan(), n.predicate(),
                 n.projection(), n.join(), n.sort(), n.mutation(), n.createIndex(),
                 n.limit(), n.createTable(), n.dropTable());
+    }
+
+    private PlanNode filterNode(PlanNode child, Expression predicate) {
+        PlanNode filter = PlanNodes.filter(child, predicate);
+        return withChildren(filter, filter.children());
+    }
+
+    private PlanNode projectNode(PlanNode child, List<ColumnRef> columns) {
+        PlanNode project = PlanNodes.project(child, columns);
+        return withChildren(project, project.children());
+    }
+
+    private List<ResultColumn> projectOutputColumns(PlanNode child, List<ColumnRef> columns) {
+        if (child.outputColumns().isEmpty()) return List.of();
+        List<ResultColumn> outputs = new ArrayList<>();
+        for (ColumnRef requested : columns) {
+            ResultColumn match = findOutputColumn(child.outputColumns(), requested);
+            if (match == null) {
+                throw QoErrors.invalidState("projection references unavailable column '" + render(requested) + "'");
+            }
+            outputs.add(match);
+        }
+        return List.copyOf(outputs);
+    }
+
+    private ResultColumn findOutputColumn(List<ResultColumn> outputs, ColumnRef requested) {
+        List<ResultColumn> matches = outputs.stream().filter(output -> {
+            if (requested.tableName().isPresent()) {
+                return output.source().filter(source -> source.tableName().isPresent()
+                        && source.tableName().get().equalsIgnoreCase(requested.tableName().get())
+                        && source.columnName().equalsIgnoreCase(requested.columnName())).isPresent();
+            }
+            return output.name().equalsIgnoreCase(requested.columnName())
+                    || output.source().map(source -> source.columnName().equalsIgnoreCase(requested.columnName())).orElse(false);
+        }).toList();
+        return matches.size() == 1 ? matches.get(0) : null;
+    }
+
+    private List<ResultColumn> joinOutputColumns(PlanNode join, PlanNode left, PlanNode right) {
+        List<ResultColumn> outputs = new ArrayList<>(left.outputColumns());
+        List<String> common = join.join().filter(spec -> spec.joinType() == JoinType.NATURAL)
+                .map(spec -> spec.commonColumns()).orElse(List.of());
+        for (ResultColumn column : right.outputColumns()) {
+            boolean duplicateNaturalColumn = common.stream().anyMatch(name -> name.equalsIgnoreCase(column.name()));
+            if (!duplicateNaturalColumn) outputs.add(column);
+        }
+        return List.copyOf(outputs);
+    }
+
+    private String render(ColumnRef column) {
+        return column.tableName().map(table -> table + ".").orElse("") + column.columnName();
     }
 
     private PlanNode copyUnary(PlanNode n, PlanNode child) {
@@ -276,4 +349,5 @@ public final class SelectionProjectionRewriter {
 
     private enum Side { LEFT, RIGHT, BOTH, UNKNOWN }
 }
+
 

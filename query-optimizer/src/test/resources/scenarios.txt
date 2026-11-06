@@ -36,7 +36,7 @@ insert-arity         | SEMANTIC_ERROR        | INSERT INTO dept VALUES (30)
 index-unknown-column | SEMANTIC_ERROR        | CREATE INDEX ix ON students(nocol)
 
 # --- known issues (XFAIL = passes while the bug still reproduces; fix the bug, then change to OK) ---
-natural-join-3-tables | XFAIL SEMANTIC_ERROR | SELECT * FROM students NATURAL JOIN dept NATURAL JOIN takes
+natural-join-3-tables | OK | SELECT * FROM students NATURAL JOIN dept NATURAL JOIN takes
 insert-char-column   | XFAIL SEMANTIC_ERROR  | INSERT INTO dept VALUES (30, 'Math')
 char-column-compare  | XFAIL SEMANTIC_ERROR  | SELECT * FROM takes WHERE grade = 'E'
 
