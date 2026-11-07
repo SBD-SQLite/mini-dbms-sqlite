@@ -95,6 +95,15 @@ public final class QueryProcessor implements IQueryProcessor {
             IStorageManager storage,
             IConcurrencyControlManager concurrency,
             IFailureRecoveryManager recovery) {
+        this(optimizer, storage, concurrency, recovery, QpConfiguration.defaults());
+    }
+
+    public QueryProcessor(
+            IQueryOptimizer optimizer,
+            IStorageManager storage,
+            IConcurrencyControlManager concurrency,
+            IFailureRecoveryManager recovery,
+            QpConfiguration configuration) {
         if (optimizer == null) {
             throw new IllegalArgumentException("IQueryOptimizer cannot be null in QueryProcessor");
         }
@@ -106,6 +115,9 @@ public final class QueryProcessor implements IQueryProcessor {
         }
         if (recovery == null) {
             throw new IllegalArgumentException("IFailureRecoveryManager cannot be null in QueryProcessor");
+        }
+        if (configuration == null) {
+            throw new IllegalArgumentException("QpConfiguration cannot be null in QueryProcessor");
         }
         this.optimizer = optimizer;
         this.storage = storage;
@@ -121,10 +133,10 @@ public final class QueryProcessor implements IQueryProcessor {
         RowSizeEstimator estimator = new RowSizeEstimator();
         PlanValidator validator = new PlanValidator();
         this.translator = PlanTranslator.withQpStorage(
-                storageAdapter, evaluator, comparator, mutations, collector, estimator, validator);
+                storageAdapter, evaluator, comparator, mutations, collector, estimator, validator, configuration);
         this.engine = new ExecutionEngine(this.translator);
         this.sessions = new SessionManager();
-        this.transactions = new TransactionCoordinator(this.concurrencyAdapter, QpConfiguration.defaults());
+        this.transactions = new TransactionCoordinator(this.concurrencyAdapter, configuration);
         this.access = new AccessCoordinator(this.concurrencyAdapter);
         this.planExecutor = this.engine;
         this.state = SystemState.STARTING;
