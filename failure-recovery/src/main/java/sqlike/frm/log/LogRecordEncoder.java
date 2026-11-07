@@ -91,13 +91,13 @@ final class LogRecordEncoder {
         }
     }
 
-    private static void writeText(DataOutputStream out, String text) throws IOException {
+    static void writeText(DataOutputStream out, String text) throws IOException {
         byte[] data = text.getBytes(StandardCharsets.UTF_8);
         out.writeInt(data.length);
         out.write(data);
     }
 
-    private static String readText(DataInputStream in) throws IOException {
+    static String readText(DataInputStream in) throws IOException {
         int size = readCount(in);
         byte[] data = new byte[size];
         in.readFully(data);
