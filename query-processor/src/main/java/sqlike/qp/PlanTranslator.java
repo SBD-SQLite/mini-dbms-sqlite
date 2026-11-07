@@ -34,6 +34,7 @@ public class PlanTranslator {
     private final MutationTargetCollector collector;
     private final RowSizeEstimator estimator;
     private final PlanValidator validator;
+    private final long joinBufferBytes;
 
     public PlanTranslator(
             IStorageManager storage,
@@ -43,18 +44,19 @@ public class PlanTranslator {
             MutationTargetCollector collector,
             RowSizeEstimator estimator,
             PlanValidator validator) {
-        this(storage, null, evaluator, comparator, mutations, collector, estimator, validator);
+        this(storage, evaluator, comparator, mutations, collector, estimator, validator, QpConfiguration.defaults());
     }
 
-    public static PlanTranslator withQpStorage(
-            sqlike.qp.port.QpContracts.IStorageManager storage,
+    public PlanTranslator(
+            IStorageManager storage,
             IExpressionEvaluator evaluator,
             IValueComparator comparator,
             MutationCoordinator mutations,
             MutationTargetCollector collector,
             RowSizeEstimator estimator,
-            PlanValidator validator) {
-        return new PlanTranslator(null, storage, evaluator, comparator, mutations, collector, estimator, validator);
+            PlanValidator validator,
+            QpConfiguration configuration) {
+        this(storage, null, evaluator, comparator, mutations, collector, estimator, validator, configuration);
     }
 
     private PlanTranslator(
@@ -65,7 +67,11 @@ public class PlanTranslator {
             MutationCoordinator mutations,
             MutationTargetCollector collector,
             RowSizeEstimator estimator,
-            PlanValidator validator) {
+            PlanValidator validator,
+            QpConfiguration configuration) {
+        if (configuration == null) {
+            throw new IllegalArgumentException("QpConfiguration cannot be null in PlanTranslator");
+        }
         this.storage = storage;
         this.qpStorage = qpStorage;
         this.evaluator = evaluator != null ? evaluator : new ExpressionEvaluator(comparator != null ? comparator : new ValueComparator());
@@ -74,9 +80,33 @@ public class PlanTranslator {
         this.collector = collector != null ? collector : new MutationTargetCollector(storage);
         this.estimator = estimator != null ? estimator : new RowSizeEstimator();
         this.validator = validator != null ? validator : new PlanValidator();
+        this.joinBufferBytes = configuration.joinBufferBytes();
         if (this.evaluator instanceof ExpressionEvaluator ee) {
             ee.setPlanTranslator(this);
         }
+    }
+
+    public static PlanTranslator withQpStorage(
+            sqlike.qp.port.QpContracts.IStorageManager storage,
+            IExpressionEvaluator evaluator,
+            IValueComparator comparator,
+            MutationCoordinator mutations,
+            MutationTargetCollector collector,
+            RowSizeEstimator estimator,
+            PlanValidator validator) {
+        return withQpStorage(storage, evaluator, comparator, mutations, collector, estimator, validator, QpConfiguration.defaults());
+    }
+
+    public static PlanTranslator withQpStorage(
+            sqlike.qp.port.QpContracts.IStorageManager storage,
+            IExpressionEvaluator evaluator,
+            IValueComparator comparator,
+            MutationCoordinator mutations,
+            MutationTargetCollector collector,
+            RowSizeEstimator estimator,
+            PlanValidator validator,
+            QpConfiguration configuration) {
+        return new PlanTranslator(null, storage, evaluator, comparator, mutations, collector, estimator, validator, configuration);
     }
 
     public void validate(PreparedStatement statement) {
@@ -337,7 +367,7 @@ public class PlanTranslator {
         }
         Schema baseOutputSchema = Schema.of(outputCols);
         JoinLayout layout = new JoinLayout(leftChild.schema(), rightChild.schema(), baseOutputSchema, mapping);
-        return new BlockNestedLoopJoinOperator(
+        BlockNestedLoopJoinOperator join = new BlockNestedLoopJoinOperator(
                 leftChild,
                 rightChild,
                 effectiveSpec,
@@ -346,6 +376,8 @@ public class PlanTranslator {
                 comparator,
                 estimator,
                 layout.getOutputSchema());
+        join.setMaxOuterBytes(joinBufferBytes);
+        return join;
     }
 
     private Operator buildSort(PlanNode node, SortSpec spec) {

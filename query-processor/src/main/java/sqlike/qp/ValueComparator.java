@@ -27,7 +27,7 @@ public class ValueComparator implements IValueComparator {
         if (isText(left.type()) && isText(right.type())) {
             String leftStr = left.textValue().orElse("");
             String rightStr = right.textValue().orElse("");
-            return compareUtf8(leftStr, rightStr);
+            return compareCodePoints(leftStr, rightStr);
         }
 
         throw new IllegalArgumentException("Incompatible types for comparison: " + left.type() + " vs " + right.type());
@@ -53,9 +53,19 @@ public class ValueComparator implements IValueComparator {
         return Double.compare(leftNum, rightNum);
     }
 
-    private int compareUtf8(String left, String right) {
-        // TODO(M1-MOCK): Unicode text comparison
-        return left.compareTo(right);
+    private int compareCodePoints(String left, String right) {
+        int leftOffset = 0;
+        int rightOffset = 0;
+        while (leftOffset < left.length() && rightOffset < right.length()) {
+            int leftCodePoint = left.codePointAt(leftOffset);
+            int rightCodePoint = right.codePointAt(rightOffset);
+            if (leftCodePoint != rightCodePoint) {
+                return Integer.compare(leftCodePoint, rightCodePoint);
+            }
+            leftOffset += Character.charCount(leftCodePoint);
+            rightOffset += Character.charCount(rightCodePoint);
+        }
+        return Integer.compare(left.length() - leftOffset, right.length() - rightOffset);
     }
 
     private boolean isNumeric(DataType type) {

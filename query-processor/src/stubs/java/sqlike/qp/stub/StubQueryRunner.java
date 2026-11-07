@@ -76,7 +76,8 @@ public final class StubQueryRunner {
                 mutations,
                 new MutationTargetCollector(sm),
                 new RowSizeEstimator(),
-                new PlanValidator());
+                new PlanValidator(),
+                config);
         this.engine = new ExecutionEngine(translator);
     }
 
