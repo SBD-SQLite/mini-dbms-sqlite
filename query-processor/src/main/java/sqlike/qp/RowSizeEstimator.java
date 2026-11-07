@@ -7,6 +7,7 @@ public class RowSizeEstimator {
 
     public RowSizeEstimator() {}
 
+    /** Estimates logical buffer bytes, including tags and RID; this is not JVM heap usage. */
     public long estimate(RowEnvelope row) {
         Objects.requireNonNull(row);
         long bytes = 16;

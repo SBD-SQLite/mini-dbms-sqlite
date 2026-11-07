@@ -60,6 +60,7 @@ public class SortOperator extends AbstractUnaryOperator {
 
     @Override
     protected void doOpen() {
+        requireContext().check();
         if (childOpened) {
             throw new QpException(ErrorCode.INVALID_STATE, "Close the previous scan before open");
         }
@@ -83,6 +84,7 @@ public class SortOperator extends AbstractUnaryOperator {
 
     @Override
     protected Optional<RowEnvelope> doNext() {
+        requireContext().check();
         return position < rows.size() ? Optional.of(rows.get(position++)) : Optional.empty();
     }
 
@@ -100,18 +102,27 @@ public class SortOperator extends AbstractUnaryOperator {
     }
 
     private void materializeInput() {
+        requireContext().check();
         if (mockRows != null) {
             rows.addAll(mockRows);
             return;
         }
-        Optional<RowEnvelope> next;
-        while ((next = child.next()).isPresent()) {
+        while (true) {
+            requireContext().check();
+            Optional<RowEnvelope> next = child.next();
+            if (next.isEmpty()) {
+                break;
+            }
             RowEnvelope row = next.get();
             if (row.row().size() != schema().columnCount()) {
                 throw new IllegalArgumentException("Child row width must match sort schema");
             }
             rows.add(row);
         }
-        rows.sort(comparator);
+        rows.sort((left, right) -> {
+            requireContext().check();
+            return comparator.compare(left, right);
+        });
+        requireContext().check();
     }
 }

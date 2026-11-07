@@ -11,7 +11,6 @@ import sqlike.shared.JoinType;
 
 public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
     private static final long DEFAULT_MAX_OUTER_BYTES = 64L * 1024L;
-
     private JoinSpec spec;
     private JoinLayout layout;
     private IExpressionEvaluator evaluator;
@@ -94,6 +93,9 @@ public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
     }
 
     public void setMaxOuterBytes(long maxOuterBytes) {
+        if (getState() != OperatorState.NEW && getState() != OperatorState.CLOSED) {
+            throw new QpException(ErrorCode.INVALID_STATE, "Close join before changing its buffer budget");
+        }
         if (maxOuterBytes <= 0) {
             throw new IllegalArgumentException("maxOuterBytes must be positive");
         }
@@ -123,6 +125,7 @@ public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
 
     @Override
     protected void doOpen() {
+        requireContext().check();
         clearBatch();
         pendingOuter = Optional.empty();
         currentInner = Optional.empty();
@@ -150,6 +153,7 @@ public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
 
     @Override
     protected Optional<RowEnvelope> doNext() {
+        requireContext().check();
         if (mockRows != null) {
             return mockPosition < mockRows.size() ? Optional.of(mockRows.get(mockPosition++)) : Optional.empty();
         }
@@ -157,8 +161,10 @@ public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
             while (currentInner.isPresent()) {
                 RowEnvelope rightRow = currentInner.get();
                 while (outerIndex < outerBatch.size()) {
+                    requireContext().check();
                     RowEnvelope leftRow = outerBatch.get(outerIndex++);
                     if (matches(leftRow, rightRow)) {
+                        requireContext().check();
                         return Optional.of(layout.combineForOutput(leftRow, rightRow));
                     }
                 }
@@ -187,24 +193,25 @@ public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
     }
 
     private boolean fillOuterBatch() {
+        requireContext().check();
         clearBatch();
         if (pendingOuter.isPresent()) {
             RowEnvelope pending = pendingOuter.get();
             pendingOuter = Optional.empty();
-            long size = estimator.estimate(pending);
+            long size = outerRowBytes(pending);
             outerBatch.add(pending);
             batchBytes += size;
         }
-        long budget = maxOuterBytes > 0 ? maxOuterBytes : DEFAULT_MAX_OUTER_BYTES;
         while (!outerEnded) {
+            requireContext().check();
             Optional<RowEnvelope> nextOuter = left.next();
             if (nextOuter.isEmpty()) {
                 outerEnded = true;
                 break;
             }
             RowEnvelope row = nextOuter.get();
-            long rowBytes = estimator.estimate(row);
-            if (!outerBatch.isEmpty() && batchBytes + rowBytes > budget) {
+            long rowBytes = outerRowBytes(row);
+            if (rowBytes > maxOuterBytes - batchBytes) {
                 pendingOuter = Optional.of(row);
                 break;
             }
@@ -216,10 +223,21 @@ public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
     }
 
     private void reopenInner() {
+        requireContext().check();
         right.close();
+        requireContext().check();
         right.open(requireContext());
         currentInner = right.next();
         outerIndex = 0;
+    }
+
+    private long outerRowBytes(RowEnvelope row) {
+        long bytes = estimator.estimate(row);
+        if (bytes > maxOuterBytes) {
+            throw new QpException(ErrorCode.INVALID_VALUE,
+                    "Join outer row requires " + bytes + " logical bytes, exceeding buffer budget " + maxOuterBytes);
+        }
+        return bytes;
     }
 
     private boolean matches(RowEnvelope leftRow, RowEnvelope rightRow) {
