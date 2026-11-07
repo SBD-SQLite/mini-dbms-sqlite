@@ -118,18 +118,25 @@ memakai satu maintenance lock.
 
 ## Status integrasi (Milestone 2)
 
-Driver sudah diverifikasi dengan implementasi referensi sementara di luar repo: 9/9 skenario PASS,
-dan tujuh bug yang sengaja ditanam (redo hilang, undo ABORT dilewati, recovery tanpa flush, PITR
-memasukkan commit setelah target, PITR tanpa epoch baru, ABORT ganda, gate checkpoint tidak
-dibuka) masing-masing membuat skenario terkait FAIL.
+Branch ini sudah menggabungkan `feat/frm/log-implementation` (FR2), `feat/frm/recovery` (FR5), dan
+`feat/frm/checkpoint-pitr` (FR4). Facade memakai `RecoveryManager` FR5 dan `MaintenanceService`
+FR4 (checkpoint, checkpoint berkala, PITR, `WalRecoveryLog`). Saat startup pertama, facade membuat
+satu checkpoint sebagai snapshot dasar PITR. Kegagalan WAL yang butuh recovery (`WalException`),
+termasuk COMMIT yang hasilnya tidak pasti, membuat FRM FAILED (fail-stop) dan
+`FrmException.isCommitUnknown()` bernilai true.
 
-Dengan modul FRM saat ini hanya `startup-gate` dan `checkpoint-timeout` yang PASS. Skenario lain
-FAIL karena bagian berikut masih TODO:
+Hasil driver saat ini:
+
+| Konfigurasi | Hasil |
+|---|---|
+| Modul FRM apa adanya | 2/9 PASS; `LogManager` masih TODO dan rollback belum tersambung |
+| FR1+FR4+FR5 asli dengan log dan rollback pengganti sementara (di luar repo) | 8/9 PASS |
+| FRM referensi sementara (di luar repo) | 9/9 PASS; 7 bug yang ditanam semuanya tertangkap |
 
 | Pemilik | Yang dibutuhkan agar skenario PASS |
 |---|---|
-| FR2 | `LogManager`: tulis/baca WAL ke file, LSN unik, `ensureDurable`, `readLogs`, `showLogs`, simpan `snapshotId` di catatan checkpoint |
-| FR3 | Pindahkan `RollbackManager` ke package bernama, implementasikan `RollbackPort`, jangan menulis ABORT final (PRD §11), lalu sambungkan di konstruktor facade |
-| FR4 | `HistoricalLogPort` di atas `LogManager` menggantikan `MockRecoveryLog`, snapshot awal base LSN 0, epoch baru setelah PITR |
-| FR5 | `RecoveryManager.recover()` lengkap; jangan memanggil `ccm.initAfterRecovery` saat startup (hanya QP, PRD §14); undo ulang transaksi ABORT yang hasil undo-nya belum aman |
-| Kontrak | Saat `contracts/` root ada: hapus salinan `IConcurrencyControlManager`, `IStorageManager`, `IWalDurability`, `sqlike.storage.*` di modul ini; ganti penantian di `ConcurrencyControlAdapter` dengan `awaitNoActiveTransactions(timeoutMs)`; tambah `logSchemaChange` setelah `SchemaChange` ada di shared |
+| FR2 | Isi `LogManager`: tulis/baca WAL ke file memakai `LogRecordEncoder`, LSN unik, `ensureDurable`, `readLogs`, `readLogsBackward`, `showLogs`, `archiveActiveLog` + `startNewLog` yang melanjutkan LSN; lempar `WalException` saat gagal; sediakan high-water mark `maxTxId` epoch sebelumnya (`WalEpoch`) |
+| FR3 | `feat/frm/rollback` belum bisa di-merge (40 error compile, menimpa file FR4 dan facade, memakai tipe tiruan). Buat `sqlike.frm.rollback.RollbackManager implements RollbackPort`: baca `readLogsBackward(txId)`, tulis before-image lewat `SmPort.writeAt` dengan LSN aslinya, tolak transaksi committed/tidak dikenal, abaikan yang sudah ABORT, jangan menulis ABORT (PRD §11); lalu pasang di konstruktor facade |
+| FR4 | `WalRecoveryLog.readHistory()` harus ikut membaca log arsip setelah FR2 menyediakannya |
+| FR5 | `lastTxId` setelah PITR harus memakai `max(log aktif, maxTxId epoch)` dari FR2 (skenario `point-in-time-recovery`); `lastTimestamp` saat ini waktu jam, facade menormalkannya ke txId sesuai PRD §14 |
+| Kontrak | Saat `contracts/` root ada: hapus salinan `IConcurrencyControlManager`, `IStorageManager`, `IWalDurability`, `sqlike.storage.*` di modul ini; ganti penantian di `ConcurrencyControlAdapter` dengan `awaitNoActiveTransactions(timeoutMs)`; tambah `logSchemaChange` (tipe `SchemaChange` sudah ada dari FR2) |

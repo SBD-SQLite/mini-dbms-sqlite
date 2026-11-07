@@ -11,15 +11,12 @@ import java.util.function.LongSupplier;
 
 import sqlike.contract.IFailureRecoveryManager;
 import sqlike.contract.IWalDurability;
-import sqlike.frm.adapter.LogCheckpointAdapter;
-import sqlike.frm.checkpoint.CheckpointManager;
-import sqlike.frm.checkpoint.CheckpointScheduler;
 import sqlike.frm.log.LogManager;
 import sqlike.frm.log.LogRecord;
 import sqlike.frm.log.LogType;
-import sqlike.frm.mock.MockRecoveryLog;
-import sqlike.frm.model.RecoveryReport;
-import sqlike.frm.pitr.PointInTimeRecovery;
+import sqlike.frm.log.WalException;
+import sqlike.frm.maintenance.MaintenanceService;
+import sqlike.frm.maintenance.WalRecoveryLog;
 import sqlike.frm.port.CcmPort;
 import sqlike.frm.port.RollbackPort;
 import sqlike.frm.port.SmPort;
@@ -37,8 +34,7 @@ import sqlike.shared.RecoveryTargetKind;
  * <ul>
  *   <li>FR2 {@link LogManager}: logBegin, logChange, logCommit, logAbort, ensureDurable, log view</li>
  *   <li>FR3 {@link RollbackPort}: rollback</li>
- *   <li>FR4 {@link CheckpointManager}, {@link CheckpointScheduler}, {@link PointInTimeRecovery}:
- *       checkpoint and recoverTo</li>
+ *   <li>FR4 {@link MaintenanceService}: checkpoint, periodic checkpoint, and recoverTo</li>
  *   <li>FR5 {@link RecoveryManager}: recover</li>
  * </ul>
  *
@@ -49,7 +45,10 @@ import sqlike.shared.RecoveryTargetKind;
  * <p>Startup ownership (PRD §14): only QP calls {@code CCM.initAfterRecovery(lastTxId)} with the
  * {@link RecoveryResult} returned here. For PITR, FRM calls it through {@link CcmPort}.
  *
- * <p>Errors leave as {@link FrmException} with an {@code ErrorInfo}; nothing is swallowed.
+ * <p>Errors leave as {@link FrmException} with an {@code ErrorInfo}; nothing is swallowed. A WAL
+ * failure that FR2 marks as needing recovery, including a COMMIT whose outcome is unknown, moves
+ * FRM to FAILED (fail-stop, PRD §12): CCM must not report success or undo that transaction, and
+ * the next startup recovery decides its outcome.
  */
 public class FailureRecoveryManager
         implements IFailureRecoveryManager, IWalDurability, LogViewer, AutoCloseable {
@@ -64,15 +63,12 @@ public class FailureRecoveryManager
     private final LogManager logManager;
     private final RollbackPort rollbackManager;
     private final RecoveryManager recoveryManager;
-    private final CheckpointManager checkpointManager;
-    private final CheckpointScheduler checkpointScheduler;
-    private final PointInTimeRecovery pointInTimeRecovery;
+    private final MaintenanceService maintenance;
     private final Lock maintenanceLock = new ReentrantLock();
     private final Object abortLock = new Object();
 
     private volatile RecoveryState state = RecoveryState.NOT_STARTED;
     private volatile RecoveryResult lastRecovery;
-    private volatile Optional<RuntimeException> lastScheduledCheckpointError = Optional.empty();
 
     /** Normal configuration: periodic checkpoint every 60 s, idle timeout 30 s (PRD §15). */
     public FailureRecoveryManager(SmPort sm, CcmPort ccm, String logPath) {
@@ -88,21 +84,25 @@ public class FailureRecoveryManager
     }
 
     public FailureRecoveryManager(SmPort sm, CcmPort ccm, FrmConfig config, RollbackPort rollback) {
+        this(sm, ccm, config, rollback, new LogManager(config.logPath().toString()));
+    }
+
+    /** Uses a given FR2 log, e.g. a test double; normal code uses the constructors above. */
+    public FailureRecoveryManager(SmPort sm, CcmPort ccm, FrmConfig config, RollbackPort rollback,
+            LogManager log) {
         Objects.requireNonNull(sm, "sm");
         Objects.requireNonNull(ccm, "ccm");
         this.config = Objects.requireNonNull(config, "config");
         this.rollbackManager = Objects.requireNonNull(rollback, "rollback");
-        this.logManager = new LogManager(config.logPath().toString());
-        this.recoveryManager = new RecoveryManager(logManager, sm, ccm);
-
-        long idleTimeoutMs = config.idleTimeout().toMillis();
-        this.checkpointManager = new CheckpointManager(
-                sm, ccm, new LogCheckpointAdapter(logManager), idleTimeoutMs, maintenanceLock);
-        // TODO(FR4): replace MockRecoveryLog with a HistoricalLogPort backed by LogManager.
-        this.pointInTimeRecovery = new PointInTimeRecovery(
-                sm, ccm, new MockRecoveryLog(), idleTimeoutMs, maintenanceLock);
-        this.checkpointScheduler = new CheckpointScheduler(
-                config.checkpointInterval(), this::scheduledCheckpoint);
+        this.logManager = Objects.requireNonNull(log, "log");
+        this.recoveryManager = new RecoveryManager(logManager, sm);
+        WalRecoveryLog wal = new WalRecoveryLog(logManager);
+        this.maintenance = new MaintenanceService(
+                sm, ccm, wal, wal,
+                config.logPath().resolveSibling(MaintenanceService.SNAPSHOT_CATALOG_FILE),
+                config.checkpointInterval(),
+                config.idleTimeout().toMillis(),
+                maintenanceLock);
     }
 
     // ------------------------------------------------------------------ logging (FR2)
@@ -127,10 +127,18 @@ public class FailureRecoveryManager
     public void logCommit(long txId) {
         requireReady("logCommit");
         requireTxId(txId);
-        logged("logCommit(" + txId + ")", () -> {
+        try {
             logManager.logCommit(txId);
-            return 0L;
-        });
+        } catch (WalException error) {
+            failStop();
+            throw new FrmException(ErrorCode.WAL_FAILURE, "logCommit(" + txId + ") failed"
+                    + (error.isCommitUnknown() ? "; commit outcome unknown until recovery" : "")
+                    + ": " + error.getMessage(), error, error.isCommitUnknown());
+        } catch (RuntimeException error) {
+            failStop();
+            throw new FrmException(ErrorCode.WAL_FAILURE, "logCommit(" + txId + ") failed; "
+                    + "commit outcome unknown until recovery: " + error.getMessage(), error, true);
+        }
     }
 
     /**
@@ -200,29 +208,32 @@ public class FailureRecoveryManager
             throw new FrmException(ErrorCode.INVALID_STATE, "recovery is already running");
         }
         state = RecoveryState.RUNNING;
-        RecoveryReport report;
+        RecoveryResult result;
         try {
-            report = recoveryManager.recover();
-        } catch (RuntimeException error) {
+            result = recoveryManager.recover();
+        } catch (Exception error) {
             state = RecoveryState.FAILED;
             throw new FrmException(ErrorCode.RECOVERY_FAILURE,
                     "crash recovery failed: " + error.getMessage(), error);
         }
-        if (report == null || !report.success) {
+        if (result == null) {
             state = RecoveryState.FAILED;
-            String reason = report == null ? "no report"
-                    : report.errorCode + ": " + report.errorMessage;
-            throw new FrmException(ErrorCode.RECOVERY_FAILURE, "crash recovery failed: " + reason);
+            throw new FrmException(ErrorCode.RECOVERY_FAILURE, "crash recovery returned no result");
         }
-        long lastTxId = Math.max(0L, report.maxTxId);
-        lastRecovery = new RecoveryResult(
-                lastTxId,
-                lastTxId, // logical timestamp = txId (PRD §14)
-                Math.max(0L, report.lastLsn),
-                Optional.ofNullable(report.checkpointLsn).map(Integer::longValue));
+        long lastTxId = Math.max(0L, result.lastTxId());
+        // PRD §14: one generator, logical timestamp = txId (not the wall-clock time of the log).
+        lastRecovery = new RecoveryResult(lastTxId, lastTxId,
+                Math.max(0L, result.lastRecoveredLSN()), result.checkpointLSN());
+        try {
+            ensureBaselineSnapshot();
+        } catch (RuntimeException error) {
+            state = RecoveryState.FAILED;
+            throw new FrmException(ErrorCode.RECOVERY_FAILURE,
+                    "cannot create the baseline snapshot for PITR: " + error.getMessage(), error);
+        }
         state = RecoveryState.READY;
         if (!config.checkpointInterval().isZero()) {
-            checkpointScheduler.start();
+            maintenance.startPeriodicCheckpoints();
         }
         return lastRecovery;
     }
@@ -250,10 +261,10 @@ public class FailureRecoveryManager
             requireReady("recoverTo");
             state = RecoveryState.RUNNING;
             try {
-                pointInTimeRecovery.recoverTo(target);
+                maintenance.recoverTo(target);
                 state = RecoveryState.READY;
             } catch (RuntimeException error) {
-                state = RecoveryState.FAILED;
+                failStop();
                 if (error instanceof FrmException frm) {
                     throw frm;
                 }
@@ -267,20 +278,20 @@ public class FailureRecoveryManager
 
     public void startCheckpointScheduler() {
         requireReady("startCheckpointScheduler");
-        checkpointScheduler.start();
+        maintenance.startPeriodicCheckpoints();
     }
 
     public void stopCheckpointScheduler() {
-        checkpointScheduler.stop();
+        maintenance.stopPeriodicCheckpoints();
     }
 
     public boolean isCheckpointSchedulerRunning() {
-        return checkpointScheduler.isRunning();
+        return maintenance.isPeriodicCheckpointRunning();
     }
 
     /** Last failure of a periodic checkpoint, if any (the timer itself keeps running). */
     public Optional<RuntimeException> getLastScheduledCheckpointError() {
-        return lastScheduledCheckpointError;
+        return maintenance.lastPeriodicFailure().map(MaintenanceService.PeriodicFailure::error);
     }
 
     // ------------------------------------------------------------------ log view (FR-03)
@@ -314,30 +325,14 @@ public class FailureRecoveryManager
 
     @Override
     public void close() {
-        checkpointScheduler.close();
+        maintenance.close();
     }
 
     // ------------------------------------------------------------------ internals
 
-    private void scheduledCheckpoint() {
-        maintenanceLock.lock();
-        try {
-            if (state != RecoveryState.READY) {
-                return;
-            }
-            runCheckpoint();
-            lastScheduledCheckpointError = Optional.empty();
-        } catch (RuntimeException error) {
-            lastScheduledCheckpointError = Optional.of(error);
-            throw error;
-        } finally {
-            maintenanceLock.unlock();
-        }
-    }
-
     private void runCheckpoint() {
         try {
-            checkpointManager.checkpoint();
+            maintenance.checkpoint();
         } catch (FrmException error) {
             throw error;
         } catch (IllegalStateException error) {
@@ -349,6 +344,23 @@ public class FailureRecoveryManager
         }
     }
 
+    /**
+     * PITR needs a snapshot at or before every target (PRD §15). On the first startup no checkpoint
+     * exists yet, so one quiescent checkpoint records the baseline. Later startups reuse the
+     * persistent snapshot catalog and skip this.
+     */
+    private void ensureBaselineSnapshot() {
+        if (maintenance.latestRecoveryPoint().isEmpty()) {
+            maintenance.checkpoint();
+        }
+    }
+
+    /** Stops accepting work after a failure that only recovery can resolve. */
+    private void failStop() {
+        state = RecoveryState.FAILED;
+        maintenance.stopPeriodicCheckpoints();
+    }
+
     private boolean hasLogRecord(long txId, LogType type) {
         for (LogRecord record : logManager.readLogs(txId)) {
             if (record.type() == type) {
@@ -358,11 +370,17 @@ public class FailureRecoveryManager
         return false;
     }
 
-    private static long logged(String operation, LongSupplier call) {
+    private long logged(String operation, LongSupplier call) {
         try {
             return call.getAsLong();
         } catch (FrmException error) {
             throw error;
+        } catch (WalException error) {
+            if (error.isRecoveryRequired() || error.isCommitUnknown()) {
+                failStop();
+            }
+            throw new FrmException(ErrorCode.WAL_FAILURE,
+                    operation + " failed: " + error.getMessage(), error, error.isCommitUnknown());
         } catch (RuntimeException error) {
             throw new FrmException(ErrorCode.WAL_FAILURE,
                     operation + " failed: " + error.getMessage(), error);
