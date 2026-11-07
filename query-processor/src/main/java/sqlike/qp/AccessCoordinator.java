@@ -13,6 +13,10 @@ public final class AccessCoordinator {
         this.concurrency = Objects.requireNonNull(concurrency);
     }
 
+    boolean isTransactionActive(TxId txId) {
+        return txId != null && concurrency.getState(txId) == TransactionState.ACTIVE;
+    }
+
     /** Acquire planned grants before opening operators, in table order with WRITE taking precedence. */
     public void acquireAll(PreparedStatement statement, ExecutionContext context) {
         if (statement == null || statement.accesses() == null || statement.accesses().isEmpty()) {

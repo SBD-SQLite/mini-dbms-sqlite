@@ -14,6 +14,7 @@ public final class UpdateExecutor extends AbstractCommandExecutor {
     private final MutationTargetCollector collector;
     private final IExpressionEvaluator evaluator;
     private final MutationCoordinator mutations;
+    private ExecutionContext currentContext;
 
     public UpdateExecutor(
             Operator source,
@@ -42,24 +43,29 @@ public final class UpdateExecutor extends AbstractCommandExecutor {
     @Override
     protected long doExecute(ExecutionContext context) {
         context.requireGrant(spec.tableName(), AccessMode.WRITE);
-        // Materialize targets and evaluate SET before writing so scans cannot revisit updated rows.
-        var targets = new LinkedHashMap<RID, StoredRecord>();
-        for (StoredRecord record : collector.collect(source, spec.tableName(), context)) {
-            targets.putIfAbsent(record.rid(), record);
-        }
-        var values = new ArrayList<Row>();
-        for (StoredRecord before : targets.values()) {
-            context.check();
-            values.add(calculateAfter(before));
-        }
-        long count = 0;
-        int index = 0;
-        for (StoredRecord before : targets.values()) {
-            if (mutations.update(spec.tableName(), before, values.get(index++), context)) {
-                count++;
+        this.currentContext = context;
+        try {
+            // Materialize targets and evaluate SET before writing so scans cannot revisit updated rows.
+            var targets = new LinkedHashMap<RID, StoredRecord>();
+            for (StoredRecord record : collector.collect(source, spec.tableName(), context)) {
+                targets.putIfAbsent(record.rid(), record);
             }
+            var values = new ArrayList<Row>();
+            for (StoredRecord before : targets.values()) {
+                context.check();
+                values.add(calculateAfter(before));
+            }
+            long count = 0;
+            int index = 0;
+            for (StoredRecord before : targets.values()) {
+                if (mutations.update(spec.tableName(), before, values.get(index++), context)) {
+                    count++;
+                }
+            }
+            return count;
+        } finally {
+            this.currentContext = null;
         }
-        return count;
     }
 
     @Override
@@ -70,10 +76,12 @@ public final class UpdateExecutor extends AbstractCommandExecutor {
     private Row calculateAfter(StoredRecord before) {
         ColumnRef colRef = spec.column();
         int column = tableSchema.offset(colRef);
-        var res = evaluator.evaluate(spec.value().value(), before.row(), tableSchema);
+        var res = (evaluator instanceof ExpressionEvaluator ee && currentContext != null)
+                ? ee.evaluateWithContext(spec.value().value(), before.row(), tableSchema, currentContext)
+                : evaluator.evaluate(spec.value().value(), before.row(), tableSchema);
         var value = res.value();
-        if (value == null) {
-            throw failure("SET requires a value");
+        if (res.isSqlNull() || value == null) {
+            throw failure("SET requires a non-null value for column " + colRef.columnName());
         }
         var copy = new ArrayList<>(before.row().values());
         copy.set(column, tableSchema.coerce(column, value));

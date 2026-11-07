@@ -160,3 +160,28 @@ ABORT;
 SELECT name FROM student ORDER BY name LIMIT 2;
 -- expect-row: Ani
 -- expect-row: Budi
+
+-- scenario: QP-16 AS table alias and subquery in WHERE (bonus)
+SELECT s.name FROM student AS s WHERE s.gpa > (SELECT gpa FROM student WHERE id = 1) ORDER BY s.name ASC;
+-- expect-row: Cici
+SELECT s.name FROM student AS s WHERE EXISTS (SELECT e.course FROM enrollment AS e WHERE e.student_id = s.id AND e.course = 'IF3130');
+-- expect-row: Cici
+
+-- scenario: QP-15 CREATE TABLE and DROP TABLE RESTRICT vs CASCADE (bonus)
+CREATE TABLE dept (id INTEGER PRIMARY KEY, title VARCHAR(20));
+-- expect: message created
+CREATE TABLE club (id INTEGER PRIMARY KEY, dept_id INTEGER, FOREIGN KEY (dept_id) REFERENCES dept(id));
+-- expect: message created
+INSERT INTO dept VALUES (10, 'Informatics');
+-- expect: affected 1
+INSERT INTO club VALUES (100, 10);
+-- expect: affected 1
+DROP TABLE dept RESTRICT;
+-- expect: error SEMANTIC_ERROR
+DROP TABLE dept CASCADE;
+-- expect: message dropped
+SELECT id, dept_id FROM club;
+-- expect-row: 100 | 10
+DROP TABLE club;
+-- expect: message dropped
+
