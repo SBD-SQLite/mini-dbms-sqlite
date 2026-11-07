@@ -43,6 +43,9 @@ public final class ConcurrencyControlManagerTest {
         check.test("write access locks without logging", ConcurrencyControlManagerTest::writeAccess);
         check.test("a schema write locks the catalog and logs one schema change", ConcurrencyControlManagerTest::schemaWrite);
         check.test("a failed schema log aborts the transaction", ConcurrencyControlManagerTest::schemaWriteFails);
+        check.test("abort waits for a running apply", ConcurrencyControlManagerTest::abortWaitsForApply);
+        check.test("an apply that never ends leaves the transaction FAILED", ConcurrencyControlManagerTest::applyTimeoutOnAbort);
+        check.test("commit does not run while an apply is in flight", ConcurrencyControlManagerTest::applyTimeoutOnCommit);
         check.done();
     }
 
@@ -279,5 +282,52 @@ public final class ConcurrencyControlManagerTest {
         require(failed.status() == AccessStatus.ABORTED && code(failed.error()) == ErrorCode.WAL_FAILURE,
                 "the schema write must be refused with WAL_FAILURE");
         require(r.frm().wasRolledBack(ddl), "the transaction must be rolled back");
+    }
+
+    private static void abortWaitsForApply() throws Exception {
+        Rig r = rig(fastConfig().withApplyDrainTimeoutMs(2000));
+        long tx = begin(r);
+        long lsn = r.ccm().requestWrite(tx, change("a", 0)).changeLSN().orElseThrow();
+        require(r.ccm().beginApply(tx, lsn), "the granted LSN may be applied");
+        require(!r.ccm().beginApply(tx, lsn + 99), "an LSN that was not granted is refused");
+        require(!r.ccm().beginApply(999, lsn), "an unknown transaction is refused");
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<TransactionResponse> abort = pool.submit(() -> r.ccm().abort(tx));
+            expectBlocked(abort);
+            require(!r.frm().wasRolledBack(tx), "no undo while the apply is running");
+            r.ccm().endApply(tx, lsn);
+            require(get(abort).status() == TransactionStatus.ABORTED, "abort finishes after the apply");
+            require(r.frm().wasRolledBack(tx), "undo runs once the apply ended");
+            require(!r.ccm().beginApply(tx, lsn), "no apply after the abort");
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    private static void applyTimeoutOnAbort() {
+        Rig r = rig();
+        long tx = begin(r);
+        long lsn = r.ccm().requestWrite(tx, change("a", 0)).changeLSN().orElseThrow();
+        require(r.ccm().beginApply(tx, lsn), "apply starts");
+        TransactionResponse stuck = r.ccm().abort(tx);
+        require(stuck.status() == TransactionStatus.FAILED && code(stuck.error()) == ErrorCode.WAL_FAILURE,
+                "a stuck apply leaves the transaction FAILED");
+        require(!r.frm().wasRolledBack(tx), "no undo parallel to a physical apply");
+        r.ccm().endApply(tx, lsn);
+        require(r.ccm().abort(tx).status() == TransactionStatus.ABORTED, "the retry finishes the abort");
+    }
+
+    private static void applyTimeoutOnCommit() {
+        Rig r = rig();
+        long tx = begin(r);
+        long lsn = r.ccm().requestWrite(tx, change("a", 0)).changeLSN().orElseThrow();
+        require(r.ccm().beginApply(tx, lsn), "apply starts");
+        TransactionResponse response = r.ccm().commit(tx);
+        require(response.status() == TransactionStatus.FAILED && code(response.error()) == ErrorCode.WAL_FAILURE,
+                "commit must fail while an apply is running");
+        require(!r.frm().wasCommitted(tx), "COMMIT must not be logged");
+        r.ccm().endApply(tx, lsn);
+        require(r.ccm().abort(tx).status() == TransactionStatus.ABORTED, "the transaction can still be aborted");
     }
 }

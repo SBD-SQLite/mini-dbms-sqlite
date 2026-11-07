@@ -155,6 +155,16 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
     }
 
     @Override
+    public boolean beginApply(long txId, long changeLSN) {
+        return transactions.get(txId).map(tx -> tx.beginApply(changeLSN)).orElse(false);
+    }
+
+    @Override
+    public void endApply(long txId, long changeLSN) {
+        transactions.get(txId).ifPresent(Transaction::endApply);
+    }
+
+    @Override
     public TransactionResponse commit(long txId) {
         Optional<Transaction> found = transactions.get(txId);
         if (found.isEmpty()) {
@@ -167,6 +177,11 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
             }
 
             transactions.setStatus(txId, TransactionStatus.PARTIALLY_COMMITTED);
+            if (!tx.awaitNoApply(config.applyDrainTimeoutMs())) {
+                transactions.setStatus(txId, TransactionStatus.FAILED);
+                return withError(tx, error(ErrorCode.WAL_FAILURE, "Transaction " + txId
+                        + " cannot commit: an apply step did not finish in time"));
+            }
             try {
                 frmBridge.logCommit(txId);
             } catch (FrmFailureException e) {
@@ -258,6 +273,10 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
             }
             if (status == TransactionStatus.ACTIVE) {
                 transactions.setStatus(txId, TransactionStatus.FAILED);
+            }
+            if (!tx.awaitNoApply(config.applyDrainTimeoutMs())) {
+                return withError(tx, error(ErrorCode.WAL_FAILURE, "Transaction " + txId
+                        + " stays FAILED: an apply step did not finish in time; abort again to retry"));
             }
             try {
                 frmBridge.rollbackThenLogAbort(txId);
