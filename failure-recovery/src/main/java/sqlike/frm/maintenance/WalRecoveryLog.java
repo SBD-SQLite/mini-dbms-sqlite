@@ -6,44 +6,48 @@ import java.util.Objects;
 import sqlike.frm.checkpoint.CheckpointInfo;
 import sqlike.frm.checkpoint.CheckpointLogPort;
 import sqlike.frm.log.LogManager;
+import sqlike.frm.log.LogRecord;
 import sqlike.frm.pitr.HistoricalLogPort;
-import sqlike.frm.pitr.LogRecord;
 
 /**
- * Adapter yang menghubungkan LogManager (WAL) ke CheckpointLogPort dan HistoricalLogPort.
+ * {@link CheckpointLogPort} and {@link HistoricalLogPort} backed by {@link LogManager}. Snapshot
+ * IDs live in {@code SnapshotCatalog}, so the CHECKPOINT record does not store them.
  */
 public class WalRecoveryLog implements CheckpointLogPort, HistoricalLogPort {
 
-    private final LogManager logManager;
+    private final LogManager wal;
 
-    public WalRecoveryLog(LogManager logManager) {
-        this.logManager = Objects.requireNonNull(logManager, "logManager");
+    public WalRecoveryLog(LogManager wal) {
+        this.wal = Objects.requireNonNull(wal, "wal");
     }
 
     @Override
     public long getLastLsn() {
-        return logManager.getLastLsn();
+        return wal.getLastLsn();
     }
 
     @Override
     public void ensureDurable(long lsn) {
-        logManager.ensureDurable(lsn);
+        wal.ensureDurable(lsn);
     }
 
     @Override
     public CheckpointInfo logCheckpoint(long flushedThroughLSN, String snapshotId) {
-        long cpLsn = logManager.logCheckpoint(flushedThroughLSN);
-        return new CheckpointInfo(cpLsn, flushedThroughLSN, java.time.Instant.now(), snapshotId);
+        CheckpointInfo logged = wal.logCheckpoint(flushedThroughLSN);
+        return new CheckpointInfo(
+                logged.checkpointLSN(), logged.flushedThroughLSN(), logged.createdAt(), snapshotId);
     }
 
     @Override
     public List<LogRecord> readHistory() {
-        return logManager.readLogs(null);
+        // TODO(FR2): LogManager.readLogs reads only the active log; archived logs must come first.
+        return wal.readLogs(null);
     }
 
     @Override
     public void separateHistory() {
-        logManager.archiveActiveLog();
-        logManager.startNewLog();
+        // TODO(FR2): archiveActiveLog + startNewLog must keep LSNs continuing after the last one.
+        wal.archiveActiveLog();
+        wal.startNewLog();
     }
 }

@@ -1,16 +1,20 @@
 package sqlike.frm.checkpoint;
 
-/** Log operations required by the checkpoint coordinator. */
+/** Write-ahead-log operations a checkpoint needs. */
 public interface CheckpointLogPort {
 
     /** Returns the latest allocated LSN, or zero when the log is empty. */
     long getLastLsn();
-    
+
     /**
-     * Memastikan semua log record sampai LSN yang ditentukan sudah persisten ke disk.
+     * Returns only after every log record up to and including {@code lsn} is on stable storage.
+     * Throws when durability cannot be guaranteed; the checkpoint then stops before touching data.
      */
     void ensureDurable(long lsn);
 
-    /** Persists a completed-checkpoint marker and returns its metadata. */
+    /**
+     * Appends a completed-checkpoint marker and returns its metadata. The caller makes the marker
+     * durable with {@link #ensureDurable(long)} before treating the checkpoint as complete.
+     */
     CheckpointInfo logCheckpoint(long flushedThroughLSN, String snapshotId);
 }

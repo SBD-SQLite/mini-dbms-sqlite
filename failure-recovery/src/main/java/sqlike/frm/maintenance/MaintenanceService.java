@@ -5,48 +5,47 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
-import sqlike.frm.checkpoint.*;
-import sqlike.frm.pitr.*;
+import sqlike.frm.checkpoint.CheckpointInfo;
+import sqlike.frm.checkpoint.CheckpointLogPort;
+import sqlike.frm.checkpoint.CheckpointManager;
+import sqlike.frm.checkpoint.CheckpointScheduler;
+import sqlike.frm.checkpoint.SnapshotCatalog;
+import sqlike.frm.pitr.HistoricalLogPort;
+import sqlike.frm.pitr.HistoricalRecoveryPlan;
+import sqlike.frm.pitr.PointInTimeRecovery;
 import sqlike.frm.port.CcmPort;
 import sqlike.frm.port.SmPort;
+import sqlike.shared.RecoveryTarget;
 
 /**
- * Pintu masuk utama (Facade) fitur maintenance basis data.
- * Menggabungkan Checkpoint Manual, Checkpoint Periodik, PITR, dan SnapshotCatalog.
+ * Database maintenance: manual and periodic checkpoints, and point-in-time recovery.
+ *
+ * <p>All operations share one maintenance gate and one snapshot catalog, so a checkpoint never
+ * overlaps a restore and a restore always sees the snapshots checkpoints created.
  */
 public class MaintenanceService implements AutoCloseable {
 
     public static final String SNAPSHOT_CATALOG_FILE = "snapshots.catalog";
 
-    private final SmPort storage;
-    private final CcmPort concurrency;
-    private final CheckpointLogPort checkpointLog;
-    private final HistoricalLogPort historicalLog;
-    private final CheckpointManager checkpointManager;
-    private final PointInTimeRecovery pitr;
-    private final SnapshotCatalog catalog;
-    private final Duration periodicInterval;
-    private final Lock maintenanceGate;
-    private final long idleTimeoutMs;
-
-    private ScheduledExecutorService scheduler;
-    private PeriodicFailure lastFailure;
-
-    public MaintenanceService(
-            SmPort storage,
-            CcmPort concurrency,
-            CheckpointLogPort checkpointLog,
-            HistoricalLogPort historicalLog,
-            Path catalogPath,
-            Duration periodicInterval,
-            long idleTimeoutMs) {
-        this(storage, concurrency, checkpointLog, historicalLog, catalogPath, periodicInterval, idleTimeoutMs, new ReentrantLock());
+    public record PeriodicFailure(Instant at, RuntimeException error) {
     }
 
+    private final Lock maintenanceGate;
+    private final SnapshotCatalog snapshotCatalog;
+    private final CheckpointManager checkpointManager;
+    private final PointInTimeRecovery pointInTimeRecovery;
+    private final CheckpointScheduler scheduler;
+    private final AtomicReference<PeriodicFailure> lastPeriodicFailure = new AtomicReference<>();
+
+    /**
+     * @param catalogPath      snapshot catalog file; {@code null} keeps it in memory
+     * @param periodicInterval zero or negative disables periodic checkpoints
+     * @param idleTimeoutMs    maximum wait for active transactions
+     */
     public MaintenanceService(
             SmPort storage,
             CcmPort concurrency,
@@ -56,74 +55,56 @@ public class MaintenanceService implements AutoCloseable {
             Duration periodicInterval,
             long idleTimeoutMs,
             Lock maintenanceGate) {
-        this.storage = Objects.requireNonNull(storage, "storage");
-        this.concurrency = Objects.requireNonNull(concurrency, "concurrency");
-        this.checkpointLog = Objects.requireNonNull(checkpointLog, "checkpointLog");
-        this.historicalLog = Objects.requireNonNull(historicalLog, "historicalLog");
-        this.periodicInterval = periodicInterval != null ? periodicInterval : Duration.ZERO;
-        this.idleTimeoutMs = idleTimeoutMs;
-        this.maintenanceGate = maintenanceGate != null ? maintenanceGate : new ReentrantLock();
+        this.maintenanceGate = Objects.requireNonNull(maintenanceGate, "maintenanceGate");
+        this.snapshotCatalog = new SnapshotCatalog(catalogPath);
+        this.checkpointManager = new CheckpointManager(
+                storage, concurrency, checkpointLog, snapshotCatalog, idleTimeoutMs, maintenanceGate);
+        this.pointInTimeRecovery = new PointInTimeRecovery(
+                storage, concurrency, historicalLog, snapshotCatalog, checkpointManager,
+                idleTimeoutMs, maintenanceGate);
+        this.scheduler = new CheckpointScheduler(
+                Objects.requireNonNull(periodicInterval, "periodicInterval"), this::periodicCheckpoint);
+    }
 
-        this.catalog = new SnapshotCatalog(catalogPath);
-        this.checkpointManager = new CheckpointManager(storage, concurrency, checkpointLog, idleTimeoutMs, this.maintenanceGate);
-        this.pitr = new PointInTimeRecovery(storage, concurrency, checkpointLog, historicalLog, catalog);
+    public MaintenanceService(
+            SmPort storage,
+            CcmPort concurrency,
+            CheckpointLogPort checkpointLog,
+            HistoricalLogPort historicalLog,
+            Path catalogPath,
+            Duration periodicInterval,
+            long idleTimeoutMs) {
+        this(storage, concurrency, checkpointLog, historicalLog, catalogPath, periodicInterval,
+                idleTimeoutMs, new ReentrantLock());
     }
 
     public CheckpointInfo checkpoint() {
-        CheckpointInfo info = checkpointManager.checkpoint();
-        catalog.recordSnapshot(new SnapshotEntry(info.snapshotId(), info.flushedThroughLSN(), info.checkpointLSN(), info.createdAt()));
-        lastFailure = null;
-        return info;
+        return checkpointManager.checkpoint();
     }
 
     public HistoricalRecoveryPlan recoverTo(RecoveryTarget target) {
-        maintenanceGate.lock();
-        try {
-            concurrency.pauseNewTransactions();
-            try {
-                if (!concurrency.waitUntilIdle(idleTimeoutMs)) {
-                    throw new IllegalStateException("checkpoint timed out waiting for active transactions");
-                }
-                return pitr.recoverTo(target);
-            } finally {
-                concurrency.resumeTransactions();
-            }
-        } finally {
-            maintenanceGate.unlock();
-        }
+        return pointInTimeRecovery.recoverTo(target);
     }
 
-    public synchronized void startPeriodicCheckpoints() {
-        if (periodicInterval.isZero() || periodicInterval.isNegative() || isPeriodicCheckpointRunning()) return;
-
-        scheduler = Executors.newSingleThreadScheduledExecutor();
-        long millis = periodicInterval.toMillis();
-        scheduler.scheduleAtFixedRate(() -> {
-            try {
-                checkpoint();
-            } catch (Throwable t) {
-                lastFailure = new PeriodicFailure(Instant.now(), t.getMessage(), t);
-            }
-        }, millis, millis, TimeUnit.MILLISECONDS);
+    public void startPeriodicCheckpoints() {
+        scheduler.start();
     }
 
-    public synchronized void stopPeriodicCheckpoints() {
-        if (scheduler != null) {
-            scheduler.shutdownNow();
-            scheduler = null;
-        }
+    public void stopPeriodicCheckpoints() {
+        scheduler.stop();
     }
 
-    public synchronized boolean isPeriodicCheckpointRunning() {
-        return scheduler != null && !scheduler.isShutdown();
+    public boolean isPeriodicCheckpointRunning() {
+        return scheduler.isRunning();
     }
 
+    /** Failure of the latest periodic checkpoint run; empty once a later run succeeds. */
     public Optional<PeriodicFailure> lastPeriodicFailure() {
-        return Optional.ofNullable(lastFailure);
+        return Optional.ofNullable(lastPeriodicFailure.get());
     }
 
-    public Optional<SnapshotEntry> latestRecoveryPoint() {
-        return catalog.latestValidSnapshot();
+    public Optional<SnapshotCatalog.SnapshotEntry> latestRecoveryPoint() {
+        return snapshotCatalog.latestUsableFor(Long.MAX_VALUE);
     }
 
     public Lock maintenanceGate() {
@@ -132,6 +113,15 @@ public class MaintenanceService implements AutoCloseable {
 
     @Override
     public void close() {
-        stopPeriodicCheckpoints();
+        scheduler.close();
+    }
+
+    private void periodicCheckpoint() {
+        try {
+            checkpointManager.checkpoint();
+            lastPeriodicFailure.set(null);
+        } catch (RuntimeException error) {
+            lastPeriodicFailure.set(new PeriodicFailure(Instant.now(), error));
+        }
     }
 }

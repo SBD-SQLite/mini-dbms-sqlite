@@ -1,80 +1,98 @@
 package sqlike.frm.pitr;
 
 import java.time.Instant;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Objects;
+import java.util.Set;
 
 import sqlike.frm.checkpoint.SnapshotCatalog;
-import sqlike.frm.checkpoint.SnapshotEntry;
+import sqlike.frm.log.LogRecord;
+import sqlike.frm.log.LogType;
+import sqlike.shared.RecoveryTarget;
+import sqlike.shared.RecoveryTargetKind;
 
 /**
- * Menyusun rencana pemulihan historis (PITR) tanpa mengubah data di disk.
+ * Builds a {@link HistoricalRecoveryPlan} from the log without touching data.
+ *
+ * <p>TIME t targets the last record with time {@code <= t}; TRANSACTION x targets x's COMMIT.
+ * Only transactions committed at or before the target are replayed. Abandoned WAL ranges are
+ * skipped except when computing {@code maxTxId}.
  */
 public class HistoricalRecoveryPlanner {
 
-    public static HistoricalRecoveryPlan plan(
-            RecoveryTarget target,
-            List<LogRecord> history,
-            SnapshotCatalog catalog) {
+    private final SnapshotCatalog snapshotCatalog;
 
-        long targetLSN = resolveTargetLSN(target, history);
-        
-        // Cari snapshot dasar terbaru dengan baseLSN <= targetLSN
-        SnapshotEntry baseSnapshot = catalog.findBaseSnapshotFor(targetLSN)
-                .orElseThrow(() -> new IllegalStateException(
-                        "Tidak ditemukan snapshot dasar yang valid untuk target LSN: " + targetLSN));
-
-        Set<Long> committedTxIds = new HashSet<>();
-        long maxTxId = 0;
-
-        // Pass 1: Identifikasi semua transaksi COMMITTED sebelum/pada targetLSN & cari maxTxId
-        for (LogRecord rec : history) {
-            if (rec.txId() > maxTxId) {
-                maxTxId = rec.txId();
-            }
-            if (rec.lsn() <= targetLSN && "COMMIT".equalsIgnoreCase(rec.type())) {
-                committedTxIds.add(rec.txId());
-            }
-        }
-
-        // Pass 2: Kumpulkan perubahan yang perlu di-replay (baseLSN < LSN <= targetLSN)
-        List<LogRecord> changesToReplay = new ArrayList<>();
-        for (LogRecord rec : history) {
-            if (rec.lsn() > baseSnapshot.baseLSN() && rec.lsn() <= targetLSN) {
-                if (committedTxIds.contains(rec.txId()) && rec.change() != null) {
-                    changesToReplay.add(rec);
-                }
-            }
-        }
-
-        return new HistoricalRecoveryPlan(
-                baseSnapshot.snapshotId(),
-                baseSnapshot.baseLSN(),
-                targetLSN,
-                maxTxId,
-                committedTxIds,
-                changesToReplay);
+    public HistoricalRecoveryPlanner(SnapshotCatalog snapshotCatalog) {
+        this.snapshotCatalog = Objects.requireNonNull(snapshotCatalog, "snapshotCatalog");
     }
 
-    private static long resolveTargetLSN(RecoveryTarget target, List<LogRecord> history) {
-        if (target.kind() == RecoveryTargetKind.TRANSACTION) {
-            long targetTxId = target.txId().orElseThrow();
-            for (LogRecord rec : history) {
-                if (rec.txId() == targetTxId && "COMMIT".equalsIgnoreCase(rec.type())) {
-                    return rec.lsn();
-                }
+    public HistoricalRecoveryPlan plan(RecoveryTarget target, List<LogRecord> history) {
+        Objects.requireNonNull(target, "target");
+        Objects.requireNonNull(history, "history");
+
+        List<LogRecord> visible = new ArrayList<>();
+        long maxTxId = 0;
+        for (LogRecord record : history) {
+            if (record.txID().isPresent()) {
+                maxTxId = Math.max(maxTxId, record.txID().orElseThrow());
             }
-            throw new IllegalArgumentException("Transaksi " + targetTxId + " tidak pernah COMMIT.");
-        } else {
-            Instant targetTime = target.time().orElseThrow();
-            long maxLsn = 0;
-            for (LogRecord rec : history) {
-                if (rec.timestamp() != null && !rec.timestamp().isAfter(targetTime)) {
-                    if (rec.lsn() > maxLsn) {
-                        maxLsn = rec.lsn();
-                    }
-                }
+            if (!snapshotCatalog.isAbandoned(record.lsn())) {
+                visible.add(record);
             }
-            return maxLsn;
         }
+
+        long targetLSN = resolveTargetLsn(target, visible);
+        SnapshotCatalog.SnapshotEntry base = snapshotCatalog.latestUsableFor(targetLSN)
+                .orElseThrow(() -> new IllegalStateException(
+                        "no base snapshot at or before LSN " + targetLSN
+                                + "; run a checkpoint before the target point"));
+
+        Set<Long> committed = new HashSet<>();
+        for (LogRecord record : visible) {
+            if (record.type() == LogType.COMMIT && record.lsn() <= targetLSN) {
+                committed.add(record.txID().orElseThrow());
+            }
+        }
+
+        List<LogRecord> changes = new ArrayList<>();
+        for (LogRecord record : visible) {
+            if (isDataChange(record.type())
+                    && record.lsn() > base.baseLSN()
+                    && record.lsn() <= targetLSN
+                    && committed.contains(record.txID().orElseThrow())) {
+                changes.add(record);
+            }
+        }
+        changes.sort((a, b) -> Long.compare(a.lsn(), b.lsn()));
+
+        return new HistoricalRecoveryPlan(
+                base.snapshotId(), base.baseLSN(), targetLSN, maxTxId, committed, changes);
+    }
+
+    static long resolveTargetLsn(RecoveryTarget target, List<LogRecord> visible) {
+        if (target.kind() == RecoveryTargetKind.TIME) {
+            Instant time = target.time().orElseThrow();
+            long lsn = 0;
+            for (LogRecord record : visible) {
+                if (!record.time().isAfter(time)) {
+                    lsn = Math.max(lsn, record.lsn());
+                }
+            }
+            return lsn;
+        }
+        long txId = target.txId().orElseThrow();
+        for (LogRecord record : visible) {
+            if (record.type() == LogType.COMMIT && record.txID().orElse(-1L) == txId) {
+                return record.lsn();
+            }
+        }
+        throw new IllegalArgumentException(
+                "transaction " + txId + " has no COMMIT on the current timeline");
+    }
+
+    private static boolean isDataChange(LogType type) {
+        return type == LogType.INSERT || type == LogType.UPDATE || type == LogType.DELETE;
     }
 }
