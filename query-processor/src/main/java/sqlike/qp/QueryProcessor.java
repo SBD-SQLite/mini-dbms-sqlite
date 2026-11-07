@@ -1,5 +1,6 @@
 package sqlike.qp;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import sqlike.contract.IConcurrencyControlManager;
@@ -20,14 +21,18 @@ import sqlike.shared.ErrorInfo;
 import sqlike.shared.ParsedQuery;
 import sqlike.shared.PlanNode;
 import sqlike.shared.PlanNodeKind;
+import sqlike.shared.QoException;
 import sqlike.shared.QueryPlan;
 import sqlike.shared.QueryResult;
 import sqlike.shared.RecoveryResult;
+import sqlike.shared.ResultColumn;
 import sqlike.shared.ResultKind;
 import sqlike.shared.Session;
 import sqlike.shared.StatementType;
+import sqlike.shared.TransactionAction;
 import sqlike.shared.TransactionResponse;
 import sqlike.shared.TransactionStatus;
+import sqlike.shared.Value;
 
 /**
  * Query Processor facade implementing both the Supergroup Contract (Tab 6: IQueryProcessor)
@@ -47,6 +52,9 @@ public final class QueryProcessor implements IQueryProcessor {
     private final PlanExecutor planExecutor;
     private final ConcurrencyAdapter concurrencyAdapter;
     private volatile SystemState state;
+
+    private record Outcome(ExecutionSummary summary, Optional<TransactionResponse> transaction) {
+    }
 
     /**
      * Constructor for QP1 M1 facade driver and PlanExecutor injection.
@@ -170,7 +178,7 @@ public final class QueryProcessor implements IQueryProcessor {
         this.access = access;
         this.planExecutor = engine;
         this.concurrencyAdapter = null;
-        this.state = SystemState.READY;
+        this.state = SystemState.STARTING;
     }
 
     @Override
@@ -223,12 +231,7 @@ public final class QueryProcessor implements IQueryProcessor {
             if (transactions != null) {
                 transactions.closeSession(session);
             } else if (concurrencyControl != null) {
-                session.getCurrentTxId().ifPresent(txId -> {
-                    try {
-                        concurrencyControl.abort(txId);
-                    } catch (RuntimeException ignored) {
-                    }
-                });
+                session.getCurrentTxId().ifPresent(this::abortQuietly);
                 session.clearTransaction();
             }
         } finally {
@@ -252,18 +255,11 @@ public final class QueryProcessor implements IQueryProcessor {
         try {
             requireReady();
             session = sessions.requireSession(sessionId);
-            if (sql == null || sql.isBlank()) {
-                throw new QpException(ErrorCode.SYNTAX_ERROR, "SQL statement cannot be empty");
-            }
         } catch (RuntimeException e) {
-            ExecutionSummary fail = ExecutionSummary.failure(new DbmsError(e.getMessage()));
-            if (sink != null) {
-                sink.onFinish(fail);
-            }
-            return fail;
+            return finish(sink, ExecutionSummary.failure(toErrorInfo(e)));
         }
 
-        if (transactions == null || translator == null || access == null) {
+        if (!isFullyWired()) {
             QueryResult qr = execute(sql, session.toSession());
             if (sink != null && qr.kind() == ResultKind.ROWS) {
                 Schema schema = Schema.of(qr.columns().stream()
@@ -274,62 +270,178 @@ public final class QueryProcessor implements IQueryProcessor {
                     sink.onRow(Row.of(rowVals));
                 }
             }
-            ExecutionSummary summary = ExecutionSummary.fromQueryResult(qr);
-            if (sink != null) {
-                sink.onFinish(summary);
+            return finish(sink, ExecutionSummary.fromQueryResult(qr));
+        }
+        return finish(sink, run(session, sql, sink).summary());
+    }
+
+    @Override
+    public QueryResult execute(String sql, Session session) {
+        SessionState sessionState;
+        try {
+            requireReady();
+            if (sql == null || sql.isBlank()) {
+                throw new QpException(ErrorCode.SYNTAX_ERROR, "SQL statement cannot be empty");
             }
-            return summary;
+            if (session == null) {
+                throw new QpException(ErrorCode.INVALID_STATE, "Session is required to execute SQL");
+            }
+            sessionState = sessions.requireSession(session.sessionId());
+        } catch (RuntimeException e) {
+            return errorResult(e);
         }
 
+        if (isFullyWired()) {
+            return runForResult(sessionState, sql);
+        }
+
+        sessionState.lockExecution();
+        try {
+            ParsedQuery parsed = optimizer.parseQuery(sql);
+            StatementType type = parsed.statementType();
+            if (type == StatementType.BEGIN) {
+                return begin(sessionState);
+            }
+            if (type == StatementType.COMMIT) {
+                return commit(sessionState);
+            }
+            if (type == StatementType.ABORT) {
+                return abort(sessionState);
+            }
+            return executeStatement(sessionState, parsed);
+        } catch (RuntimeException e) {
+            return errorResult(e);
+        } finally {
+            sessionState.unlockExecution();
+        }
+    }
+
+    @Override
+    public QueryResult executePlan(QueryPlan plan, long txId) {
+        try {
+            requireReady();
+            ExecutionContext context = ExecutionContext.of(txId);
+            if (concurrencyAdapter != null && access != null && plan != null) {
+                concurrencyAdapter.registerExternalTransaction(txId);
+                access.acquireAll(PreparedStatement.of(plan), context);
+            }
+            return planExecutor.execute(plan, context);
+        } catch (RuntimeException e) {
+            return errorResult(e);
+        }
+    }
+
+    private boolean isFullyWired() {
+        return transactions != null && translator != null && access != null;
+    }
+
+    private ExecutionSummary finish(ResultSink sink, ExecutionSummary summary) {
+        if (sink != null) {
+            sink.onFinish(summary);
+        }
+        return summary;
+    }
+
+    private Outcome run(SessionState session, String sql, ResultSink sink) {
+        if (sql == null || sql.isBlank()) {
+            return new Outcome(
+                    ExecutionSummary.failure(toErrorInfo(
+                            new QpException(ErrorCode.SYNTAX_ERROR, "SQL statement cannot be empty"))),
+                    Optional.empty());
+        }
         session.lockExecution();
         Optional<ExecutionContext> context = Optional.empty();
-        boolean started = false;
         try {
             ParsedQuery parsed = optimizer.parseQuery(sql);
             if (parsed.transactionCommand().isPresent()) {
-                ExecutionSummary txSummary = switch (parsed.transactionCommand().get().action()) {
-                    case BEGIN -> {
-                        TxId tx = transactions.beginExplicit(session);
-                        yield ExecutionSummary.ok(0L, "BEGIN: ACTIVE txId=" + tx.value());
-                    }
-                    case COMMIT -> {
-                        TransactionState st = transactions.commit(session);
-                        yield st == TransactionState.COMMITTED
-                                ? ExecutionSummary.ok(0L, "COMMIT: COMMITTED")
-                                : ExecutionSummary.failure(new DbmsError("COMMIT rejected: " + st));
-                    }
-                    case ABORT -> {
-                        TransactionState st = transactions.abort(session, "User ABORT");
-                        yield st == TransactionState.ABORTED
-                                ? ExecutionSummary.ok(0L, "ABORT: ABORTED")
-                                : ExecutionSummary.failure(new DbmsError("ABORT rejected: " + st));
-                    }
-                };
-                if (sink != null) {
-                    sink.onFinish(txSummary);
-                }
-                return txSummary;
+                return runTransactionCommand(session, parsed.transactionCommand().get().action());
             }
             QueryPlan plan = optimizer.optimizeQuery(parsed);
             PreparedStatement prepared = PreparedStatement.of(sql, plan);
             validateStatementPolicy(prepared, session);
             ExecutionContext ctx = transactions.ensureTransaction(session);
             context = Optional.of(ctx);
-            started = true;
             ExecutionSummary summary = executePrepared(prepared, ctx, sink);
             transactions.finishImplicit(session, ctx);
-            if (sink != null) {
-                sink.onFinish(summary);
-            }
-            return summary;
+            return new Outcome(summary, Optional.empty());
         } catch (RuntimeException e) {
-            ExecutionSummary failure = handleFailure(session, context, new DbmsError(e.getMessage()), started);
-            if (sink != null) {
-                sink.onFinish(failure);
-            }
-            return failure;
+            return new Outcome(handleFailure(session, context, toErrorInfo(e)), Optional.empty());
         } finally {
             session.unlockExecution();
+        }
+    }
+
+    private Outcome runTransactionCommand(SessionState session, TransactionAction action) {
+        switch (action) {
+            case BEGIN: {
+                TxId tx = transactions.beginExplicit(session);
+                return transactionOutcome(tx.value(), TransactionStatus.ACTIVE, "BEGIN: ACTIVE txId=" + tx.value());
+            }
+            case COMMIT: {
+                long txId = requireExplicitTransaction(session, "COMMIT");
+                TransactionState st = transactions.commit(session);
+                if (st != TransactionState.COMMITTED) {
+                    return new Outcome(ExecutionSummary.failure(new ErrorInfo(
+                            ErrorCode.TRANSACTION_ABORTED, ComponentType.CCM,
+                            "COMMIT rejected: " + st, Optional.empty())), Optional.empty());
+                }
+                return transactionOutcome(txId, TransactionStatus.COMMITTED, "COMMIT: COMMITTED");
+            }
+            case ABORT:
+            default: {
+                long txId = requireExplicitTransaction(session, "ABORT");
+                TransactionState st = transactions.abort(session, "User ABORT");
+                if (st != TransactionState.ABORTED) {
+                    return new Outcome(ExecutionSummary.failure(new ErrorInfo(
+                            ErrorCode.INVALID_STATE, ComponentType.CCM,
+                            "ABORT rejected: " + st, Optional.empty())), Optional.empty());
+                }
+                return transactionOutcome(txId, TransactionStatus.ABORTED, "ABORT: ABORTED");
+            }
+        }
+    }
+
+    private Outcome transactionOutcome(long txId, TransactionStatus status, String message) {
+        TransactionResponse response = new TransactionResponse(txId, txId, status, Optional.empty());
+        return new Outcome(ExecutionSummary.ok(0L, message), Optional.of(response));
+    }
+
+    private QueryResult runForResult(SessionState session, String sql) {
+        CollectingSink collector = new CollectingSink();
+        Outcome outcome = run(session, sql, collector);
+        ExecutionSummary summary = outcome.summary();
+        if (!summary.isSuccess()) {
+            return summary.toQueryResult();
+        }
+        if (outcome.transaction().isPresent()) {
+            return transactionResult(outcome.transaction().get(), summary.getMessage());
+        }
+        if (collector.schema != null) {
+            List<ResultColumn> columns = collector.schema.getColumns().stream()
+                    .map(c -> new ResultColumn(c.name(), Optional.empty(), c.dataType()))
+                    .toList();
+            List<List<Value>> rows = collector.rows.stream().map(Row::values).toList();
+            return new QueryResult(ResultKind.ROWS, columns, rows, 0, summary.getMessage(), Optional.empty());
+        }
+        return summary.toQueryResult();
+    }
+
+    private static final class CollectingSink implements ResultSink {
+        private Schema schema;
+        private final List<Row> rows = new ArrayList<>();
+
+        @Override
+        public void onSchema(Schema schema) {
+            this.schema = schema;
+        }
+
+        @Override
+        public void onRow(Row row) {
+            rows.add(row);
+        }
+
+        @Override
+        public void onFinish(ExecutionSummary summary) {
         }
     }
 
@@ -380,76 +492,25 @@ public final class QueryProcessor implements IQueryProcessor {
     private ExecutionSummary handleFailure(
             SessionState session,
             Optional<ExecutionContext> context,
-            DbmsError error,
-            boolean started) {
-        if (started && context.isPresent() && transactions != null) {
+            ErrorInfo error) {
+        if (context.isPresent() && transactions != null) {
             try {
-                transactions.handleRuntimeFailure(session, context.get(), error);
+                transactions.handleRuntimeFailure(session, context.get(), new DbmsError(error.message()));
             } catch (RuntimeException cleanupError) {
-                return ExecutionSummary.failure(
-                        new DbmsError(error.message() + "; cleanup incomplete: " + cleanupError.getMessage()));
+                return ExecutionSummary.failure(new ErrorInfo(
+                        error.code(),
+                        error.component(),
+                        error.message() + "; cleanup incomplete: " + cleanupError.getMessage(),
+                        error.position()));
             }
         }
         return ExecutionSummary.failure(error);
     }
 
-    @Override
-    public QueryResult execute(String sql, Session session) {
-        SessionState sessionState;
-        try {
-            requireReady();
-            if (sql == null || sql.isBlank()) {
-                throw new QpException(ErrorCode.SYNTAX_ERROR, "SQL statement cannot be empty");
-            }
-            if (session == null) {
-                throw new QpException(ErrorCode.INVALID_STATE, "Session is required to execute SQL");
-            }
-            sessionState = sessions.requireSession(session.sessionId());
-        } catch (RuntimeException e) {
-            return errorResult(e);
-        }
-
-        sessionState.lockExecution();
-        try {
-            ParsedQuery parsed = optimizer.parseQuery(sql);
-            StatementType type = parsed.statementType();
-            if (type == StatementType.BEGIN) {
-                return begin(sessionState);
-            }
-            if (type == StatementType.COMMIT) {
-                return commit(sessionState);
-            }
-            if (type == StatementType.ABORT) {
-                return abort(sessionState);
-            }
-            return executeStatement(sessionState, parsed);
-        } catch (RuntimeException e) {
-            return errorResult(e);
-        } finally {
-            sessionState.unlockExecution();
-        }
-    }
-
-    @Override
-    public QueryResult executePlan(QueryPlan plan, long txId) {
-        try {
-            requireReady();
-            ExecutionContext context = ExecutionContext.of(txId);
-            if (concurrencyAdapter != null && access != null && plan != null) {
-                concurrencyAdapter.registerExternalTransaction(txId);
-                access.acquireAll(PreparedStatement.of(plan), context);
-            }
-            return planExecutor.execute(plan, context);
-        } catch (RuntimeException e) {
-            return errorResult(e);
-        }
-    }
+    // M1 driver path (PlanExecutor constructor)
 
     private QueryResult executeStatement(SessionState session, ParsedQuery parsed) {
         QueryPlan plan = optimizer.optimizeQuery(parsed);
-        if (translator != null) {
-            validateStatementPolicy(PreparedStatement.of("", plan), session);
-        }
         Optional<Long> activeTx = session.getCurrentTxId();
         if (activeTx.isPresent()) {
             return executeInExplicitTransaction(session, plan, activeTx.get());
@@ -459,50 +520,23 @@ public final class QueryProcessor implements IQueryProcessor {
 
     private QueryResult executeInExplicitTransaction(SessionState session, QueryPlan plan, long txId) {
         try {
-            ExecutionContext context = ExecutionContext.of(txId, session.getId(), false);
-            if (access != null) {
-                if (concurrencyAdapter != null) {
-                    concurrencyAdapter.registerExternalTransaction(txId);
-                }
-                access.acquireAll(PreparedStatement.of("", plan), context);
-            }
-            return planExecutor.execute(plan, context);
+            return planExecutor.execute(plan, ExecutionContext.of(txId, session.getId(), false));
         } catch (RuntimeException e) {
             ErrorInfo error = toErrorInfo(e);
-            if (error.code() == ErrorCode.TRANSACTION_ABORTED) {
-                session.clearTransaction();
+            if (error.code() != ErrorCode.TRANSACTION_ABORTED) {
+                abortQuietly(txId);
             }
+            session.clearTransaction();
             return errorResult(error);
         }
     }
 
     private QueryResult executeInImplicitTransaction(SessionState session, QueryPlan plan) {
-        if (concurrencyControl == null && transactions != null) {
-            ExecutionContext ctx = transactions.ensureTransaction(session);
-            try {
-                if (access != null) {
-                    access.acquireAll(PreparedStatement.of("", plan), ctx);
-                }
-                QueryResult result = planExecutor.execute(plan, ctx);
-                transactions.finishImplicit(session, ctx);
-                return result;
-            } catch (RuntimeException e) {
-                transactions.handleRuntimeFailure(session, ctx, new DbmsError(e.getMessage()));
-                return errorResult(e);
-            }
-        }
         TransactionResponse begin = requireStatus(concurrencyControl.beginTransaction(), TransactionStatus.ACTIVE);
         long txId = begin.txId();
         session.attachTransaction(txId, false);
-        if (concurrencyAdapter != null) {
-            concurrencyAdapter.registerExternalTransaction(txId);
-        }
         try {
-            ExecutionContext context = ExecutionContext.of(txId, session.getId(), true);
-            if (access != null) {
-                access.acquireAll(PreparedStatement.of("", plan), context);
-            }
-            QueryResult result = planExecutor.execute(plan, context);
+            QueryResult result = planExecutor.execute(plan, ExecutionContext.of(txId, session.getId(), true));
             requireStatus(concurrencyControl.commit(txId), TransactionStatus.COMMITTED);
             return result;
         } catch (RuntimeException e) {
@@ -514,33 +548,16 @@ public final class QueryProcessor implements IQueryProcessor {
     }
 
     private QueryResult begin(SessionState session) {
-        if (concurrencyControl == null && transactions != null) {
-            TxId tx = transactions.beginExplicit(session);
-            TransactionResponse resp = new TransactionResponse(tx.value(), System.currentTimeMillis(), TransactionStatus.ACTIVE, Optional.empty());
-            return transactionResult(resp, "BEGIN TRANSACTION " + tx.value());
-        }
         Optional<Long> activeTx = session.getCurrentTxId();
         if (activeTx.isPresent()) {
             throw new QpException(ErrorCode.INVALID_STATE, "Transaction " + activeTx.get() + " is already active");
         }
         TransactionResponse response = requireStatus(concurrencyControl.beginTransaction(), TransactionStatus.ACTIVE);
         session.attachTransaction(response.txId(), true);
-        if (concurrencyAdapter != null) {
-            concurrencyAdapter.registerExternalTransaction(response.txId());
-        }
         return transactionResult(response, "BEGIN TRANSACTION " + response.txId());
     }
 
     private QueryResult commit(SessionState session) {
-        if (concurrencyControl == null && transactions != null) {
-            long txId = requireExplicitTransaction(session, "COMMIT");
-            TransactionState st = transactions.commit(session);
-            if (st != TransactionState.COMMITTED) {
-                throw new QpException(new ErrorInfo(ErrorCode.TRANSACTION_ABORTED, ComponentType.CCM, "COMMIT rejected: " + st, Optional.empty()));
-            }
-            TransactionResponse resp = new TransactionResponse(txId, System.currentTimeMillis(), TransactionStatus.COMMITTED, Optional.empty());
-            return transactionResult(resp, "COMMIT " + txId);
-        }
         long txId = requireExplicitTransaction(session, "COMMIT");
         try {
             TransactionResponse response = requireStatus(concurrencyControl.commit(txId), TransactionStatus.COMMITTED);
@@ -551,15 +568,6 @@ public final class QueryProcessor implements IQueryProcessor {
     }
 
     private QueryResult abort(SessionState session) {
-        if (concurrencyControl == null && transactions != null) {
-            long txId = requireExplicitTransaction(session, "ABORT");
-            TransactionState st = transactions.abort(session, "User ABORT");
-            if (st != TransactionState.ABORTED) {
-                throw new QpException(new ErrorInfo(ErrorCode.INVALID_STATE, ComponentType.CCM, "ABORT rejected: " + st, Optional.empty()));
-            }
-            TransactionResponse resp = new TransactionResponse(txId, System.currentTimeMillis(), TransactionStatus.ABORTED, Optional.empty());
-            return transactionResult(resp, "ABORT " + txId);
-        }
         long txId = requireExplicitTransaction(session, "ABORT");
         try {
             TransactionResponse response = requireStatus(concurrencyControl.abort(txId), TransactionStatus.ABORTED);
@@ -622,6 +630,9 @@ public final class QueryProcessor implements IQueryProcessor {
     private ErrorInfo toErrorInfo(RuntimeException e) {
         if (e instanceof QpException qp && qp.getErrorInfo() != null) {
             return qp.getErrorInfo();
+        }
+        if (e instanceof QoException qo && qo.getInfo() != null) {
+            return qo.getInfo();
         }
         ErrorCode code;
         if (e instanceof UnsupportedOperationException) {

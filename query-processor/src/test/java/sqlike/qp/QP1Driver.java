@@ -205,13 +205,20 @@ public class QP1Driver {
         Fixture f = Fixture.ready();
         Session s = f.processor.openSession();
         f.processor.execute("BEGIN TRANSACTION", s);
+        QueryResult syntax = f.processor.execute("SELEC * FORM student", s);
+        check(code(syntax) == ErrorCode.SYNTAX_ERROR
+                && f.sessions.requireSession(s.sessionId()).getCurrentTxId().equals(Optional.of(42L)),
+                "syntax error before execution keeps the explicit transaction");
         QueryResult bad = f.processor.execute("create index idx on student(id)", s);
-        check(code(bad) == ErrorCode.UNSUPPORTED_OPERATION, "statement error inside explicit transaction");
-        check(f.sessions.requireSession(s.sessionId()).getCurrentTxId().isPresent(),
-                "explicit transaction survives a non-fatal statement error");
+        check(code(bad) == ErrorCode.UNSUPPORTED_OPERATION, "runtime error inside explicit transaction");
+        check(f.ccm.calls.contains("abort 42") && f.sessions.requireSession(s.sessionId()).getCurrentTxId().isEmpty(),
+                "runtime error aborts the explicit transaction (PRD 5)");
+
+        f.processor.execute("BEGIN TRANSACTION", s);
         QueryResult conflict = f.processor.execute("update student set name = 'conflict' where id = 2", s);
         check(code(conflict) == ErrorCode.TRANSACTION_ABORTED && component(conflict) == ComponentType.CCM,
                 "CCM abort surfaces as TRANSACTION_ABORTED");
+        check(!f.ccm.calls.contains("abort 43"), "QP does not abort again after CCM aborted the transaction");
         check(f.sessions.requireSession(s.sessionId()).getCurrentTxId().isEmpty(),
                 "session falls back to auto-commit after CCM abort");
         QueryResult after = f.processor.execute("select * from student", s);
