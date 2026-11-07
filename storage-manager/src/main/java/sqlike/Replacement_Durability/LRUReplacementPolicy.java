@@ -1,7 +1,9 @@
-package storage.Replacement_Durability;
+package sqlike.replacement_durability;
 
 import java.util.LinkedHashMap;
 import java.util.Optional;
+
+import sqlike.shared.PageId;
 
 public class LRUReplacementPolicy implements ReplacementPolicy {
     private final LinkedHashMap<PageId, Boolean> accessOrder = new LinkedHashMap<>();
