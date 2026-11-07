@@ -1,6 +1,10 @@
-package sqlike.buffer
+package sqlike.buffer;
 
 import sqlike.block.*;
+import sqlike.replacement_durability.*;
+import sqlike.shared.*;
+import sqlike.replacement_durability.*;
+import java.util.*;
 
 public class BufferPoolManager{
     private BlockManager blocks;
