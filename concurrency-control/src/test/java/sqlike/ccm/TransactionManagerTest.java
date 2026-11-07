@@ -26,6 +26,7 @@ public final class TransactionManagerTest {
         check.test("recovery opens the manager after lastTxId", TransactionManagerTest::opensAfterRecovery);
         check.test("markNotReady stops new transactions until recovery", TransactionManagerTest::notReadyAgain);
         check.test("a waiting creator is rejected when the manager stops being ready", TransactionManagerTest::waiterRejected);
+        check.test("runIfNoneActive only runs when idle", TransactionManagerTest::runIfNoneActive);
         check.done();
     }
 
@@ -172,5 +173,17 @@ public final class TransactionManagerTest {
         } finally {
             pool.shutdownNow();
         }
+    }
+
+    private static void runIfNoneActive() throws Exception {
+        TransactionManager m = manager();
+        long id = m.create().getTxId();
+        int[] runs = {0};
+        rejects(IllegalStateException.class, () -> m.runIfNoneActive(() -> runs[0]++));
+        require(runs[0] == 0, "the action must not run while a transaction is unfinished");
+        m.setStatus(id, TransactionStatus.FAILED);
+        m.setStatus(id, TransactionStatus.ABORTED);
+        m.runIfNoneActive(() -> runs[0]++);
+        require(runs[0] == 1, "the action must run once when idle");
     }
 }

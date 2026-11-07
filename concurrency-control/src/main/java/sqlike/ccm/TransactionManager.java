@@ -196,4 +196,18 @@ public class TransactionManager {
             lock.unlock();
         }
     }
+
+    /** Runs {@code action} while no transaction can start or be unfinished; used to swap the protocol. */
+    public void runIfNoneActive(Runnable action) {
+        Objects.requireNonNull(action, "action");
+        lock.lock();
+        try {
+            if (unfinished > 0) {
+                throw new IllegalStateException("Cannot change protocol while transactions are active");
+            }
+            action.run();
+        } finally {
+            lock.unlock();
+        }
+    }
 }
