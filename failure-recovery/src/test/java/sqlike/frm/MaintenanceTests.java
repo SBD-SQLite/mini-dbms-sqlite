@@ -172,8 +172,9 @@ public final class MaintenanceTests {
         expect(f.ccm.getMaxTxIdAfterRecovery(), 4L, "maxTxId covers whole history");
         expect(f.catalog.isAbandoned(plan.targetLSN() + 1), true, "tail abandoned");
         expect(f.catalog.isAbandoned(lastBefore), true, "last old LSN abandoned");
-        expect(f.log.activeLog().size(), 1, "new active log holds only the checkpoint");
+        expect(f.log.activeLog().size(), 2, "new active log holds only the two checkpoint markers");
         expect(f.log.activeLog().get(0).type(), LogType.CHECKPOINT, "new log starts with checkpoint");
+        expect(f.log.activeLog().get(1).type(), LogType.CHECKPOINT, "restored state is checkpointed");
     }
 
     private static void pitrTransactionTarget() {
