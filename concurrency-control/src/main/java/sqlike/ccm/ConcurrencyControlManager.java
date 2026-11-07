@@ -40,7 +40,7 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
         this.recovery = Objects.requireNonNull(recovery, "recovery");
         this.config = Objects.requireNonNull(config, "config");
         this.transactions = new TransactionManager();
-        this.frmBridge = new FRMBridge(this.recovery);
+        this.frmBridge = new FRMBridge(this.recovery, config);
         this.recorder = new ScheduleRecorder();
         this.protocol = createProtocol(config.protocol());
     }
@@ -138,16 +138,7 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
         if (found.isEmpty()) {
             return unknownTransaction(txId);
         }
-        Transaction tx = found.get();
-        TransactionStatus status = tx.getStatus();
-        if (status == TransactionStatus.COMMITTED || status == TransactionStatus.ABORTED) {
-            return withError(tx, error(ErrorCode.INVALID_STATE, "Transaction " + txId + " is " + status));
-        }
-        if (status == TransactionStatus.PARTIALLY_COMMITTED) {
-            return withError(tx, error(ErrorCode.INVALID_STATE,
-                    "Transaction " + txId + " has an unknown commit outcome; recovery is required"));
-        }
-        return handleAbort(tx, null);
+        return handleAbort(found.get(), null);
     }
 
     @Override
@@ -198,8 +189,9 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
     }
 
     /**
-     * Single abort path for user ABORT, deadlock victims, and protocol violations (CC-04).
-     * Protocol state is kept until rollback has finished.
+     * Single abort path for user ABORT, deadlock victims, protocol violations, and WAL failures (CC-04).
+     * Protocol state is kept until rollback and logAbort have finished; a failure leaves the
+     * transaction FAILED so that a later abort can retry.
      */
     private TransactionResponse handleAbort(Transaction tx, ErrorInfo reason) {
         // A deadlock callback and a waiting request can reach this method at the same time.
@@ -209,9 +201,19 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
             if (status == TransactionStatus.COMMITTED || status == TransactionStatus.ABORTED) {
                 return withError(tx, error(ErrorCode.INVALID_STATE, "Transaction " + txId + " is " + status));
             }
-            transactions.setStatus(txId, TransactionStatus.FAILED);
-            // TODO(CC3): if rollback fails, keep the transaction FAILED and keep its protocol state.
-            frmBridge.rollbackThenLogAbort(txId);
+            if (status == TransactionStatus.PARTIALLY_COMMITTED) {
+                return withError(tx, error(ErrorCode.INVALID_STATE,
+                        "Transaction " + txId + " has an unknown commit outcome; recovery is required"));
+            }
+            if (status == TransactionStatus.ACTIVE) {
+                transactions.setStatus(txId, TransactionStatus.FAILED);
+            }
+            try {
+                frmBridge.rollbackThenLogAbort(txId);
+            } catch (FrmFailureException e) {
+                return withError(tx, error(ErrorCode.WAL_FAILURE, "Transaction " + txId
+                        + " stays FAILED with its locks held; abort again to retry: " + e.getMessage()));
+            }
             transactions.setStatus(txId, TransactionStatus.ABORTED);
             protocol.release(tx);
             return reason == null ? tx.toResponse() : withError(tx, reason);

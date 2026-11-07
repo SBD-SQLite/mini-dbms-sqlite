@@ -37,6 +37,9 @@ public final class ConcurrencyControlManagerTest {
         check.test("a failed change log aborts the transaction", ConcurrencyControlManagerTest::writeLogFails);
         check.test("commit releases locks only after COMMIT is logged", ConcurrencyControlManagerTest::commitOrder);
         check.test("a failed COMMIT log is an unknown outcome, not an abort", ConcurrencyControlManagerTest::commitUnknown);
+        check.test("a transient rollback failure is retried", ConcurrencyControlManagerTest::rollbackRetried);
+        check.test("a failed rollback keeps the transaction FAILED and its locks", ConcurrencyControlManagerTest::rollbackStuck);
+        check.test("a failed logAbort keeps the locks until a retry works", ConcurrencyControlManagerTest::logAbortStuck);
         check.done();
     }
 
@@ -179,5 +182,49 @@ public final class ConcurrencyControlManagerTest {
                 "abort must not undo a commit that may have happened");
         r.ccm().initAfterRecovery(10);
         require(r.ccm().beginTransaction().txId() == 11, "recovery reopens the manager");
+    }
+
+    private static void rollbackRetried() {
+        Rig r = rig();
+        long tx = begin(r);
+        granted(r.ccm().requestWrite(tx, change("a", 0)));
+        r.frm().setFailOnOperation("rollback", 2);
+        TransactionResponse response = r.ccm().abort(tx);
+        require(response.status() == TransactionStatus.ABORTED && response.error().isEmpty(), "abort succeeds");
+        require(r.frm().wasRolledBack(tx) && r.frm().wasAborted(tx), "rollback then ABORT");
+        require(code(r.ccm().abort(tx).error()) == ErrorCode.INVALID_STATE, "a second abort is refused");
+    }
+
+    private static void rollbackStuck() throws Exception {
+        Rig r = rig();
+        long first = begin(r);
+        long second = begin(r);
+        granted(r.ccm().requestWrite(first, change("a", 0)));
+        r.frm().setFailOnOperation("rollback", 100);
+        TransactionResponse stuck = r.ccm().abort(first);
+        require(stuck.status() == TransactionStatus.FAILED && code(stuck.error()) == ErrorCode.WAL_FAILURE,
+                "a failed rollback leaves the transaction FAILED");
+        require(!r.frm().wasAborted(first), "no ABORT record without a finished undo");
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<AccessResponse> blocked = pool.submit(() -> r.ccm().requestWrite(second, change("a", 1)));
+            expectBlocked(blocked);
+            r.frm().setFailOnOperation("rollback", 0);
+            require(r.ccm().abort(first).status() == TransactionStatus.ABORTED, "the retry finishes the abort");
+            granted(get(blocked));
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    private static void logAbortStuck() {
+        Rig r = rig();
+        long tx = begin(r);
+        granted(r.ccm().requestWrite(tx, change("a", 0)));
+        r.frm().setFailOnOperation("logAbort", 100);
+        require(r.ccm().abort(tx).status() == TransactionStatus.FAILED, "ABORT could not be logged");
+        require(r.frm().wasRolledBack(tx) && !r.frm().wasAborted(tx), "undo done, ABORT missing");
+        r.frm().setFailOnOperation("logAbort", 0);
+        require(r.ccm().abort(tx).status() == TransactionStatus.ABORTED, "the retry logs ABORT");
     }
 }
