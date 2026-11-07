@@ -1,102 +1,90 @@
 package sqlike.frm.recovery;
 
-import sqlike.frm.Log.LogManager;
-import sqlike.frm.RecoveryError;
+import sqlike.frm.log.LogManager;
+import sqlike.frm.log.LogRecord;
 import sqlike.frm.RecoveryState;
-import sqlike.frm.port.CcmPort;
 import sqlike.frm.port.SmPort;
-import sqlike.frm.model.RecoveryPlan;
-import sqlike.frm.model.RecoveryReport;
-import java.util.Collections;
+import sqlike.shared.RecoveryResult;
+
+import java.util.HashSet;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
 
 public class RecoveryManager {
     private RecoveryState state;
-    private LogManager logManager;
-    private RecoveryAnalyzer analyzer;
-    private ChangeApplier applier;
-    private SmPort sm;
-    private CcmPort ccm;
-    private RecoveryReport lastReport;
+    private final LogManager logManager;
+    private final RecoveryAnalyzer analyzer;
+    private final ChangeApplier applier;
+    private final SmPort sm;
+    private RecoveryResult lastResult;
 
-    public RecoveryManager(LogManager logManager, SmPort sm, CcmPort ccm) {
+    public RecoveryManager(LogManager logManager, SmPort sm) {
         this.logManager = logManager;
         this.sm = sm;
-        this.ccm = ccm;
         this.analyzer = new RecoveryAnalyzer();
         this.applier = new ChangeApplier(sm);
         this.state = RecoveryState.NOT_STARTED;
     }
 
-    public RecoveryReport recover() {
-        // Mengembalikan hasil bila recovery sudah selesai
-        // TODO: Tambahkan mekanisme sinkronisasi (misal: synchronized/locking) untuk mencegah race condition jika dipanggil bersamaan saat state RUNNING
-        if (lastReport != null && (state == RecoveryState.READY || state == RecoveryState.RUNNING)) {
-            return lastReport;
-        }
+    public synchronized RecoveryResult recover() throws Exception {
+        if (state == RecoveryState.READY && lastResult != null) return lastResult;
+        if (state == RecoveryState.RUNNING) throw new IllegalStateException("Recovery sedang berjalan!");
 
         state = RecoveryState.RUNNING;
 
         try {
-            RecoveryPlan plan = new RecoveryPlan();
-            plan.maxTxId = 0; 
+            // baca log
+            List<LogRecord> records = logManager.readLogs(null);
 
-            // TODO: 1. Dapatkan log via logManager.readLogs()
-            // TODO: Jika ada log terpotong (truncated) di ekor, POTONG/HAPUS bagian tersebut dari file log sebelum proses lanjut
-            // TODO: Tangani korupsi tengah log dengan melempar RecoveryError.LOG_INCONSISTENT
-            // TODO: 2. plan = analyzer.analyze(records)
+            // fase analysis
+            RecoveryPlan plan = analyzer.analyze(records);
 
-            // TODO: 3. Lakukan Fase UNDO terlebih dahulu
-            // undoUncommitted(plan);
+            // fase undo: LogManager.logAbort menolak ABORT tanpa COMPENSATION per perubahan,
+            // jadi catat COMPENSATION (yang belum ada) sebelum menerapkan undo
+            Set<Long> compensated = new HashSet<>();
+            for (LogRecord record : records) {
+                record.undoOfLSN().ifPresent(compensated::add);
+            }
+            for (LogRecord undoRec : plan.undoChanges) {
+                long txId = undoRec.txID().orElseThrow();
+                if (plan.needsAbortTx.contains(txId) && !compensated.contains(undoRec.lsn())) {
+                    logManager.logCompensation(txId, undoRec.lsn());
+                }
+                applier.undo(undoRec);
+            }
 
-            // TODO: 4. Lakukan Fase REDO
-            // redoCommitted(plan);
+            // fase redo
+            for (LogRecord redoRec : plan.redoChanges) {
+                applier.apply(redoRec);
+            }
 
-            // TODO: 5. finalizeRecovery(plan)
-            
-            lastReport = new RecoveryReport();
-            lastReport.success = true;
-            lastReport.maxTxId = plan.maxTxId;
-            // Kontrak: txOutcome bersifat read-only (tidak boleh dimodifikasi pemanggil)
-            lastReport.txOutcome = Collections.emptyMap(); 
-            
+            // fase finalize
+            for (Long txId : plan.needsAbortTx) {
+                logManager.logAbort(txId); // return void
+                logManager.ensureDurable(logManager.getLastLsn()); 
+            }
+
+            sm.flushAll();
+
             state = RecoveryState.READY;
-            return lastReport;
+            
+            lastResult = new RecoveryResult(
+                Math.max(plan.maxTxId, logManager.getMaxTxId()),
+                plan.lastTimestamp,
+                plan.lastRecoveredLSN,
+                plan.checkpointLsn != null ? Optional.of(plan.checkpointLsn) : Optional.empty()
+            );
+            
+            return lastResult;
 
         } catch (Exception e) {
-            // TODO: Petakan exception ke RecoveryError yang spesifik per fase
-            return fail(RecoveryError.LOG_READ_FAILED, e.getMessage());
+            state = RecoveryState.FAILED;
+            throw new Exception("Recovery gagal: " + e.getMessage(), e);
         }
     }
 
     public RecoveryState getState() {
         return state;
-    }
-
-    private int redoCommitted(RecoveryPlan plan) {
-        // TODO: Iterasi plan.redoChanges, panggil applier.apply()
-        return 0;
-    }
-
-    private int undoUncommitted(RecoveryPlan plan) {
-        // TODO: Iterasi plan.undoChanges secara mundur, panggil applier.undo()
-        return 0;
-    }
-
-        private int finalizeRecovery(RecoveryPlan plan) {
-        // TODO: 1. Panggil sm.flush_all() agar semua data aman di disk
-        // TODO: 2. Tulis log ABORT untuk transaksi di plan.needsAbortTx (setelah undo aman)
-        // TODO: 3. Pastikan log ABORT tersebut sudah persisten (flush log / ensure_durable)
-        // TODO: 4. Panggil ccm.initAfterRecovery(plan.maxTxId) PALING AKHIR
-        return 0;
-    }
-
-    private RecoveryReport fail(RecoveryError code, String msg) {
-        state = RecoveryState.FAILED;
-        RecoveryReport report = new RecoveryReport();
-        report.success = false;
-        report.errorCode = code;
-        report.errorMessage = msg;
-        this.lastReport = report;
-        return report;
     }
 }
