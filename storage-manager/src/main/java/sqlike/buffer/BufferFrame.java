@@ -1,5 +1,6 @@
-pacakge sqlike.block
+package sqlike.buffer;
 
+import sqlike.block.*;
 
 public class BufferFrame{
     private Page page;
