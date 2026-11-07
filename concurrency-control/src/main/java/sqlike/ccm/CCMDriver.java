@@ -721,6 +721,43 @@ public class CCMDriver {
                 """,
                 true);
 
+        Scenario beginLogFailure = Scenario.fromScript(
+                "Koordinasi WAL - Kegagalan logBegin Membatalkan Transaksi Baru",
+                """
+                # protokol: lock
+                # seed: A=100
+                T1 BEGIN # fail_wal
+                T2 BEGIN
+                T2 R(A=100) # diizinkan
+                T2 COMMIT
+                """,
+                true);
+
+        Scenario commitLogFailure = Scenario.fromScript(
+                "Koordinasi WAL - Kegagalan logCommit (Hasil Commit Tidak Pasti, Tanpa Undo)",
+                """
+                # protokol: lock
+                # seed: A=100
+                T1 BEGIN
+                T1 W(A=200)
+                T1 COMMIT # fail_wal
+                """,
+                true);
+
+        Scenario rollbackRetried = Scenario.fromScript(
+                "Koordinasi Rollback - Kegagalan Sementara Diulang oleh FRMBridge",
+                """
+                # protokol: lock
+                # seed: A=100
+                T1 BEGIN
+                T1 W(A=250)
+                T1 ABORT # fail_wal
+                T2 BEGIN
+                T2 R(A=100) # diizinkan
+                T2 COMMIT
+                """,
+                true);
+
         Scenario ccmInvariants = new Scenario(
                 "Invarians CCM - beginTransaction Paralel, Penolakan setProtocol Aktif & Akses Pasca-Abort",
                 ProtocolType.LOCK_BASED,
@@ -741,12 +778,16 @@ public class CCMDriver {
                 timestampViolationAndRetry,
                 walFailureAbortsTx,
                 readOldValueAfterAbort,
+                beginLogFailure,
+                commitLogFailure,
+                rollbackRetried,
                 ccmInvariants);
     }
 
     public static void main(String[] args) {
         MockFRM mockFrm = new MockFRM();
-        ConcurrencyControlManager ccm = new ConcurrencyControlManager(mockFrm);
+        ConcurrencyControlManager ccm = new ConcurrencyControlManager(
+                mockFrm, CCMConfig.defaults().withRollbackRetry(3, 5));
         System.out.println(ccm.describeProtocol());
         List<Scenario> scenarios = defaultScenarios();
         CCMDriver driver = new CCMDriver(ccm, scenarios, new SerializabilityVerifier(), mockFrm);
