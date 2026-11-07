@@ -49,7 +49,9 @@ public final class ConsoleResultSink implements ResultSink {
         if (summary == null) {
             output.println("ERROR: Null execution summary");
         } else if (!summary.isSuccess()) {
-            output.println("ERROR: " + summary.getMessage());
+            output.println(summary.getErrorInfo()
+                    .map(ResultPrinter::formatError)
+                    .orElse("ERROR: " + summary.getMessage()));
         } else if (schema.isPresent()) {
             output.println(rowCount + " row(s) returned");
         } else if (!summary.getMessage().isBlank()) {
@@ -58,6 +60,8 @@ public final class ConsoleResultSink implements ResultSink {
             output.println(summary.getAffectedRows() + " row(s) affected");
         }
         output.flush();
+        this.schema = Optional.empty();
+        this.rowCount = 0L;
     }
 
     private String formatValue(Value value) {
@@ -72,6 +76,16 @@ public final class ConsoleResultSink implements ResultSink {
         if (!names.isEmpty()) {
             output.println("| " + String.join(" | ", names) + " |");
         }
+    }
+
+    public void printPrompt(String prompt) {
+        output.print(prompt);
+        output.flush();
+    }
+
+    public void printMessage(String message) {
+        output.println(message);
+        output.flush();
     }
 
     public Optional<Schema> getSchema() {

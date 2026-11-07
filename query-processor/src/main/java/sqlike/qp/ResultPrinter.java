@@ -43,9 +43,12 @@ public final class ResultPrinter {
         if (result.error().isEmpty()) {
             return "ERROR: " + result.message() + "\n";
         }
-        ErrorInfo error = result.error().get();
+        return formatError(result.error().get()) + "\n";
+    }
+
+    public static String formatError(ErrorInfo error) {
         String position = error.position().map(p -> " at position " + p).orElse("");
-        return "ERROR [" + error.component() + " " + error.code() + "]" + position + ": " + error.message() + "\n";
+        return "ERROR [" + error.component() + " " + error.code() + "]" + position + ": " + error.message();
     }
 
     private static String formatTable(QueryResult result) {

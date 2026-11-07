@@ -106,6 +106,7 @@ run_test() {
 case "${TARGET}" in
     qp1)
         run_test "QP1 Driver Scenarios" "sqlike.qp.QP1Driver" "--test"
+        run_test "QP1 QP-14 Script Driver" "sqlike.qp.QP1ScriptDriver" "${SCRIPT_DIR}/test-scripts/qp14-acceptance.sql"
         ;;
     qp2)
         run_test "QP2 Unit Tests" "sqlike.qp.QP2TestDriver"
@@ -122,6 +123,7 @@ case "${TARGET}" in
     all)
         run_test "QP2 Unit Tests" "sqlike.qp.QP2TestDriver"
         run_test "QP1 Driver Scenarios" "sqlike.qp.QP1Driver" "--test"
+        run_test "QP1 QP-14 Script Driver" "sqlike.qp.QP1ScriptDriver" "${SCRIPT_DIR}/test-scripts/qp14-acceptance.sql"
         if [ -f "${REPO_ROOT}/query-processor/src/test/java/sqlike/qp/QP4TestDriver.java" ]; then
             run_test "QP4 Test Driver" "sqlike.qp.QP4TestDriver"
         fi
