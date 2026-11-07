@@ -11,7 +11,10 @@ import java.util.List;
 import java.util.Optional;
 import sqlike.qp.port.QpContracts.DbmsError;
 import sqlike.shared.ColumnSchema;
+import sqlike.shared.ComponentType;
 import sqlike.shared.DataType;
+import sqlike.shared.ErrorCode;
+import sqlike.shared.ErrorInfo;
 import sqlike.shared.Value;
 
 /**
@@ -99,7 +102,8 @@ public final class ProtocolCodec {
                     String message = readString(input);
                     boolean hasError = input.readBoolean();
                     Optional<DbmsError> error = hasError ? Optional.of(new DbmsError(readString(input))) : Optional.empty();
-                    ExecutionSummary summary = new ExecutionSummary(success, affected, message, error);
+                    Optional<ErrorInfo> info = input.readBoolean() ? Optional.of(readErrorInfo(input)) : Optional.empty();
+                    ExecutionSummary summary = new ExecutionSummary(success, affected, message, error, info);
                     yield new ProtocolFrame(FrameKind.SUMMARY, Optional.empty(), Optional.empty(), Optional.of(summary));
                 }
             };
@@ -159,10 +163,30 @@ public final class ProtocolCodec {
             if (err.isPresent()) {
                 writeString(output, err.get().message());
             }
+            Optional<ErrorInfo> info = summary.getErrorInfo();
+            output.writeBoolean(info.isPresent());
+            if (info.isPresent()) {
+                writeErrorInfo(output, info.get());
+            }
             output.flush();
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to write summary frame", e);
         }
+    }
+
+    private ErrorInfo readErrorInfo(DataInputStream input) throws IOException {
+        ErrorCode code = ErrorCode.valueOf(readString(input));
+        ComponentType component = ComponentType.valueOf(readString(input));
+        String message = readString(input);
+        int position = input.readInt();
+        return new ErrorInfo(code, component, message, position < 0 ? Optional.empty() : Optional.of(position));
+    }
+
+    private void writeErrorInfo(DataOutputStream output, ErrorInfo info) throws IOException {
+        writeString(output, info.code().name());
+        writeString(output, info.component().name());
+        writeString(output, info.message());
+        output.writeInt(info.position().orElse(-1));
     }
 
     private String readString(DataInputStream input) {
