@@ -21,7 +21,7 @@ public class PlanPrinter {
 
     private void render(PlanNode n, int depth, StringBuilder sb) {
         sb.append("  ".repeat(depth)).append(describe(n));
-        n.estimatedRows().ifPresent(r -> sb.append("  (rows~").append(r).append(")"));
+        n.estimatedRows().ifPresent(r -> sb.append("  (rows~").append(Math.round(r)).append(")"));
         sb.append('\n');
         for (PlanNode c : n.children()) render(c, depth + 1, sb);
     }
@@ -44,7 +44,27 @@ public class PlanPrinter {
             case DELETE -> "DELETE FROM " + n.mutation().get().tableName();
             case CREATE_INDEX -> "CREATE_INDEX " + n.createIndex().get().indexName() + " ON "
                     + n.createIndex().get().tableName() + "(" + n.createIndex().get().columnName() + ") " + n.createIndex().get().indexType();
+            case LIMIT -> "LIMIT " + n.limit().get().count();
+            case CREATE_TABLE -> createTable(n.createTable().get());
+            case DROP_TABLE -> "DROP_TABLE " + n.dropTable().get().tableName() + " " + n.dropTable().get().behavior();
         };
+    }
+
+    private static String createTable(CreateTableSpec t) {
+        String columns = t.columns().stream()
+                .map(c -> c.name() + " " + c.dataType() + c.maxLength().map(len -> "(" + len + ")").orElse(""))
+                .collect(Collectors.joining(", "));
+        String keys = (t.primaryKey().isEmpty() ? "" : " PRIMARY KEY " + t.primaryKey())
+                + t.foreignKeys().stream()
+                        .map(fk -> " FOREIGN KEY " + fk.columnNames() + " REFERENCES " + fk.referencedTable() + fk.referencedColumns())
+                        .collect(Collectors.joining());
+        return "CREATE_TABLE " + t.tableName() + " (" + columns + ")" + keys;
+    }
+
+    private static String subquery(Expression e) {
+        SubquerySpec s = e.subquery().get();
+        String tag = "<" + s.type() + " subquery" + (s.correlated() ? ", correlated" : "") + ">";
+        return s.type() == SubqueryType.IN ? expr(e.operands().get(0)) + " IN " + tag : tag;
     }
 
     static String col(ColumnRef c) { return c.tableName().map(t -> t + ".").orElse("") + c.columnName(); }
@@ -55,6 +75,7 @@ public class PlanPrinter {
             case COLUMN -> col(e.column().get());
             case UNARY -> "-(" + expr(e.operands().get(0)) + ")";
             case BINARY -> "(" + expr(e.operands().get(0)) + " " + op(e.operator().get()) + " " + expr(e.operands().get(1)) + ")";
+            case SUBQUERY -> subquery(e);
         };
     }
 

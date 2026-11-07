@@ -1,0 +1,404 @@
+package sqlike.qo;
+
+import java.lang.reflect.Proxy;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.function.BiConsumer;
+import sqlike.contract.IStorageManager;
+import sqlike.shared.*;
+import static sqlike.qo.QO5TestSupport.*;
+
+/** QO-13/QO-14 checks use metadata-only SM and an independent in-memory INDEX_SCAN evaluator. */
+final class QO5AccessPathTest {
+    private QO5AccessPathTest() { }
+
+    static void run(BiConsumer<String, Runnable> test) {
+        test.accept("HASH equality uses an index and preserves duplicate keys", QO5AccessPathTest::hashEquality);
+        test.accept("HASH never serves range or NE conditions", QO5AccessPathTest::hashRestrictions);
+        test.accept("BPLUS_TREE supports each range and reversed operand form", QO5AccessPathTest::treeRanges);
+        test.accept("BETWEEN preserves both bound inclusivity flags", QO5AccessPathTest::betweenBounds);
+        test.accept("contradictory conditions preserve empty results", QO5AccessPathTest::contradictions);
+        test.accept("uncovered predicates remain residual filters", QO5AccessPathTest::residuals);
+        test.accept("arithmetic predicates and column comparisons are not index lookups", QO5AccessPathTest::unsupportedPredicates);
+        test.accept("no matching index falls back to sequential scan", QO5AccessPathTest::missingIndex);
+        test.accept("higher-cost index loses to sequential scan", QO5AccessPathTest::expensiveIndex);
+        test.accept("all applicable indexes are compared deterministically", QO5AccessPathTest::multipleIndexes);
+        test.accept("numeric lookup keys use exact compatible types", QO5AccessPathTest::numericKeys);
+        test.accept("inexact numeric key conversions retain scans", QO5AccessPathTest::inexactKeys);
+        test.accept("text equality and ranges preserve results", QO5AccessPathTest::textKeys);
+        test.accept("empty tables keep full-scan headers and zero rows", QO5AccessPathTest::emptyTable);
+        test.accept("index lookup without matches returns an empty result", QO5AccessPathTest::noMatches);
+        test.accept("catalog identifiers are matched case-insensitively", QO5AccessPathTest::identifierCase);
+        test.accept("projection/filter chains keep SELECT order and ORDER BY keys", QO5AccessPathTest::projectionAndSort);
+        test.accept("join and access candidates select the global evaluated minimum", QO5AccessPathTest::combinedMinimum);
+        test.accept("access alternatives include combinations across join inputs", QO5AccessPathTest::combinedInputs);
+        test.accept("UPDATE/DELETE optimize only target-reading subtrees", QO5AccessPathTest::mutations);
+        test.accept("nonjoin facade still applies QO4 rewrites before index selection", QO5AccessPathTest::nonjoinFacade);
+        test.accept("index enumeration preserves input and is idempotent on chosen paths", QO5AccessPathTest::immutability);
+        test.accept("access path budget includes baseline and stays immutable", QO5AccessPathTest::budget);
+        test.accept("LIMIT and correlated subqueries block access transformations", QO5AccessPathTest::boundaries);
+        test.accept("access path dependency and argument validation is explicit", QO5AccessPathTest::validation);
+        test.accept("metadata failures propagate without a success-shaped fallback", QO5AccessPathTest::catalogFailure);
+        test.accept("NATURAL JOIN keeps deduplicated schema after index selection", QO5AccessPathTest::naturalJoin);
+        test.accept("facade preserves mutation payloads with indexed target reads", QO5AccessPathTest::mutationFacade);
+        test.accept("catalog snapshots do not leak between optimization calls", QO5AccessPathTest::catalogRefresh);
+    }
+
+    private static void hashEquality() {
+        Fixture fixture = new Fixture(index("students", "id", IndexType.HASH));
+        PlanNode before = rewritten("SELECT students.name FROM students WHERE id = 3");
+        PlanNode after = fixture.choose(before);
+        equal(1, nodes(after, PlanNodeKind.INDEX_SCAN).size());
+        equal(0, nodes(after, PlanNodeKind.FILTER).size());
+        equal(2, eval(after, data(), fixture.storage).values().size());
+        fixture.equivalent(before, after);
+    }
+
+    private static void hashRestrictions() {
+        Fixture fixture = new Fixture(index("students", "id", IndexType.HASH));
+        for (String predicate : List.of("id > 1", "id >= 1", "id < 3", "id <= 3", "id <> 2")) {
+            PlanNode before = rewritten("SELECT * FROM students WHERE " + predicate);
+            equal(List.of(before), fixture.paths(before));
+        }
+    }
+
+    private static void treeRanges() {
+        Fixture fixture = sparse(index("students", "id", IndexType.BPLUS_TREE));
+        for (String predicate : List.of("id > 1", "id >= 1", "id < 3", "id <= 3", "1 < id", "1 <= id", "3 > id", "3 >= id")) {
+            PlanNode before = rewritten("SELECT * FROM students WHERE " + predicate);
+            PlanNode after = fixture.choose(before);
+            equal(1, nodes(after, PlanNodeKind.INDEX_SCAN).size());
+            fixture.equivalent(before, after);
+        }
+    }
+
+    private static void betweenBounds() {
+        Fixture fixture = sparse(index("students", "id", IndexType.BPLUS_TREE));
+        for (String lower : List.of(">", ">=")) for (String upper : List.of("<", "<=")) {
+            PlanNode before = rewritten("SELECT name FROM students WHERE id " + lower + " 1 AND id " + upper + " 3");
+            List<PlanNode> ranges = fixture.paths(before).stream().filter(plan -> nodes(plan, PlanNodeKind.INDEX_SCAN).stream()
+                    .anyMatch(scan -> scan.scan().orElseThrow().condition().orElseThrow().operator() == IndexOperator.BETWEEN)).toList();
+            check(!ranges.isEmpty(), "BETWEEN not generated");
+            for (PlanNode range : ranges) {
+                IndexCondition condition = nodes(range, PlanNodeKind.INDEX_SCAN).get(0).scan().orElseThrow().condition().orElseThrow();
+                equal(lower.equals(">="), condition.lowerInclusive());
+                equal(upper.equals("<="), condition.upperInclusive());
+                equal(1, condition.key().integerValue().orElseThrow());
+                equal(3, condition.upperBound().orElseThrow().integerValue().orElseThrow());
+                equal(0, nodes(range, PlanNodeKind.FILTER).size());
+                fixture.equivalent(before, range);
+            }
+        }
+    }
+
+    private static void contradictions() {
+        Fixture fixture = sparse(index("students", "id", IndexType.BPLUS_TREE));
+        for (String predicate : List.of("id > 3 AND id < 1", "id = 1 AND id = 2", "id > 2 AND id <= 2")) {
+            PlanNode before = rewritten("SELECT name FROM students WHERE " + predicate);
+            fixture.paths(before).forEach(candidate -> fixture.equivalent(before, candidate));
+            equal(List.of(), eval(fixture.choose(before), data(), fixture.storage).values());
+        }
+    }
+
+    private static void residuals() {
+        Fixture fixture = new Fixture(index("students", "id", IndexType.HASH));
+        PlanNode before = rewritten("SELECT name FROM students WHERE id = 3 AND gpa > 3.5");
+        PlanNode after = fixture.choose(before);
+        equal(1, nodes(after, PlanNodeKind.INDEX_SCAN).size());
+        equal(1, nodes(after, PlanNodeKind.FILTER).size());
+        fixture.equivalent(before, after);
+        // Repeated identical conjuncts must not fail or accidentally retain an extra lookup.
+        PlanNode repeated = rewritten("SELECT name FROM students WHERE id = 3 AND id = 3");
+        fixture.paths(repeated).forEach(candidate -> fixture.equivalent(repeated, candidate));
+    }
+
+    private static void unsupportedPredicates() {
+        Fixture fixture = new Fixture(index("students", "id", IndexType.BPLUS_TREE));
+        for (String predicate : List.of("id + 1 = 3", "id = dept_id", "id <> 3")) {
+            PlanNode before = rewritten("SELECT name FROM students WHERE " + predicate);
+            equal(List.of(before), fixture.paths(before));
+        }
+    }
+
+    private static void missingIndex() {
+        Fixture fixture = new Fixture(index("students", "gpa", IndexType.HASH));
+        PlanNode before = rewritten("SELECT name FROM students WHERE id = 3");
+        check(fixture.choose(before) == before, "used an index on another column");
+        Fixture none = new Fixture();
+        check(none.choose(before) == before, "no-index fallback changed the plan");
+    }
+
+    private static void expensiveIndex() {
+        Fixture fixture = new Fixture(index("dept", "dept_id", IndexType.HASH));
+        PlanNode before = rewritten("SELECT * FROM dept WHERE dept_id = 10");
+        check(fixture.paths(before).size() > 1, "missing index alternative");
+        check(fixture.choose(before) == before, "expensive index was selected");
+        PlanNode denseRange = rewritten("SELECT name FROM students WHERE id > 1");
+        Fixture dense = new Fixture(index("students", "id", IndexType.BPLUS_TREE));
+        check(dense.choose(denseRange) == denseRange, "unselective dense range should scan");
+    }
+
+    private static void multipleIndexes() {
+        IndexMetadata z = new IndexMetadata("z_id", "students", "id", IndexType.HASH);
+        IndexMetadata a = new IndexMetadata("a_id", "students", "id", IndexType.BPLUS_TREE);
+        Fixture fixture = new Fixture(z, a);
+        PlanNode before = rewritten("SELECT name FROM students WHERE id = 3");
+        List<PlanNode> paths = fixture.paths(before);
+        equal(3, paths.size());
+        PlanNode after = fixture.choose(before);
+        equal("a_id", nodes(after, PlanNodeKind.INDEX_SCAN).get(0).scan().orElseThrow().indexName().orElseThrow());
+        double minimum = paths.stream().mapToDouble(fixture.cost::getCost).min().orElseThrow();
+        equal(minimum, fixture.cost.getCost(after));
+    }
+
+    private static void numericKeys() {
+        for (String query : List.of("SELECT name FROM students WHERE id = 3.0", "SELECT name FROM students WHERE gpa = 3")) {
+            String column = query.contains("gpa") ? "gpa" : "id";
+            Fixture fixture = new Fixture(index("students", column, IndexType.HASH));
+            PlanNode before = rewritten(query);
+            List<PlanNode> indexed = fixture.paths(before).stream().filter(plan -> !nodes(plan, PlanNodeKind.INDEX_SCAN).isEmpty()).toList();
+            check(!indexed.isEmpty(), "exact numeric conversion was skipped");
+            indexed.forEach(candidate -> fixture.equivalent(before, candidate));
+        }
+    }
+
+    private static void inexactKeys() {
+        Fixture fixture = new Fixture(index("students", "id", IndexType.BPLUS_TREE));
+        for (String predicate : List.of("id = 2.5", "id > 2.5", "id = 2147483648.0", "id = -0.0")) {
+            PlanNode before = rewritten("SELECT name FROM students WHERE " + predicate);
+            equal(List.of(before), fixture.paths(before));
+        }
+    }
+
+    private static void textKeys() {
+        Fixture fixture = sparse(index("students", "name", IndexType.BPLUS_TREE));
+        for (String predicate : List.of("name = 'Cici'", "name >= 'Bima' AND name < 'D'")) {
+            PlanNode before = rewritten("SELECT name FROM students WHERE " + predicate);
+            fixture.paths(before).forEach(candidate -> fixture.equivalent(before, candidate));
+        }
+    }
+
+    private static void emptyTable() {
+        Fixture fixture = new Fixture(index("students", "id", IndexType.HASH));
+        fixture.statistics.put("students", new TableStatistics(0, 0, 0, 1, Map.of("id", 0L)));
+        PlanNode before = rewritten("SELECT name FROM students WHERE id = 3");
+        check(fixture.choose(before) == before, "empty table scan should win");
+        var empty = data(); empty.put("students", List.of());
+        equivalent(before, fixture.choose(before), empty, fixture.storage);
+    }
+
+    private static void noMatches() {
+        Fixture fixture = new Fixture(index("students", "id", IndexType.HASH));
+        PlanNode before = rewritten("SELECT name FROM students WHERE id = 99");
+        PlanNode after = fixture.choose(before);
+        equal(1, nodes(after, PlanNodeKind.INDEX_SCAN).size());
+        equal(List.of(), eval(after, data(), fixture.storage).values());
+        fixture.equivalent(before, after);
+    }
+
+    private static void identifierCase() {
+        Fixture fixture = new Fixture(new IndexMetadata("MiXeD", "STUDENTS", "ID", IndexType.HASH));
+        PlanNode before = rewritten("SELECT NAME FROM STUDENTS WHERE ID = 3");
+        PlanNode after = fixture.choose(before);
+        equal(1, nodes(after, PlanNodeKind.INDEX_SCAN).size());
+        fixture.equivalent(before, after);
+    }
+
+    private static void projectionAndSort() {
+        Fixture fixture = new Fixture(index("students", "id", IndexType.HASH));
+        PlanNode before = rewritten("SELECT name, name FROM students WHERE id = 3 ORDER BY gpa DESC");
+        PlanNode after = fixture.choose(before);
+        equal(1, nodes(after, PlanNodeKind.INDEX_SCAN).size());
+        equal(eval(before, data(), fixture.storage), eval(after, data(), fixture.storage));
+        fixture.equivalent(before, after);
+    }
+
+    private static void combinedMinimum() {
+        Fixture fixture = new Fixture(index("students", "id", IndexType.HASH), index("dept", "dept_id", IndexType.HASH));
+        PlanNode before = rewritten("SELECT students.name, dept.dname FROM students, dept "
+                + "WHERE students.dept_id = dept.dept_id AND students.id = 3");
+        JoinRewriter rewriter = new JoinRewriter();
+        PlanNode rewritten = rewriter.mergeSelectionIntoJoin(rewriter.cartesianToJoin(before));
+        List<PlanNode> oracle = new ArrayList<>(); oracle.add(before);
+        for (PlanNode order : new JoinOrderEnumerator().enumerate(rewritten)) oracle.addAll(fixture.paths(order));
+        PlanNode after = new JoinAccessPathOptimizer(fixture.cost, fixture.storage).optimize(before);
+        equal(oracle.stream().mapToDouble(fixture.cost::getCost).min().orElseThrow(), fixture.cost.getCost(after));
+        check(fixture.cost.getCost(after) <= fixture.cost.getCost(before), "baseline cost regression");
+        equal(1, nodes(after, PlanNodeKind.INDEX_SCAN).size());
+        fixture.equivalent(before, after);
+    }
+
+    private static void combinedInputs() {
+        Fixture fixture = new Fixture(index("students", "id", IndexType.HASH), index("takes", "id", IndexType.HASH));
+        PlanNode before = rewritten("SELECT students.name, takes.course_id FROM students JOIN takes ON students.id = takes.id "
+                + "WHERE students.id = 3 AND takes.id = 3");
+        List<PlanNode> paths = fixture.paths(before);
+        check(paths.stream().anyMatch(candidate -> nodes(candidate, PlanNodeKind.INDEX_SCAN).size() == 2), "no combined access paths");
+        paths.forEach(candidate -> fixture.equivalent(before, candidate));
+        PlanNode chosen = fixture.choose(before);
+        equal(paths.stream().mapToDouble(fixture.cost::getCost).min().orElseThrow(), fixture.cost.getCost(chosen));
+    }
+
+    private static void mutations() {
+        Fixture fixture = new Fixture(index("students", "id", IndexType.HASH));
+        for (String sql : List.of("UPDATE students SET gpa = gpa + 0.1 WHERE id = 3", "DELETE FROM students WHERE id = 3")) {
+            PlanNode before = new Binder(fixture.storage).bind(new QueryOptimizer(fixture.storage).parseQuery(sql));
+            PlanNode after = new JoinAccessPathOptimizer(fixture.cost, fixture.storage).optimize(before);
+            equal(before.kind(), after.kind()); equal(before.mutation(), after.mutation());
+            equal(1, nodes(after, PlanNodeKind.INDEX_SCAN).size());
+            fixture.equivalent(before.children().get(0), after.children().get(0));
+        }
+    }
+
+    private static void nonjoinFacade() {
+        Fixture fixture = new Fixture(index("students", "id", IndexType.HASH));
+        QueryOptimizer qo = new QueryOptimizer(fixture.storage);
+        ParsedQuery parsed = qo.parseQuery("SELECT name FROM students WHERE id = 3 AND gpa > 3 ORDER BY dept_id");
+        PlanNode before = new Binder(fixture.storage).bind(parsed);
+        QueryPlan after = qo.optimizeQuery(parsed);
+        equal(1, nodes(after.root(), PlanNodeKind.INDEX_SCAN).size());
+        equal(qo.getCost(after), after.estimatedCost());
+        fixture.equivalent(before, after.root());
+    }
+
+    private static void immutability() {
+        Fixture fixture = new Fixture(index("students", "id", IndexType.HASH));
+        PlanNode before = rewritten("SELECT name FROM students WHERE id = 3 AND gpa > 3");
+        String snapshot = before.toString();
+        PlanNode after = fixture.choose(before);
+        equal(snapshot, before.toString()); equal(before.outputColumns(), after.outputColumns());
+        check(fixture.choose(after) == after, "selected index path changed on a second call");
+    }
+
+    private static void budget() {
+        Fixture fixture = new Fixture(new IndexMetadata("z", "students", "id", IndexType.HASH),
+                new IndexMetadata("a", "students", "id", IndexType.BPLUS_TREE));
+        AccessPathOptimizer access = new AccessPathOptimizer(fixture.storage, 2);
+        PlanNode before = rewritten("SELECT name FROM students WHERE id = 3");
+        List<PlanNode> paths = access.enumerateAccessPaths(before);
+        equal(2, paths.size()); check(paths.get(0) == before, "baseline not first");
+        equal(paths, access.enumerateAccessPaths(before));
+        try { paths.add(before); throw new AssertionError("mutable candidates"); }
+        catch (UnsupportedOperationException expected) { }
+    }
+
+    private static void boundaries() {
+        Fixture fixture = new Fixture(index("students", "id", IndexType.HASH));
+        PlanNode child = rewritten("SELECT name FROM students WHERE id = 3");
+        PlanNode limit = PlanNodes.limit(child, new LimitSpec(1));
+        check(fixture.choose(limit) == limit, "rewrote below LIMIT");
+        Expression subquery = new Expression(ExpressionKind.SUBQUERY, Optional.empty(), Optional.empty(), Optional.empty(),
+                List.of(), Optional.of(new SubquerySpec(SubqueryType.EXISTS, bound("SELECT * FROM dept"), true)));
+        PlanNode filter = QO5Plans.filter(child, subquery);
+        equal(List.of(filter), fixture.paths(filter));
+    }
+
+    private static void validation() {
+        Fixture fixture = new Fixture();
+        domainError(() -> fixture.access.chooseAccessPath(null, fixture.cost));
+        domainError(() -> fixture.access.chooseAccessPath(bound("SELECT * FROM students"), null));
+        try { new AccessPathOptimizer(null); throw new AssertionError("null storage accepted"); }
+        catch (IllegalArgumentException expected) { }
+        try { new AccessPathOptimizer(fixture.storage, 1); throw new AssertionError("invalid budget accepted"); }
+        catch (IllegalArgumentException expected) { }
+    }
+
+    private static void catalogFailure() {
+        Fixture fixture = new Fixture(index("students", "id", IndexType.HASH));
+        fixture.failIndexes = true;
+        domainError(() -> fixture.choose(rewritten("SELECT name FROM students WHERE id = 3")));
+    }
+
+    private static void naturalJoin() {
+        Fixture fixture = new Fixture(index("students", "id", IndexType.HASH), index("takes", "id", IndexType.HASH));
+        PlanNode before = rewritten("SELECT * FROM students NATURAL JOIN dept NATURAL JOIN takes WHERE students.id = 3");
+        PlanNode after = new JoinAccessPathOptimizer(fixture.cost, fixture.storage).optimize(before);
+        check(!nodes(after, PlanNodeKind.INDEX_SCAN).isEmpty(), "no natural join access alternative was selected");
+        equal(before.outputColumns(), after.outputColumns());
+        fixture.equivalent(before, after);
+    }
+
+    private static void mutationFacade() {
+        Fixture fixture = new Fixture(index("students", "id", IndexType.HASH));
+        QueryOptimizer qo = new QueryOptimizer(fixture.storage);
+        for (String sql : List.of("UPDATE students SET gpa = gpa + 0.1 WHERE id = 3", "DELETE FROM students WHERE id = 3")) {
+            ParsedQuery parsed = qo.parseQuery(sql);
+            PlanNode before = new Binder(fixture.storage).bind(parsed);
+            QueryPlan after = qo.optimizeQuery(parsed);
+            equal(before.mutation(), after.root().mutation());
+            equal(1, nodes(after.root(), PlanNodeKind.INDEX_SCAN).size());
+            equal(qo.getCost(after), after.estimatedCost());
+            fixture.equivalent(before.children().get(0), after.root().children().get(0));
+        }
+    }
+
+    private static void catalogRefresh() {
+        IndexMetadata[] indexes = { index("students", "id", IndexType.HASH) };
+        Fixture fixture = new Fixture(indexes);
+        PlanNode before = rewritten("SELECT name FROM students WHERE id = 3");
+        equal(1, nodes(fixture.choose(before), PlanNodeKind.INDEX_SCAN).size());
+        indexes[0] = index("students", "gpa", IndexType.HASH);
+        check(fixture.choose(before) == before, "stale index metadata escaped its invocation");
+    }
+
+    private static Fixture sparse(IndexMetadata index) {
+        Fixture fixture = new Fixture(index);
+        fixture.statistics.put("students", new TableStatistics(4, 1000, 40, 1,
+                Map.of("id", 3L, "name", 3L, "gpa", 3L, "dept_id", 2L)));
+        return fixture;
+    }
+
+    private static IndexMetadata index(String table, String column, IndexType type) {
+        return new IndexMetadata(table + "_" + column + "_" + type, table, column, type);
+    }
+
+    private static List<PlanNode> nodes(PlanNode plan, PlanNodeKind kind) {
+        List<PlanNode> result = new ArrayList<>();
+        if (plan.kind() == kind) result.add(plan);
+        plan.children().forEach(child -> result.addAll(nodes(child, kind)));
+        return result;
+    }
+
+    private static void domainError(Runnable action) {
+        try { action.run(); throw new AssertionError("expected domain error"); }
+        catch (QoException expected) { equal(ErrorCode.INVALID_STATE, expected.getInfo().code()); }
+    }
+
+    private static final class Fixture {
+        final Map<String, TableStatistics> statistics = new HashMap<>();
+        final IStorageManager storage;
+        final CostModel cost;
+        final AccessPathOptimizer access;
+        boolean failIndexes;
+
+        Fixture(IndexMetadata... definitions) {
+            IStorageManager base = catalog();
+            storage = (IStorageManager) Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[] { IStorageManager.class },
+                    (proxy, method, args) -> switch (method.getName()) {
+                        case "listTables" -> base.listTables();
+                        case "getSchema" -> base.getSchema((String) args[0]);
+                        case "getStatistics" -> {
+                            String table = ((String) args[0]).toLowerCase(Locale.ROOT);
+                            yield statistics.containsKey(table) ? statistics.get(table) : base.getStatistics(table);
+                        }
+                        case "getIndexes" -> {
+                            if (failIndexes) throw QoErrors.invalidState("catalog unavailable");
+                            String table = (String) args[0];
+                            check(base.listTables().contains(table), "catalog needs canonical table spelling");
+                            yield java.util.Arrays.stream(definitions).filter(index -> index.tableName().equalsIgnoreCase(table)).toList();
+                        }
+                        default -> throw new AssertionError("optimizer must not perform physical I/O: " + method.getName());
+                    });
+            cost = new CostModel(storage);
+            access = new AccessPathOptimizer(storage);
+        }
+
+        PlanNode choose(PlanNode plan) { return access.chooseAccessPath(plan, cost); }
+        List<PlanNode> paths(PlanNode plan) { return access.enumerateAccessPaths(plan); }
+        void equivalent(PlanNode before, PlanNode after) { QO5TestSupport.equivalent(before, after, data(), storage); }
+    }
+}

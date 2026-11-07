@@ -22,6 +22,12 @@ public class ExpressionParser {
 
     private Expression parseCompare(TokenStream ts) {
         Expression expression = parseAdditive(ts);
+        if (ts.peek().isKeyword(Keyword.IN)) {
+            Token in = ts.next();
+            if (ts.peek().isSymbol("(") && ts.peek(1).isKeyword(Keyword.SELECT))
+                throw QoErrors.unsupported("subqueries are not part of the agreed contract", in.offset());
+            throw QoErrors.unsupported("IN predicates are not part of the agreed contract", in.offset());
+        }
         ExpressionOperator operator = comparisonOperator(ts.peek());
         if (operator == null) return expression;
         ts.next();
@@ -77,8 +83,12 @@ public class ExpressionParser {
 
     private Expression parseAtom(TokenStream ts) {
         Token token = ts.peek();
+        if (ts.peek().isSymbol("(") && ts.peek(1).isKeyword(Keyword.SELECT))
+            throw QoErrors.unsupported("subqueries are not part of the agreed contract", token.offset());
+        if (token.isKeyword(Keyword.EXISTS))
+            throw QoErrors.unsupported("subqueries are not part of the agreed contract", token.offset());
         if (ts.matchSymbol("(")) {
-            Expression expression = parseAnd(ts);
+            Expression expression = parseExpression(ts);
             ts.expectSymbol(")");
             return expression;
         }
@@ -103,8 +113,8 @@ public class ExpressionParser {
         if (token.type() == TokenType.IDENTIFIER) {
             String first = ts.next().text();
             ColumnRef column = ts.matchSymbol(".")
-                    ? ColumnRef.of(first, ts.expectIdentifier("column name").text())
-                    : ColumnRef.of(null, first);
+                    ? Refs.column(first, ts.expectIdentifier("column name").text())
+                    : Refs.column(null, first);
             return new Expression(ExpressionKind.COLUMN, Optional.empty(), Optional.of(column), Optional.empty(), List.of());
         }
         throw QoErrors.syntax("expected literal, column reference, or parenthesized expression", token.offset());

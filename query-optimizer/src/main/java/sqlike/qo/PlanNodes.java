@@ -56,10 +56,26 @@ public final class PlanNodes {
                 Optional.empty(), Optional.empty(), Optional.of(meta));
     }
 
+    public static PlanNode limit(PlanNode child, LimitSpec spec) {
+        return new PlanNode(PlanNodeKind.LIMIT, List.of(child), List.of(), Optional.empty(), Optional.empty(), Optional.empty(),
+                List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),
+                Optional.of(spec), Optional.empty(), Optional.empty());
+    }
+    public static PlanNode createTable(CreateTableSpec spec) {
+        return new PlanNode(PlanNodeKind.CREATE_TABLE, List.of(), List.of(), Optional.empty(), Optional.empty(), Optional.empty(),
+                List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),
+                Optional.empty(), Optional.of(spec), Optional.empty());
+    }
+    public static PlanNode dropTable(DropTableSpec spec) {
+        return new PlanNode(PlanNodeKind.DROP_TABLE, List.of(), List.of(), Optional.empty(), Optional.empty(), Optional.empty(),
+                List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),
+                Optional.empty(), Optional.empty(), Optional.of(spec));
+    }
+
     public static void validate(PlanNode n) {
         int arity = switch (n.kind()) {
-            case SCAN, INDEX_SCAN, INSERT, CREATE_INDEX -> 0;
-            case FILTER, PROJECT, SORT, UPDATE, DELETE -> 1;
+            case SCAN, INDEX_SCAN, INSERT, CREATE_INDEX, CREATE_TABLE, DROP_TABLE -> 0;
+            case FILTER, PROJECT, SORT, UPDATE, DELETE, LIMIT -> 1;
             case JOIN, CARTESIAN -> 2;
         };
         require(n.children().size() == arity, n, "expects " + arity + " child(ren)");
@@ -80,7 +96,34 @@ public final class PlanNodes {
         if (n.kind() == PlanNodeKind.INSERT) require(!n.mutation().get().insertValues().isEmpty(), n, "INSERT needs one row of values");
         if (n.kind() == PlanNodeKind.UPDATE)
             require(n.mutation().get().updateColumn().isPresent() && n.mutation().get().updateExpression().isPresent(), n, "UPDATE needs one column + expression");
+        require((n.kind() == PlanNodeKind.LIMIT) == n.limit().isPresent(), n, "limit payload only on LIMIT");
+        require((n.kind() == PlanNodeKind.CREATE_TABLE) == n.createTable().isPresent(), n, "createTable payload only on CREATE_TABLE");
+        require((n.kind() == PlanNodeKind.DROP_TABLE) == n.dropTable().isPresent(), n, "dropTable payload only on DROP_TABLE");
+        if (n.kind() == PlanNodeKind.LIMIT) require(n.limit().get().count() >= 0, n, "LIMIT count must not be negative");
+        n.predicate().ifPresent(e -> validateExpression(e, n));
+        n.join().flatMap(JoinSpec::condition).ifPresent(e -> validateExpression(e, n));
+        n.mutation().flatMap(MutationSpec::updateExpression).ifPresent(e -> validateExpression(e, n));
         n.children().forEach(PlanNodes::validate);
+    }
+
+    /** payload must match the expression kind, operand count per kind, and a SUBQUERY carries its own plan */
+    private static void validateExpression(Expression e, PlanNode owner) {
+        boolean literal = e.literal().isPresent(), column = e.column().isPresent();
+        boolean operator = e.operator().isPresent(), subquery = e.subquery().isPresent();
+        int operands = e.operands().size();
+        switch (e.kind()) {
+            case LITERAL -> require(literal && !column && !operator && !subquery && operands == 0, owner, "LITERAL expression needs only a literal");
+            case COLUMN -> require(column && !literal && !operator && !subquery && operands == 0, owner, "COLUMN expression needs only a column");
+            case UNARY -> require(operator && !literal && !column && !subquery && operands == 1, owner, "UNARY expression needs an operator and 1 operand");
+            case BINARY -> require(operator && !literal && !column && !subquery && operands == 2, owner, "BINARY expression needs an operator and 2 operands");
+            case SUBQUERY -> {
+                require(subquery && !literal && !column && !operator, owner, "SUBQUERY expression needs only a subquery payload");
+                int expected = e.subquery().get().type() == SubqueryType.IN ? 1 : 0;
+                require(operands == expected, owner, "SUBQUERY " + e.subquery().get().type() + " expects " + expected + " operand(s)");
+                validate(e.subquery().get().root());
+            }
+        }
+        e.operands().forEach(operand -> validateExpression(operand, owner));
     }
 
     private static void require(boolean ok, PlanNode n, String msg) {
