@@ -3,16 +3,37 @@ Concurrency Control Manager (CCM)
 Class diagram: docs/ccm-class-diagram.drawio (PNG export next to it).
 Contract: IConcurrencyControlManager and IFailureRecoveryManager follow the SQLike supergroup report (section 2.1).
 
-Milestone 1 status
-- Every IConcurrencyControlManager method is callable through sqlike.ccm.ConcurrencyControlManager,
-  so QP and FRM can integrate against it now.
-- Parts that are still mocks are marked TODO(CCx), where CCx is the role that implements them.
+Current status (Milestone 2)
+- Every IConcurrencyControlManager method, including the PRD section 3.4 additions (requestWriteAccess,
+  requestSchemaWrite, beginApply/endApply, awaitNoActiveTransactions(timeoutMs)), is implemented by
+  sqlike.ccm.ConcurrencyControlManager.
+- Locking is table level (PRD section 9). RECORD requests lock their table. The catalog is its own resource,
+  the reserved table name __catalog__ (a scope named CATALOG is recognized too, see sqlike.ccm.Resources).
+  Default protocol: LOCK_BASED (rigorous 2PL, FIFO queue, S to X upgrade). The active protocol is logged and
+  printed when CCM starts.
+- Deadlocks: wait-for graph, checked every 100 ms, victim is the youngest transaction. A two-transaction
+  deadlock is resolved in under 5 seconds (tested). The victim goes through the normal abort flow.
+- TIMESTAMP_BASED is strict timestamp ordering (timestamp = txId) on table-level resources.
+- Lifecycle: ACTIVE, PARTIALLY_COMMITTED, FAILED, ABORTED, COMMITTED with validated transitions. New
+  transactions are refused until initAfterRecovery has run. pauseNewTransactions holds only new
+  transactions; running ones can still commit or abort. initAfterRecovery does not reopen a paused gate.
+- Write flow: requestWriteAccess (lock only), then requestWrite (one change record, changeLSN), then
+  beginApply/endApply around the SM mutation. Abort and commit wait for a running apply (30 s by default).
+- Commit: PARTIALLY_COMMITTED, logCommit, COMMITTED, release locks. Abort: FAILED, rollback, logAbort,
+  ABORTED, release locks. rollback and logAbort are tried 3 times, 100 ms apart (CCMConfig). If they still
+  fail, the transaction stays FAILED with its locks held and abort can be called again.
+- FRM failures are RuntimeExceptions. CCM reports them to QP as WAL_FAILURE.
+- Deviation from the course spec (CC-03): if logCommit fails, CCM does not abort. COMMIT may already be
+  durable, so the transaction stays PARTIALLY_COMMITTED, its locks stay held, and CCM refuses new
+  transactions until initAfterRecovery (PRD section 11).
 
 Packages (src/main/java)
 - sqlike.contract  IConcurrencyControlManager (CCM) and IFailureRecoveryManager (FRM), copied from the contract
-- sqlike.shared    shared data types copied from the contract; delete once a supergroup shared package exists
+- sqlike.shared    only SchemaChange and SchemaImage, which are not in the root shared/ module yet.
+                   Every other shared type comes from shared/src/main/java (CCM keeps no copies).
 - sqlike.ccm       CCM classes:
     ConcurrencyControlManager, CCMConfig, TransactionManager, Transaction   transactions and protocol choice (CC-01, CC-02)
+    Resources                                                                helpers that build table, record, and catalog resources
     FRMBridge                                                                WAL logging, abort, recovery (CC-03, CC-04, CC-05)
     IConcurrencyProtocol, LockBasedProtocol                                  lock-based access (CC-06)
     DeadlockHandler                                                          deadlock handling (CC-07)
@@ -21,7 +42,14 @@ Packages (src/main/java)
     CCMDriver, Scenario, MockFRM                                             standalone driver (CC-10)
 
 Build and run the driver (JDK 17 or newer), from the repository root:
-  javac --release 17 -d out $(find concurrency-control/src/main/java -name '*.java')
+  javac --release 17 -d out $(find shared/src/main/java concurrency-control/src/main/java -name '*.java')
   java -cp out sqlike.ccm.CCMDriver
 The driver runs every scenario against ConcurrencyControlManager with MockFRM and prints
 "Total: N/N skenario LULUS" when all of them pass.
+
+Run all tests and the driver from the repository root:
+  ./concurrency-control/run-tests.sh
+The tests are standalone classes in src/test/java/sqlike/ccm (LockBasedProtocolTest,
+TimestampProtocolTest, TransactionManagerTest, TransactionTest, CCMConfigTest, MockFRMTest,
+FRMBridgeTest, ConcurrencyControlManagerTest). run-tests.sh runs every *Test class, then the driver.
+FRM is a MockFRM here; integration with the real FRM and QP is Milestone 3.

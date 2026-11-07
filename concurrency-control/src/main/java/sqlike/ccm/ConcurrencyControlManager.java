@@ -1,7 +1,11 @@
 package sqlike.ccm;
 
+import java.util.LinkedHashSet;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.logging.Logger;
 
 import sqlike.contract.IConcurrencyControlManager;
 import sqlike.contract.IFailureRecoveryManager;
@@ -13,17 +17,20 @@ import sqlike.shared.ErrorCode;
 import sqlike.shared.ErrorInfo;
 import sqlike.shared.ProtocolType;
 import sqlike.shared.ResourceId;
+import sqlike.shared.SchemaChange;
+import sqlike.shared.SchemaImage;
 import sqlike.shared.TransactionResponse;
 import sqlike.shared.TransactionStatus;
 
 /**
  * CCM facade called by QP and FRM (CC1).
  *
- * <p>Milestone 1 MOCK: every contract method is callable and wired to {@link TransactionManager},
- * the active {@link IConcurrencyProtocol}, {@link FRMBridge}, and {@link ScheduleRecorder}. The
- * decisions themselves come from those components, which are still mocks where marked.
+ * <p>Connects transactions, the active protocol, the FRM bridge, and the schedule recorder.
+ * Lifecycle and WAL work that is still pending is marked with TODO comments.
  */
 public class ConcurrencyControlManager implements IConcurrencyControlManager {
+
+    private static final Logger LOG = Logger.getLogger(ConcurrencyControlManager.class.getName());
 
     private final IFailureRecoveryManager recovery;
     private final TransactionManager transactions;
@@ -40,16 +47,33 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
         this.recovery = Objects.requireNonNull(recovery, "recovery");
         this.config = Objects.requireNonNull(config, "config");
         this.transactions = new TransactionManager();
-        this.frmBridge = new FRMBridge(this.recovery);
+        this.frmBridge = new FRMBridge(this.recovery, config);
         this.recorder = new ScheduleRecorder();
         this.protocol = createProtocol(config.protocol());
+        LOG.info(describeProtocol());
+    }
+
+    /** The protocol in use and the documented default, shown when CCM starts (CC-02). */
+    public String describeProtocol() {
+        return "Active protocol: " + protocol.getType() + " (default: " + CCMConfig.defaults().protocol() + ")";
     }
 
     @Override
     public TransactionResponse beginTransaction() {
-        Transaction tx = transactions.create();
-        // TODO(CC3): if logging BEGIN fails, abort the transaction instead of returning ACTIVE.
-        frmBridge.logBegin(tx.getTxId());
+        Transaction tx;
+        try {
+            tx = transactions.create();
+        } catch (IllegalStateException e) {
+            return new TransactionResponse(0L, 0L, TransactionStatus.FAILED,
+                    Optional.of(error(ErrorCode.INVALID_STATE, e.getMessage())));
+        }
+        try {
+            frmBridge.logBegin(tx.getTxId());
+        } catch (FrmFailureException e) {
+            transactions.setStatus(tx.getTxId(), TransactionStatus.FAILED);
+            transactions.setStatus(tx.getTxId(), TransactionStatus.ABORTED);
+            return withError(tx, error(ErrorCode.WAL_FAILURE, e.getMessage()));
+        }
         protocol.onBegin(tx);
         return tx.toResponse();
     }
@@ -57,50 +81,96 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
     @Override
     public AccessResponse requestRead(long txId, ResourceId resource) {
         Objects.requireNonNull(resource, "resource");
-        Optional<Transaction> found = transactions.get(txId);
-        if (found.isEmpty()) {
-            return accessError(error(ErrorCode.NOT_FOUND, "Unknown transaction " + txId));
-        }
-        Transaction tx = found.get();
-        if (!tx.isActive()) {
-            return accessError(error(ErrorCode.INVALID_STATE, "Transaction " + txId + " is " + tx.getStatus()));
-        }
-
-        AccessStatus status = protocol.checkRead(tx, resource);
-        return switch (status) {
+        return withActiveTransaction(txId, tx -> switch (protocol.checkRead(tx, resource)) {
             case GRANTED -> {
                 recorder.record(new ScheduleOperation(txId, resource, false));
-                yield new AccessResponse(AccessStatus.GRANTED, Optional.empty(), Optional.empty(), Optional.empty());
+                yield granted(Optional.empty());
             }
-            case WAIT -> new AccessResponse(AccessStatus.WAIT, Optional.empty(), Optional.empty(), Optional.empty());
-            case ABORTED -> abortedAccess(tx, "Read on " + resource.tableName() + " violates the protocol");
-        };
+            case WAIT -> waiting();
+            case ABORTED -> abortedAccess(tx, ErrorCode.TRANSACTION_ABORTED,
+                    "Read on " + resource.tableName() + " violates the protocol");
+        });
     }
 
     @Override
     public AccessResponse requestWrite(long txId, DataChange change) {
         Objects.requireNonNull(change, "change");
-        Optional<Transaction> found = transactions.get(txId);
-        if (found.isEmpty()) {
-            return accessError(error(ErrorCode.NOT_FOUND, "Unknown transaction " + txId));
-        }
-        Transaction tx = found.get();
-        if (!tx.isActive()) {
-            return accessError(error(ErrorCode.INVALID_STATE, "Transaction " + txId + " is " + tx.getStatus()));
-        }
+        return withActiveTransaction(txId, tx -> {
+            ResourceId resource = Resources.record(change.tableName(), change.rid());
+            return switch (protocol.checkWrite(tx, resource)) {
+                case GRANTED -> {
+                    long lsn;
+                    try {
+                        lsn = frmBridge.logWrite(txId, change);
+                    } catch (FrmFailureException e) {
+                        yield abortedAccess(tx, ErrorCode.WAL_FAILURE, e.getMessage());
+                    }
+                    tx.grantLsn(lsn);
+                    recorder.record(new ScheduleOperation(txId, resource, true));
+                    yield granted(Optional.of(lsn));
+                }
+                case WAIT -> waiting();
+                case ABORTED -> abortedAccess(tx, ErrorCode.TRANSACTION_ABORTED,
+                        "Write on " + change.tableName() + " violates the protocol");
+            };
+        });
+    }
 
-        ResourceId resource = ResourceId.ofRecord(change.tableName(), change.rid());
-        AccessStatus status = protocol.checkWrite(tx, resource);
-        return switch (status) {
-            case GRANTED -> {
-                // TODO(CC3): if logging the change fails, the write must not be applied; abort instead.
-                long lsn = frmBridge.logWrite(txId, change);
-                recorder.record(new ScheduleOperation(txId, resource, true));
-                yield new AccessResponse(AccessStatus.GRANTED, Optional.of(lsn), Optional.empty(), Optional.empty());
+    @Override
+    public AccessResponse requestWriteAccess(long txId, ResourceId resource) {
+        Objects.requireNonNull(resource, "resource");
+        return withActiveTransaction(txId, tx -> switch (protocol.checkWrite(tx, resource)) {
+            case GRANTED -> granted(Optional.empty());
+            case WAIT -> waiting();
+            case ABORTED -> abortedAccess(tx, ErrorCode.TRANSACTION_ABORTED,
+                    "Write access on " + resource.tableName() + " violates the protocol");
+        });
+    }
+
+    @Override
+    public AccessResponse requestSchemaWrite(long txId, SchemaChange change) {
+        Objects.requireNonNull(change, "change");
+        return withActiveTransaction(txId, tx -> {
+            Set<ResourceId> resources = new LinkedHashSet<>();
+            resources.add(Resources.catalog());
+            for (SchemaImage image : change.before()) {
+                resources.add(Resources.table(image.tableName()));
             }
-            case WAIT -> new AccessResponse(AccessStatus.WAIT, Optional.empty(), Optional.empty(), Optional.empty());
-            case ABORTED -> abortedAccess(tx, "Write on " + change.tableName() + " violates the protocol");
-        };
+            for (SchemaImage image : change.after()) {
+                resources.add(Resources.table(image.tableName()));
+            }
+            for (ResourceId resource : resources) {
+                AccessStatus status = protocol.checkWrite(tx, resource);
+                if (status == AccessStatus.ABORTED) {
+                    return abortedAccess(tx, ErrorCode.TRANSACTION_ABORTED,
+                            "Schema write on " + resource.tableName() + " violates the protocol");
+                }
+                if (status == AccessStatus.WAIT) {
+                    return waiting();
+                }
+            }
+            long lsn;
+            try {
+                lsn = frmBridge.logSchema(txId, change);
+            } catch (FrmFailureException e) {
+                return abortedAccess(tx, ErrorCode.WAL_FAILURE, e.getMessage());
+            }
+            tx.grantLsn(lsn);
+            for (ResourceId resource : resources) {
+                recorder.record(new ScheduleOperation(txId, resource, true));
+            }
+            return granted(Optional.of(lsn));
+        });
+    }
+
+    @Override
+    public boolean beginApply(long txId, long changeLSN) {
+        return transactions.get(txId).map(tx -> tx.beginApply(changeLSN)).orElse(false);
+    }
+
+    @Override
+    public void endApply(long txId, long changeLSN) {
+        transactions.get(txId).ifPresent(Transaction::endApply);
     }
 
     @Override
@@ -110,17 +180,31 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
             return unknownTransaction(txId);
         }
         Transaction tx = found.get();
-        if (!tx.isActive()) {
-            return withError(tx, error(ErrorCode.INVALID_STATE, "Transaction " + txId + " is " + tx.getStatus()));
-        }
+        synchronized (tx) {
+            if (!tx.isActive()) {
+                return withError(tx, inactiveError(tx));
+            }
 
-        transactions.setStatus(txId, TransactionStatus.PARTIALLY_COMMITTED);
-        // TODO(CC3): if COMMIT is not durable, the transaction must not become COMMITTED; abort instead.
-        frmBridge.logCommit(txId);
-        transactions.setStatus(txId, TransactionStatus.COMMITTED);
-        protocol.release(tx);
-        recorder.markCommitted(txId);
-        return tx.toResponse();
+            transactions.setStatus(txId, TransactionStatus.PARTIALLY_COMMITTED);
+            if (!tx.awaitNoApply(config.applyDrainTimeoutMs())) {
+                transactions.setStatus(txId, TransactionStatus.FAILED);
+                return withError(tx, error(ErrorCode.WAL_FAILURE, "Transaction " + txId
+                        + " cannot commit: an apply step did not finish in time"));
+            }
+            try {
+                frmBridge.logCommit(txId);
+            } catch (FrmFailureException e) {
+                // COMMIT may already be durable, so do not undo anything: stay PARTIALLY_COMMITTED,
+                // keep the locks, and stop accepting transactions until recovery decides.
+                transactions.markNotReady();
+                return withError(tx, error(ErrorCode.WAL_FAILURE,
+                        "Commit outcome of transaction " + txId + " is unknown: " + e.getMessage()));
+            }
+            transactions.setStatus(txId, TransactionStatus.COMMITTED);
+            protocol.release(tx);
+            recorder.markCommitted(txId);
+            return tx.toResponse();
+        }
     }
 
     @Override
@@ -129,24 +213,17 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
         if (found.isEmpty()) {
             return unknownTransaction(txId);
         }
-        Transaction tx = found.get();
-        TransactionStatus status = tx.getStatus();
-        if (status == TransactionStatus.COMMITTED || status == TransactionStatus.ABORTED) {
-            return withError(tx, error(ErrorCode.INVALID_STATE, "Transaction " + txId + " is " + status));
-        }
-        return handleAbort(tx, null);
+        return handleAbort(found.get(), null);
     }
 
     @Override
     public void setProtocol(ProtocolType protocol) {
         Objects.requireNonNull(protocol, "protocol");
-        if (transactions.hasActive()) {
-            throw new IllegalStateException("Cannot change protocol while transactions are active");
-        }
-        // TODO(CC1): block new transactions while the protocol is being replaced.
-        if (this.protocol.getType() != protocol) {
-            this.protocol = createProtocol(protocol);
-        }
+        transactions.runIfNoneActive(() -> {
+            if (this.protocol.getType() != protocol) {
+                this.protocol = createProtocol(protocol);
+            }
+        });
     }
 
     @Override
@@ -164,6 +241,11 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
     @Override
     public void awaitNoActiveTransactions() {
         transactions.awaitNoActive();
+    }
+
+    @Override
+    public boolean awaitNoActiveTransactions(long timeoutMs) {
+        return transactions.awaitNoActive(timeoutMs);
     }
 
     @Override
@@ -185,28 +267,87 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
     }
 
     /**
-     * Single abort path for user ABORT, deadlock victims, and protocol violations (CC-04).
-     * Protocol state is kept until rollback has finished.
+     * Single abort path for user ABORT, deadlock victims, protocol violations, and WAL failures (CC-04).
+     * Protocol state is kept until rollback and logAbort have finished; a failure leaves the
+     * transaction FAILED so that a later abort can retry.
      */
     private TransactionResponse handleAbort(Transaction tx, ErrorInfo reason) {
-        long txId = tx.getTxId();
-        transactions.setStatus(txId, TransactionStatus.FAILED);
-        // TODO(CC3): if rollback fails, keep the transaction FAILED and keep its protocol state.
-        frmBridge.rollbackThenLogAbort(txId);
-        transactions.setStatus(txId, TransactionStatus.ABORTED);
-        protocol.release(tx);
-        return reason == null ? tx.toResponse() : withError(tx, reason);
+        // A deadlock callback and a waiting request can reach this method at the same time.
+        synchronized (tx) {
+            long txId = tx.getTxId();
+            TransactionStatus status = tx.getStatus();
+            if (status == TransactionStatus.COMMITTED || status == TransactionStatus.ABORTED) {
+                return withError(tx, error(ErrorCode.INVALID_STATE, "Transaction " + txId + " is " + status));
+            }
+            if (status == TransactionStatus.PARTIALLY_COMMITTED) {
+                return withError(tx, error(ErrorCode.INVALID_STATE,
+                        "Transaction " + txId + " has an unknown commit outcome; recovery is required"));
+            }
+            if (status == TransactionStatus.ACTIVE) {
+                transactions.setStatus(txId, TransactionStatus.FAILED);
+            }
+            if (!tx.awaitNoApply(config.applyDrainTimeoutMs())) {
+                return withError(tx, error(ErrorCode.WAL_FAILURE, "Transaction " + txId
+                        + " stays FAILED: an apply step did not finish in time; abort again to retry"));
+            }
+            try {
+                frmBridge.rollbackThenLogAbort(txId);
+            } catch (FrmFailureException e) {
+                return withError(tx, error(ErrorCode.WAL_FAILURE, "Transaction " + txId
+                        + " stays FAILED with its locks held; abort again to retry: " + e.getMessage()));
+            }
+            transactions.setStatus(txId, TransactionStatus.ABORTED);
+            protocol.release(tx);
+            return reason == null ? tx.toResponse() : withError(tx, reason);
+        }
     }
 
-    private AccessResponse abortedAccess(Transaction tx, String message) {
-        ErrorInfo reason = error(ErrorCode.TRANSACTION_ABORTED, message);
+    private AccessResponse abortedAccess(Transaction tx, ErrorCode code, String message) {
+        ErrorInfo reason = error(code, message);
         handleAbort(tx, reason);
         return new AccessResponse(AccessStatus.ABORTED, Optional.empty(), Optional.empty(), Optional.of(reason));
     }
 
-    private static IConcurrencyProtocol createProtocol(ProtocolType type) {
+    private AccessResponse withActiveTransaction(long txId, Function<Transaction, AccessResponse> action) {
+        Optional<Transaction> found = transactions.get(txId);
+        if (found.isEmpty()) {
+            return accessError(error(ErrorCode.NOT_FOUND, "Unknown transaction " + txId));
+        }
+        Transaction tx = found.get();
+        if (!tx.isActive()) {
+            return accessError(inactiveError(tx));
+        }
+        return action.apply(tx);
+    }
+
+    private static ErrorInfo inactiveError(Transaction tx) {
+        TransactionStatus status = tx.getStatus();
+        if (status == TransactionStatus.FAILED || status == TransactionStatus.ABORTED) {
+            return error(ErrorCode.TRANSACTION_ABORTED,
+                    "Transaction " + tx.getTxId() + " has been aborted (status " + status + ")");
+        }
+        return error(ErrorCode.INVALID_STATE, "Transaction " + tx.getTxId() + " is " + status);
+    }
+
+    private static AccessResponse granted(Optional<Long> lsn) {
+        return new AccessResponse(AccessStatus.GRANTED, lsn, Optional.empty(), Optional.empty());
+    }
+
+    private static AccessResponse waiting() {
+        return new AccessResponse(AccessStatus.WAIT, Optional.empty(), Optional.empty(), Optional.empty());
+    }
+
+    private void abortDeadlockVictim(long txId) {
+        TransactionResponse response = abort(txId);
+        if (response.status() != TransactionStatus.ABORTED
+                && response.status() != TransactionStatus.COMMITTED) {
+            throw new IllegalStateException("Deadlock victim could not finish abort: " + txId);
+        }
+    }
+
+    private IConcurrencyProtocol createProtocol(ProtocolType type) {
         return switch (type) {
-            case LOCK_BASED -> new LockBasedProtocol(new DeadlockHandler());
+            case LOCK_BASED -> new LockBasedProtocol(new DeadlockHandler(), this::abortDeadlockVictim);
             case TIMESTAMP_BASED -> new TimestampProtocol();
         };
     }

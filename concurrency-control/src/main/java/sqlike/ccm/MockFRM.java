@@ -2,26 +2,61 @@ package sqlike.ccm;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
 import sqlike.contract.IFailureRecoveryManager;
 import sqlike.shared.DataChange;
+import sqlike.shared.DataType;
+import sqlike.shared.PageId;
+import sqlike.shared.RID;
+import sqlike.shared.RecordImage;
 import sqlike.shared.RecoveryResult;
 import sqlike.shared.RecoveryTarget;
+import sqlike.shared.ResourceId;
+import sqlike.shared.SchemaChange;
+import sqlike.shared.Value;
 
 /**
  * In-memory mock implementation of {@link IFailureRecoveryManager} for isolated CCM testing (CC-10).
+ *
+ * <p>Supports WAL failure injection, per-transaction change tracking, and simulated undo on
+ * {@link #rollback(long)} so scenarios can verify that aborted writes restore old values (before-image).
  */
 public class MockFRM implements IFailureRecoveryManager {
 
     private final List<String> log = new ArrayList<>();
     private final AtomicLong lsnGenerator = new AtomicLong(0);
+    private final Map<Long, List<DataChange>> txChanges = new HashMap<>();
+    private final Map<String, RecordImage> simulatedStore = new HashMap<>();
+    private final Set<Long> committedTransactions = new HashSet<>();
+    private final Set<Long> abortedTransactions = new HashSet<>();
+    private final Set<Long> rolledBackTransactions = new HashSet<>();
     private boolean failNext = false;
+    private final Map<String, Integer> failuresLeft = new HashMap<>();
 
     public synchronized void setFailNext(boolean failNext) {
         this.failNext = failNext;
+    }
+
+    public synchronized void setFailOnOperation(String operation) {
+        setFailOnOperation(operation, 1);
+    }
+
+    /** Makes the next {@code times} calls of {@code operation} throw; {@code times <= 0} clears it. */
+    public synchronized void setFailOnOperation(String operation, int times) {
+        String key = operation.toLowerCase(Locale.ROOT);
+        if (times <= 0) {
+            failuresLeft.remove(key);
+        } else {
+            failuresLeft.put(key, times);
+        }
     }
 
     public synchronized List<String> getLog() {
@@ -31,13 +66,69 @@ public class MockFRM implements IFailureRecoveryManager {
     public synchronized void clear() {
         log.clear();
         lsnGenerator.set(0);
+        txChanges.clear();
+        simulatedStore.clear();
+        committedTransactions.clear();
+        abortedTransactions.clear();
+        rolledBackTransactions.clear();
         failNext = false;
+        failuresLeft.clear();
+    }
+
+    public synchronized void seedValue(ResourceId resource, int value) {
+        RecordImage image = new RecordImage(true, List.of(
+                new Value(DataType.INTEGER, Optional.of(value), Optional.empty(), Optional.empty())));
+        simulatedStore.put(resourceKey(resource), image);
+    }
+
+    public synchronized Optional<Integer> readIntValue(ResourceId resource) {
+        RecordImage img = simulatedStore.get(resourceKey(resource));
+        if (img == null || !img.exists() || img.values().isEmpty()) {
+            return Optional.empty();
+        }
+        return img.values().get(0).integerValue();
+    }
+
+    public synchronized Optional<RecordImage> readRecordImage(ResourceId resource) {
+        return Optional.ofNullable(simulatedStore.get(resourceKey(resource)));
+    }
+
+    public synchronized boolean wasRolledBack(long txId) {
+        return rolledBackTransactions.contains(txId);
+    }
+
+    public synchronized boolean wasAborted(long txId) {
+        return abortedTransactions.contains(txId);
+    }
+
+    public synchronized boolean wasCommitted(long txId) {
+        return committedTransactions.contains(txId);
+    }
+
+    private static String resourceKey(ResourceId resource) {
+        RID rid = resource.rid().orElseGet(() -> new RID(new PageId(resource.tableName(), 0L), 0));
+        return resource.tableName() + "#" + rid.pageId().pageNumber() + ":" + rid.slotId();
+    }
+
+    private static String changeKey(DataChange change) {
+        RID rid = change.rid();
+        return change.tableName() + "#" + rid.pageId().pageNumber() + ":" + rid.slotId();
     }
 
     private void checkFailNext(String operation) {
-        if (failNext) {
+        String key = operation.toLowerCase(Locale.ROOT);
+        Integer left = failuresLeft.get(key);
+        boolean injected = left != null && left > 0;
+        if (injected) {
+            if (left == 1) {
+                failuresLeft.remove(key);
+            } else {
+                failuresLeft.put(key, left - 1);
+            }
+        }
+        if (failNext || injected) {
             failNext = false;
-            throw new RuntimeException("MockFRM simulated failure on " + operation);
+            throw new RuntimeException("MockFRM simulated WAL failure on " + operation);
         }
     }
 
@@ -55,6 +146,19 @@ public class MockFRM implements IFailureRecoveryManager {
         long lsn = lsnGenerator.incrementAndGet();
         log.add(String.format("LSN=%d CHANGE tx=%d op=%s table=%s rid=%s",
                 lsn, txId, change.operation(), change.tableName(), change.rid()));
+        txChanges.computeIfAbsent(txId, k -> new ArrayList<>()).add(change);
+        if (change.after() != null) {
+            simulatedStore.put(changeKey(change), change.after());
+        }
+        return lsn;
+    }
+
+    @Override
+    public synchronized long logSchemaChange(long txId, SchemaChange change) {
+        checkFailNext("logSchemaChange");
+        long lsn = lsnGenerator.incrementAndGet();
+        log.add(String.format("LSN=%d SCHEMA_CHANGE tx=%d tables=%d",
+                lsn, txId, change == null ? 0 : change.after().size()));
         return lsn;
     }
 
@@ -62,6 +166,7 @@ public class MockFRM implements IFailureRecoveryManager {
     public synchronized void logCommit(long txId) {
         checkFailNext("logCommit");
         long lsn = lsnGenerator.incrementAndGet();
+        committedTransactions.add(txId);
         log.add(String.format("LSN=%d COMMIT tx=%d", lsn, txId));
     }
 
@@ -69,6 +174,7 @@ public class MockFRM implements IFailureRecoveryManager {
     public synchronized void logAbort(long txId) {
         checkFailNext("logAbort");
         long lsn = lsnGenerator.incrementAndGet();
+        abortedTransactions.add(txId);
         log.add(String.format("LSN=%d ABORT tx=%d", lsn, txId));
     }
 
@@ -81,6 +187,15 @@ public class MockFRM implements IFailureRecoveryManager {
     @Override
     public synchronized void rollback(long txId) {
         checkFailNext("rollback");
+        if (rolledBackTransactions.add(txId)) {
+            List<DataChange> changes = txChanges.getOrDefault(txId, Collections.emptyList());
+            for (int i = changes.size() - 1; i >= 0; i--) {
+                DataChange change = changes.get(i);
+                if (change.before() != null) {
+                    simulatedStore.put(changeKey(change), change.before());
+                }
+            }
+        }
         log.add(String.format("ROLLBACK tx=%d", txId));
     }
 
