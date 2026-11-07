@@ -83,7 +83,7 @@ public class PointInTimeRecovery {
                 replay(plan);
                 storageManager.flushAll();
 
-                historicalLog.separateHistory();
+                historicalLog.separateHistory(plan.snapshotId(), plan.targetLSN());
                 if (lastLsn > plan.targetLSN()) {
                     snapshotCatalog.recordAbandoned(plan.targetLSN() + 1, lastLsn);
                 }
