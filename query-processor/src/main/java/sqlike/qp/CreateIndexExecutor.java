@@ -5,6 +5,7 @@ import sqlike.qp.port.QpContracts.*;
 import static sqlike.qp.port.QpContracts.failure;
 import sqlike.storage.StorageException;
 
+/** Callers must reject CREATE INDEX during validation to keep an explicit transaction active. */
 public final class CreateIndexExecutor extends AbstractCommandExecutor {
     private final CreateIndexSpec spec;
     private final sqlike.contract.IStorageManager storageContract;

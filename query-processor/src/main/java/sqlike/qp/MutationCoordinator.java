@@ -8,18 +8,19 @@ import static sqlike.qp.port.QpContracts.failure;
 public class MutationCoordinator {
     private final sqlike.qp.port.QpContracts.IStorageManager storage;
     private final IConcurrencyControl concurrency;
+    private final AccessCoordinator access;
 
-    // Konstruktor untuk kompatibilitas develop/qp (QP2, QP3)
+    /** Storage-only compatibility constructor. Use a CCM port for WAL-backed writes. */
     public MutationCoordinator(sqlike.contract.IStorageManager storage) {
         this(storage instanceof sqlike.qp.port.QpContracts.IStorageManager qpSm
                 ? qpSm
                 : (storage != null ? new sqlike.qp.port.StorageAdapter(storage) : null), null);
     }
 
-    // Konstruktor utama untuk transaksi tulis QP5
     public MutationCoordinator(sqlike.qp.port.QpContracts.IStorageManager storage, IConcurrencyControl concurrency) {
         this.storage = storage;
         this.concurrency = concurrency;
+        this.access = concurrency == null ? null : new AccessCoordinator(concurrency);
     }
 
     public MutationCoordinator(sqlike.contract.IStorageManager storage, IConcurrencyControl concurrency) {
@@ -34,9 +35,10 @@ public class MutationCoordinator {
 
     public Rid insert(TableId tableId, Row row, ExecutionContext context) {
         if (storage == null) throw failure("Storage manager is not initialized in MutationCoordinator");
+        AccessGrant writeGrant = context.requireGrant(tableId, AccessMode.WRITE);
         Row values = storage.getSchema(tableId).validate(row);
         enforceInsertOrUpdateConstraints(tableId, values, null, context);
-        Rid rid = storage.reserveInsert(tableId, values, context, context.requireGrant(tableId, AccessMode.WRITE));
+        Rid rid = storage.reserveInsert(tableId, values, context, writeGrant);
         try {
             apply(new ChangeRecord(context.nextChangeId(), new TxId(context.txId), new DataChange(ChangeOperation.INSERT,
                     tableId.value(), rid.value(), new RecordImage(false, List.of()), new RecordImage(true, values.values()))), context);
@@ -134,7 +136,6 @@ public class MutationCoordinator {
         }
         Schema qpSchema = Schema.fromTableSchema(tableSchema);
 
-        // 1. Primary Key uniqueness check
         if (!tableSchema.primaryKey().isEmpty()) {
             List<Integer> pkOffsets = tableSchema.primaryKey().stream()
                     .map(col -> qpSchema.findColumnOffset(null, col))
@@ -163,7 +164,6 @@ public class MutationCoordinator {
             }
         }
 
-        // 2. Foreign Key parent existence check
         for (ForeignKeySpec fk : tableSchema.foreignKeys()) {
             TableId refTableId = new TableId(fk.referencedTable());
             TableSchema refTableSchema = storage.getTableSchema(refTableId);
@@ -176,7 +176,7 @@ public class MutationCoordinator {
                     .toList();
             List<Value> fkValues = localOffsets.stream().map(candidateRow::getValue).toList();
 
-            // Self-reference satisfied by the row being inserted/updated itself
+            // The candidate row can satisfy its own foreign key before it is stored.
             if (refTableId.value().equalsIgnoreCase(tableId.value())) {
                 List<Value> selfRefValues = refOffsets.stream().map(candidateRow::getValue).toList();
                 if (fkValues.equals(selfRefValues)) {
@@ -257,7 +257,7 @@ public class MutationCoordinator {
                 if (afterRow != null) {
                     List<Value> newParentKey = parentOffsets.stream().map(afterRow::getValue).toList();
                     if (oldParentKey.equals(newParentKey)) {
-                        continue; // Referenced key values did not change
+                        continue;
                     }
                 }
                 List<Integer> childOffsets = fk.columnNames().stream()
@@ -287,21 +287,15 @@ public class MutationCoordinator {
     }
 
     private AccessGrant ensureReadGrant(ExecutionContext context, TableId tableId) {
+        // Foreign-key checks can discover tables outside the statement's planned grants.
         try {
             return context.requireGrant(tableId, AccessMode.READ);
-        } catch (RuntimeException missing) {
-            if (concurrency != null) {
-                AccessDecision dec = concurrency.acquireAccess(
-                        new TxId(context.txId), ResourceKey.table(tableId), AccessMode.READ);
-                if (dec.status() == AccessStatus.GRANTED && dec.grant().isPresent()) {
-                    context.addGrant(dec.grant().get());
-                    return dec.grant().get();
-                }
-            }
-            AccessGrant synthetic = new AccessGrant(
-                    new TxId(context.txId), ResourceKey.table(tableId), AccessMode.READ);
-            context.addGrant(synthetic);
-            return synthetic;
+        } catch (IllegalStateException missing) {
+            context.check();
+            if (access == null) throw missing;
+            AccessGrant grant = access.acquireOne(ResourceKey.table(tableId), AccessMode.READ, context);
+            context.addGrant(grant);
+            return grant;
         }
     }
 }
