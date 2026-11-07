@@ -1,7 +1,9 @@
 package sqlike.ccm;
 
+import java.util.LinkedHashSet;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Function;
 
 import sqlike.contract.IConcurrencyControlManager;
@@ -14,6 +16,8 @@ import sqlike.shared.ErrorCode;
 import sqlike.shared.ErrorInfo;
 import sqlike.shared.ProtocolType;
 import sqlike.shared.ResourceId;
+import sqlike.shared.SchemaChange;
+import sqlike.shared.SchemaImage;
 import sqlike.shared.TransactionResponse;
 import sqlike.shared.TransactionStatus;
 
@@ -111,6 +115,42 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
             case WAIT -> waiting();
             case ABORTED -> abortedAccess(tx, ErrorCode.TRANSACTION_ABORTED,
                     "Write access on " + resource.tableName() + " violates the protocol");
+        });
+    }
+
+    @Override
+    public AccessResponse requestSchemaWrite(long txId, SchemaChange change) {
+        Objects.requireNonNull(change, "change");
+        return withActiveTransaction(txId, tx -> {
+            Set<ResourceId> resources = new LinkedHashSet<>();
+            resources.add(ResourceId.ofCatalog());
+            for (SchemaImage image : change.before()) {
+                resources.add(ResourceId.ofTable(image.tableName()));
+            }
+            for (SchemaImage image : change.after()) {
+                resources.add(ResourceId.ofTable(image.tableName()));
+            }
+            for (ResourceId resource : resources) {
+                AccessStatus status = protocol.checkWrite(tx, resource);
+                if (status == AccessStatus.ABORTED) {
+                    return abortedAccess(tx, ErrorCode.TRANSACTION_ABORTED,
+                            "Schema write on " + resource.tableName() + " violates the protocol");
+                }
+                if (status == AccessStatus.WAIT) {
+                    return waiting();
+                }
+            }
+            long lsn;
+            try {
+                lsn = frmBridge.logSchema(txId, change);
+            } catch (FrmFailureException e) {
+                return abortedAccess(tx, ErrorCode.WAL_FAILURE, e.getMessage());
+            }
+            tx.grantLsn(lsn);
+            for (ResourceId resource : resources) {
+                recorder.record(new ScheduleOperation(txId, resource, true));
+            }
+            return granted(Optional.of(lsn));
         });
     }
 

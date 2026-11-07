@@ -41,6 +41,8 @@ public final class ConcurrencyControlManagerTest {
         check.test("a failed rollback keeps the transaction FAILED and its locks", ConcurrencyControlManagerTest::rollbackStuck);
         check.test("a failed logAbort keeps the locks until a retry works", ConcurrencyControlManagerTest::logAbortStuck);
         check.test("write access locks without logging", ConcurrencyControlManagerTest::writeAccess);
+        check.test("a schema write locks the catalog and logs one schema change", ConcurrencyControlManagerTest::schemaWrite);
+        check.test("a failed schema log aborts the transaction", ConcurrencyControlManagerTest::schemaWriteFails);
         check.done();
     }
 
@@ -247,5 +249,35 @@ public final class ConcurrencyControlManagerTest {
         } finally {
             pool.shutdownNow();
         }
+    }
+
+    private static void schemaWrite() throws Exception {
+        Rig r = rig();
+        long ddl = begin(r);
+        long reader = begin(r);
+        AccessResponse response = r.ccm().requestSchemaWrite(ddl, new SchemaChange(null, null));
+        granted(response);
+        require(response.changeLSN().orElse(0L) > 0, "a schema write carries a positive LSN");
+        require(r.frm().getLog().stream().anyMatch(line -> line.contains("SCHEMA_CHANGE tx=" + ddl)),
+                "the schema change must be logged");
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<AccessResponse> blocked = pool.submit(() -> r.ccm().requestRead(reader, ResourceId.ofCatalog()));
+            expectBlocked(blocked);
+            r.ccm().commit(ddl);
+            granted(get(blocked));
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    private static void schemaWriteFails() {
+        Rig r = rig();
+        long ddl = begin(r);
+        r.frm().setFailOnOperation("logSchemaChange", 1);
+        AccessResponse failed = r.ccm().requestSchemaWrite(ddl, new SchemaChange(null, null));
+        require(failed.status() == AccessStatus.ABORTED && code(failed.error()) == ErrorCode.WAL_FAILURE,
+                "the schema write must be refused with WAL_FAILURE");
+        require(r.frm().wasRolledBack(ddl), "the transaction must be rolled back");
     }
 }
