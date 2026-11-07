@@ -798,7 +798,8 @@ public class CCMDriver {
 
     public static void main(String[] args) {
         MockFRM mockFrm = new MockFRM();
-        IConcurrencyControlManager ccm = new ConcurrencyControlManager(mockFrm);
+        ConcurrencyControlManager ccm = new ConcurrencyControlManager(mockFrm);
+        System.out.println(ccm.describeProtocol());
         List<Scenario> scenarios = defaultScenarios();
         CCMDriver driver = new CCMDriver(ccm, scenarios, new SerializabilityVerifier(), mockFrm);
         for (Scenario scenario : scenarios) {

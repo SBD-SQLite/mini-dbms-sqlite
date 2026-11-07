@@ -5,6 +5,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.logging.Logger;
 
 import sqlike.contract.IConcurrencyControlManager;
 import sqlike.contract.IFailureRecoveryManager;
@@ -29,6 +30,8 @@ import sqlike.shared.TransactionStatus;
  */
 public class ConcurrencyControlManager implements IConcurrencyControlManager {
 
+    private static final Logger LOG = Logger.getLogger(ConcurrencyControlManager.class.getName());
+
     private final IFailureRecoveryManager recovery;
     private final TransactionManager transactions;
     private volatile IConcurrencyProtocol protocol;
@@ -47,6 +50,12 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
         this.frmBridge = new FRMBridge(this.recovery, config);
         this.recorder = new ScheduleRecorder();
         this.protocol = createProtocol(config.protocol());
+        LOG.info(describeProtocol());
+    }
+
+    /** The protocol in use and the documented default, shown when CCM starts (CC-02). */
+    public String describeProtocol() {
+        return "Active protocol: " + protocol.getType() + " (default: " + CCMConfig.defaults().protocol() + ")";
     }
 
     @Override

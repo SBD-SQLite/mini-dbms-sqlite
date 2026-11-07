@@ -49,6 +49,7 @@ public final class ConcurrencyControlManagerTest {
         check.test("pause holds new transactions but not running ones", ConcurrencyControlManagerTest::gate);
         check.test("initAfterRecovery keeps a paused gate closed", ConcurrencyControlManagerTest::recoveryKeepsGate);
         check.test("the protocol can change only when idle", ConcurrencyControlManagerTest::protocolChange);
+        check.test("the active protocol and the default are described", ConcurrencyControlManagerTest::describe);
         check.done();
     }
 
@@ -375,5 +376,14 @@ public final class ConcurrencyControlManagerTest {
         r.ccm().commit(tx);
         r.ccm().setProtocol(ProtocolType.TIMESTAMP_BASED);
         require(r.ccm().getActiveProtocol() == ProtocolType.TIMESTAMP_BASED, "the protocol must change when idle");
+    }
+
+    private static void describe() {
+        MockFRM frm = new MockFRM();
+        require(new ConcurrencyControlManager(frm).describeProtocol()
+                .equals("Active protocol: LOCK_BASED (default: LOCK_BASED)"), "default description");
+        CCMConfig timestamp = new CCMConfig(ProtocolType.TIMESTAMP_BASED, 5000L);
+        require(new ConcurrencyControlManager(frm, timestamp).describeProtocol()
+                .equals("Active protocol: TIMESTAMP_BASED (default: LOCK_BASED)"), "configured description");
     }
 }
