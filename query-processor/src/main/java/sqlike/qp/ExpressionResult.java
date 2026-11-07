@@ -27,7 +27,10 @@ public record ExpressionResult(Value value) {
     }
 
     public boolean isSqlNull() {
-        return value == SQL_NULL_SENTINEL;
+        return value == SQL_NULL_SENTINEL
+                || (value.integerValue().isEmpty()
+                        && value.floatValue().isEmpty()
+                        && value.textValue().isEmpty());
     }
 
     public DataType type() {

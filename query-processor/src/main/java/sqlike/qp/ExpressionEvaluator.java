@@ -47,6 +47,26 @@ public class ExpressionEvaluator implements IExpressionEvaluator {
         return planTranslator;
     }
 
+    public ExpressionResult evaluateWithContext(
+            Expression expr,
+            Row row,
+            Schema schema,
+            ExecutionContext context) {
+        ExecutionContext prevCtx = activeContext.get();
+        if (context != null) {
+            activeContext.set(context);
+        }
+        try {
+            return evaluate(expr, row, schema);
+        } finally {
+            if (prevCtx == null) {
+                activeContext.remove();
+            } else {
+                activeContext.set(prevCtx);
+            }
+        }
+    }
+
     public boolean evaluateConditionWithContext(
             Expression expr,
             Row row,
@@ -93,6 +113,9 @@ public class ExpressionEvaluator implements IExpressionEvaluator {
             case LITERAL -> {
                 Value lit = expr.literal().orElseThrow(() ->
                         new IllegalArgumentException("LITERAL expression must contain a Value"));
+                if (lit.type() == DataType.FLOAT && lit.floatValue().isPresent() && !Double.isFinite(lit.floatValue().get())) {
+                    throw new QpException(ErrorCode.INVALID_VALUE, "Non-finite floating point literal is not allowed");
+                }
                 yield ExpressionResult.of(lit);
             }
             case COLUMN -> {
@@ -111,7 +134,11 @@ public class ExpressionEvaluator implements IExpressionEvaluator {
                     yield ExpressionResult.sqlNull();
                 }
                 if (op == ExpressionOperator.NEGATE) {
-                    yield ExpressionResult.of(negateValue(operandRes.value()));
+                    try {
+                        yield ExpressionResult.of(negateValue(operandRes.value()));
+                    } catch (ArithmeticException e) {
+                        throw new QpException(ErrorCode.INVALID_VALUE, "Integer overflow in unary negation");
+                    }
                 }
                 throw new IllegalArgumentException("Unsupported unary operator: " + op);
             }
@@ -209,6 +236,7 @@ public class ExpressionEvaluator implements IExpressionEvaluator {
             pushed = true;
         }
         try {
+            checkContextActive(ctx);
             subOp.open(ctx);
             if (subOp.schema().columnCount() != 1) {
                 throw new QpException(
@@ -249,6 +277,7 @@ public class ExpressionEvaluator implements IExpressionEvaluator {
                 ExecutionContext ctx = currentExecutionContext();
                 yield withOuterScope(row, schema, () -> {
                     try {
+                        checkContextActive(ctx);
                         subOp.open(ctx);
                         return subOp.next().isPresent();
                     } finally {
@@ -269,6 +298,7 @@ public class ExpressionEvaluator implements IExpressionEvaluator {
                 ExecutionContext ctx = currentExecutionContext();
                 yield withOuterScope(row, schema, () -> {
                     try {
+                        checkContextActive(ctx);
                         subOp.open(ctx);
                         if (subOp.schema().columnCount() != 1) {
                             throw new QpException(
@@ -276,11 +306,15 @@ public class ExpressionEvaluator implements IExpressionEvaluator {
                                     "IN subquery must return exactly 1 column, found: " + subOp.schema().columnCount());
                         }
                         while (true) {
+                            checkContextActive(ctx);
                             Optional<RowEnvelope> next = subOp.next();
                             if (next.isEmpty()) {
                                 return false;
                             }
                             Value candidateVal = next.get().row().getValue(0);
+                            if (ExpressionResult.of(candidateVal).isSqlNull()) {
+                                continue;
+                            }
                             if (compare(ExpressionOperator.EQ, targetVal, candidateVal)) {
                                 return true;
                             }
@@ -302,6 +336,18 @@ public class ExpressionEvaluator implements IExpressionEvaluator {
                 throw new QpException(ErrorCode.SEMANTIC_ERROR, "SCALAR subquery cannot be used directly as a boolean condition");
             }
         };
+    }
+
+    private void checkContextActive(ExecutionContext ctx) {
+        if (ctx == null) {
+            return;
+        }
+        try {
+            ctx.check();
+        } catch (IllegalStateException e) {
+            String msg = e.getMessage() != null ? e.getMessage() : "Transaction cancelled during subquery evaluation";
+            throw new QpException(ErrorCode.TRANSACTION_ABORTED, msg);
+        }
     }
 
     private Operator buildSubqueryOperator(SubquerySpec sub) {
@@ -333,8 +379,12 @@ public class ExpressionEvaluator implements IExpressionEvaluator {
             return ExpressionResult.sqlNull();
         }
 
-        Value result = arithmetic(op, leftRes.value(), rightRes.value());
-        return ExpressionResult.of(result);
+        try {
+            Value result = arithmetic(op, leftRes.value(), rightRes.value());
+            return ExpressionResult.of(result);
+        } catch (ArithmeticException e) {
+            throw new QpException(ErrorCode.INVALID_VALUE, e.getMessage());
+        }
     }
 
     public Value arithmetic(ExpressionOperator op, Value left, Value right) {
@@ -351,6 +401,9 @@ public class ExpressionEvaluator implements IExpressionEvaluator {
         if (useFloat) {
             double l = left.type() == DataType.INTEGER ? left.integerValue().orElse(0) : left.floatValue().orElse(0.0);
             double r = right.type() == DataType.INTEGER ? right.integerValue().orElse(0) : right.floatValue().orElse(0.0);
+            if (!Double.isFinite(l) || !Double.isFinite(r)) {
+                throw new QpException(ErrorCode.INVALID_VALUE, "Non-finite floating point operand");
+            }
 
             double res = switch (op) {
                 case ADD -> l + r;
@@ -412,7 +465,11 @@ public class ExpressionEvaluator implements IExpressionEvaluator {
         if (val.type() == DataType.INTEGER) {
             return new Value(DataType.INTEGER, Optional.of(Math.negateExact(val.integerValue().orElse(0))), Optional.empty(), Optional.empty());
         } else if (val.type() == DataType.FLOAT) {
-            return new Value(DataType.FLOAT, Optional.empty(), Optional.of(-val.floatValue().orElse(0.0)), Optional.empty());
+            double d = -val.floatValue().orElse(0.0);
+            if (!Double.isFinite(d)) {
+                throw new QpException(ErrorCode.INVALID_VALUE, "Non-finite floating point result");
+            }
+            return new Value(DataType.FLOAT, Optional.empty(), Optional.of(d), Optional.empty());
         }
         throw new IllegalArgumentException("Cannot negate non-numeric Value of type: " + val.type());
     }
