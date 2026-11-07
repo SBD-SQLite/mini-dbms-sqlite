@@ -235,7 +235,6 @@ public class CCMDriver {
         if (!activeTxSet.isEmpty()) {
             for (Long remainingTx : new ArrayList<>(activeTxSet)) {
                 ccm.abort(remainingTx);
-                syncAbortToMockFrm(remainingTx);
                 activeTxSet.remove(remainingTx);
             }
         }
@@ -274,29 +273,17 @@ public class CCMDriver {
                 if (step.injectWalFailure()) {
                     mockFrm.setFailNext(true);
                 }
-                int logSizeBefore = mockFrm.getLog().size();
                 TransactionResponse resp = ccm.beginTransaction();
                 long txId = resp.txId();
                 txIds.put(label, txId);
                 if (resp.status() == TransactionStatus.ACTIVE) {
-                    try {
-                        if (mockFrm.getLog().size() == logSizeBefore) {
-                            mockFrm.logBegin(txId);
-                        }
-                        activeTxSet.add(txId);
-                        stepLogs.add(String.format("%s BEGIN -> txId=%d ts=%d status=%s",
-                                label, txId, resp.timestamp(), resp.status()));
-                        return AccessStatus.GRANTED;
-                    } catch (RuntimeException walEx) {
-                        ccm.abort(txId);
-                        syncAbortToMockFrm(txId);
-                        stepLogs.add(String.format("%s BEGIN -> DIBATALKAN (WAL_FAILURE: %s)",
-                                label, walEx.getMessage()));
-                        return AccessStatus.ABORTED;
-                    }
+                    activeTxSet.add(txId);
+                    stepLogs.add(String.format("%s BEGIN -> txId=%d ts=%d status=%s",
+                            label, txId, resp.timestamp(), resp.status()));
+                    return AccessStatus.GRANTED;
                 }
-                stepLogs.add(String.format("%s BEGIN -> txId=%d status=%s",
-                        label, txId, resp.status()));
+                stepLogs.add(String.format("%s BEGIN -> DIBATALKAN (%s)",
+                        label, resp.error().map(e -> e.code().name()).orElse("-")));
                 return AccessStatus.ABORTED;
             }
             case READ -> {
@@ -304,7 +291,6 @@ public class CCMDriver {
                 ResourceId res = step.resource().orElseThrow();
                 AccessResponse resp = ccm.requestRead(txId, res);
                 if (resp.status() == AccessStatus.ABORTED) {
-                    syncAbortToMockFrm(txId);
                     activeTxSet.remove(txId);
                     stepLogs.add(String.format("%s (tx=%d) R(%s) -> %s",
                             label, txId, res.tableName(), formatAccessStatus(AccessStatus.ABORTED)));
@@ -339,95 +325,57 @@ public class CCMDriver {
                 if (step.injectWalFailure()) {
                     mockFrm.setFailNext(true);
                 }
-                int logSizeBefore = mockFrm.getLog().size();
-                try {
-                    AccessResponse resp = ccm.requestWrite(txId, change);
-                    if (resp.status() == AccessStatus.ABORTED) {
-                        syncAbortToMockFrm(txId);
-                        activeTxSet.remove(txId);
-                        stepLogs.add(String.format("%s (tx=%d) W(%s) -> %s",
-                                label, txId, res.tableName(), formatAccessStatus(AccessStatus.ABORTED)));
-                        return AccessStatus.ABORTED;
-                    }
-                    if (resp.status() == AccessStatus.GRANTED) {
-                        if (mockFrm.getLog().size() == logSizeBefore) {
-                            mockFrm.logChange(txId, change);
-                        }
-                        recorder.record(new ScheduleOperation(txId, res, true));
-                    }
-                    stepLogs.add(String.format("%s (tx=%d) W(%s) -> %s",
-                            label, txId, res.tableName(), formatAccessStatus(resp.status())));
-                    return resp.status();
-                } catch (RuntimeException walEx) {
-                    ErrorInfo walErr = new ErrorInfo(
-                            ErrorCode.WAL_FAILURE,
-                            ComponentType.CCM,
-                            walEx.getMessage(),
-                            Optional.empty());
-                    ccm.abort(txId);
-                    syncAbortToMockFrm(txId);
+                AccessResponse resp = ccm.requestWrite(txId, change);
+                if (resp.status() == AccessStatus.ABORTED) {
                     activeTxSet.remove(txId);
                     stepLogs.add(String.format("%s (tx=%d) W(%s) -> %s (%s)",
-                            label, txId, res.tableName(),
-                            formatAccessStatus(AccessStatus.ABORTED),
-                            walErr.code()));
+                            label, txId, res.tableName(), formatAccessStatus(AccessStatus.ABORTED),
+                            resp.error().map(e -> e.code().name()).orElse("-")));
                     return AccessStatus.ABORTED;
                 }
+                if (resp.status() == AccessStatus.GRANTED) {
+                    recorder.record(new ScheduleOperation(txId, res, true));
+                }
+                stepLogs.add(String.format("%s (tx=%d) W(%s) -> %s",
+                        label, txId, res.tableName(), formatAccessStatus(resp.status())));
+                return resp.status();
             }
             case COMMIT -> {
                 long txId = requireTxId(label, txIds);
                 if (step.injectWalFailure()) {
                     mockFrm.setFailNext(true);
                 }
-                try {
-                    TransactionResponse resp = ccm.commit(txId);
-                    if (resp.status() == TransactionStatus.COMMITTED) {
-                        if (!mockFrm.wasCommitted(txId)) {
-                            mockFrm.logCommit(txId);
-                        }
-                        recorder.markCommitted(txId);
-                        activeTxSet.remove(txId);
-                        stepLogs.add(String.format("%s (tx=%d) COMMIT -> %s",
-                                label, txId, resp.status()));
-                        return AccessStatus.GRANTED;
-                    }
-                    stepLogs.add(String.format("%s (tx=%d) COMMIT -> %s",
-                            label, txId, resp.status()));
-                    return AccessStatus.ABORTED;
-                } catch (RuntimeException walEx) {
-                    ccm.abort(txId);
-                    syncAbortToMockFrm(txId);
+                TransactionResponse resp = ccm.commit(txId);
+                if (resp.status() == TransactionStatus.COMMITTED) {
+                    recorder.markCommitted(txId);
                     activeTxSet.remove(txId);
-                    stepLogs.add(String.format("%s (tx=%d) COMMIT -> DIBATALKAN (WAL_FAILURE)",
-                            label, txId));
-                    return AccessStatus.ABORTED;
+                    stepLogs.add(String.format("%s (tx=%d) COMMIT -> %s", label, txId, resp.status()));
+                    return AccessStatus.GRANTED;
                 }
+                stepLogs.add(String.format("%s (tx=%d) COMMIT -> %s (%s)", label, txId, resp.status(),
+                        resp.error().map(e -> e.code().name()).orElse("-")));
+                return AccessStatus.ABORTED;
             }
             case ABORT -> {
                 long txId = requireTxId(label, txIds);
-                syncAbortToMockFrm(txId);
+                if (step.injectWalFailure()) {
+                    // Two rollback failures: the bridge retries and the abort still finishes.
+                    mockFrm.setFailOnOperation("rollback", 2);
+                }
                 TransactionResponse resp = ccm.abort(txId);
                 activeTxSet.remove(txId);
-                stepLogs.add(String.format("%s (tx=%d) ABORT -> %s",
-                        label, txId, resp.status()));
+                stepLogs.add(String.format("%s (tx=%d) ABORT -> %s", label, txId, resp.status()));
                 return AccessStatus.ABORTED;
             }
         }
         return AccessStatus.ABORTED;
     }
 
-    private void syncAbortToMockFrm(long txId) {
-        if (!mockFrm.wasAborted(txId)) {
-            mockFrm.rollback(txId);
-            mockFrm.logAbort(txId);
-        }
-    }
-
     /**
      * Verifies concurrency invariants required by Milestone 2 (CC-01, CC-02, CC-04, CC-05):
      * 1. Concurrent multi-threaded {@code beginTransaction()} produces unique, monotonically increasing IDs/timestamps.
      * 2. Calling {@code setProtocol()} while a transaction is active throws {@code IllegalStateException}.
-     * 3. Calling {@code requestRead}, {@code requestWrite}, or {@code commit} after {@code ABORTED} is rejected with {@code INVALID_STATE}.
+     * 3. Calling {@code requestRead}, {@code requestWrite}, or {@code commit} after {@code ABORTED} is rejected with {@code TRANSACTION_ABORTED}.
      */
     private boolean runInvariantVerificationScenario(Scenario scenario) {
         List<String> stepLogs = new ArrayList<>();
@@ -495,16 +443,16 @@ public class CCMDriver {
             TransactionResponse commitAfterAbort = ccm.commit(abortedTxId);
 
             boolean postAbortRejected = readAfterAbort.status() == AccessStatus.ABORTED
-                    && readAfterAbort.error().map(ErrorInfo::code).orElse(null) == ErrorCode.INVALID_STATE
+                    && readAfterAbort.error().map(ErrorInfo::code).orElse(null) == ErrorCode.TRANSACTION_ABORTED
                     && writeAfterAbort.status() == AccessStatus.ABORTED
-                    && writeAfterAbort.error().map(ErrorInfo::code).orElse(null) == ErrorCode.INVALID_STATE
-                    && commitAfterAbort.error().map(ErrorInfo::code).orElse(null) == ErrorCode.INVALID_STATE;
+                    && writeAfterAbort.error().map(ErrorInfo::code).orElse(null) == ErrorCode.TRANSACTION_ABORTED
+                    && commitAfterAbort.error().map(ErrorInfo::code).orElse(null) == ErrorCode.TRANSACTION_ABORTED;
 
             if (!postAbortRejected) {
                 passed = false;
-                stepLogs.add("GAGAL: Operasi setelah ABORTED tidak ditolak dengan INVALID_STATE");
+                stepLogs.add("GAGAL: Operasi setelah ABORTED tidak ditolak dengan TRANSACTION_ABORTED");
             } else {
-                stepLogs.add("requestRead/requestWrite/commit setelah ABORTED -> ditolak (INVALID_STATE)");
+                stepLogs.add("requestRead/requestWrite/commit setelah ABORTED -> ditolak (TRANSACTION_ABORTED)");
             }
         } catch (Exception e) {
             passed = false;
@@ -773,6 +721,43 @@ public class CCMDriver {
                 """,
                 true);
 
+        Scenario beginLogFailure = Scenario.fromScript(
+                "Koordinasi WAL - Kegagalan logBegin Membatalkan Transaksi Baru",
+                """
+                # protokol: lock
+                # seed: A=100
+                T1 BEGIN # fail_wal
+                T2 BEGIN
+                T2 R(A=100) # diizinkan
+                T2 COMMIT
+                """,
+                true);
+
+        Scenario commitLogFailure = Scenario.fromScript(
+                "Koordinasi WAL - Kegagalan logCommit (Hasil Commit Tidak Pasti, Tanpa Undo)",
+                """
+                # protokol: lock
+                # seed: A=100
+                T1 BEGIN
+                T1 W(A=200)
+                T1 COMMIT # fail_wal
+                """,
+                true);
+
+        Scenario rollbackRetried = Scenario.fromScript(
+                "Koordinasi Rollback - Kegagalan Sementara Diulang oleh FRMBridge",
+                """
+                # protokol: lock
+                # seed: A=100
+                T1 BEGIN
+                T1 W(A=250)
+                T1 ABORT # fail_wal
+                T2 BEGIN
+                T2 R(A=100) # diizinkan
+                T2 COMMIT
+                """,
+                true);
+
         Scenario ccmInvariants = new Scenario(
                 "Invarians CCM - beginTransaction Paralel, Penolakan setProtocol Aktif & Akses Pasca-Abort",
                 ProtocolType.LOCK_BASED,
@@ -793,12 +778,17 @@ public class CCMDriver {
                 timestampViolationAndRetry,
                 walFailureAbortsTx,
                 readOldValueAfterAbort,
+                beginLogFailure,
+                commitLogFailure,
+                rollbackRetried,
                 ccmInvariants);
     }
 
     public static void main(String[] args) {
         MockFRM mockFrm = new MockFRM();
-        IConcurrencyControlManager ccm = new ConcurrencyControlManager(mockFrm);
+        ConcurrencyControlManager ccm = new ConcurrencyControlManager(
+                mockFrm, CCMConfig.defaults().withRollbackRetry(3, 5));
+        System.out.println(ccm.describeProtocol());
         List<Scenario> scenarios = defaultScenarios();
         CCMDriver driver = new CCMDriver(ccm, scenarios, new SerializabilityVerifier(), mockFrm);
         for (Scenario scenario : scenarios) {

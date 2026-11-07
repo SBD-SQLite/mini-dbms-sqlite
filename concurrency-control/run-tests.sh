@@ -11,5 +11,7 @@ while IFS= read -r -d '' source; do
 done < <(find "$ccm_root/src/main/java" "$ccm_root/src/test/java" -name '*.java' -print0)
 
 javac --release 17 -d "$ccm_build/classes" "${sources[@]}"
-java -cp "$ccm_build/classes" sqlike.ccm.LockBasedProtocolTest
+for test_file in "$ccm_root"/src/test/java/sqlike/ccm/*Test.java; do
+    java -cp "$ccm_build/classes" "sqlike.ccm.$(basename "$test_file" .java)"
+done
 java -cp "$ccm_build/classes" sqlike.ccm.CCMDriver
