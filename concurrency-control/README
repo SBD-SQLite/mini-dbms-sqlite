@@ -41,7 +41,19 @@ Packages (src/main/java)
     ScheduleOperation, ScheduleRecorder, SerializabilityVerifier             serializability check (CC-09)
     CCMDriver, Scenario, MockFRM                                             standalone driver (CC-10)
 
-Build and run the driver (JDK 17 or newer), from the repository root:
+Build with Maven (Maven 3.9+), from the repository root:
+  mvn -pl concurrency-control -am compile        compile CCM and the root shared module
+  mvn -pl concurrency-control -am test-compile   also compile the tests in src/test/java
+  mvn test-compile                               compile every component at once
+Classes go to concurrency-control/target/classes and concurrency-control/target/test-classes.
+The tests are standalone classes, not JUnit, so mvn test only compiles them. Run them with java:
+  Linux / macOS:
+    java -cp "concurrency-control/target/classes:concurrency-control/target/test-classes:shared/target/classes" sqlike.ccm.CCMDriver
+  Windows (use ; instead of :):
+    java -cp "concurrency-control/target/classes;concurrency-control/target/test-classes;shared/target/classes" sqlike.ccm.CCMDriver
+Replace sqlike.ccm.CCMDriver with a test class such as sqlike.ccm.TransactionTest to run one test.
+
+Build and run the driver without Maven (JDK 17 or newer), from the repository root:
   javac --release 17 -d out $(find shared/src/main/java concurrency-control/src/main/java -name '*.java')
   java -cp out sqlike.ccm.CCMDriver
 The driver runs every scenario against ConcurrencyControlManager with MockFRM and prints

@@ -132,6 +132,29 @@ Seluruh kebutuhan fungsional wajib (`QP-01` s/d `QP-14`) serta kebutuhan bonus (
 - **Java Development Kit (JDK):** Versi 17 atau yang lebih baru (OpenJDK 17 / 21).
 - **Sistem Operasi:** Linux / macOS / Windows (via Git Bash / WSL).
 
+### Kompilasi dengan Maven
+
+Semua komponen terdaftar sebagai modul Maven di `pom.xml` root. Jalankan perintah berikut dari **root repositori** (butuh Maven 3.9+):
+
+```bash
+mvn -pl query-processor -am compile        # kompilasi kode utama QP (termasuk src/stubs/java)
+mvn -pl query-processor -am test-compile   # kompilasi kode utama + test driver
+mvn test-compile                           # kompilasi seluruh komponen sekaligus
+```
+
+Hasil kompilasi ada di `query-processor/target/classes` dan `query-processor/target/test-classes`. Test driver QP bukan JUnit, jadi `mvn test` hanya mengompilasi dan tidak menjalankannya. Jalankan driver langsung dengan `java`:
+
+```bash
+# Linux / macOS
+java -cp "query-processor/target/classes:query-processor/target/test-classes" sqlike.qp.QP2TestDriver
+# Windows (Git Bash / PowerShell / cmd)
+java -cp "query-processor/target/classes;query-processor/target/test-classes" sqlike.qp.QP2TestDriver
+```
+
+Ganti `sqlike.qp.QP2TestDriver` dengan `QP1Driver --test`, `QP3TestDriver`, `QP4TestDriver`, atau `Qp5AcceptanceTest` sesuai kebutuhan.
+
+> QP masih memakai salinan `sqlike.shared` miliknya sendiri (`src/main/java/sqlike/shared`), sehingga modul ini belum bergantung pada modul `shared` global. Setelah salinan lokal dihapus, tambahkan dependency `sqlike-shared` di `query-processor/pom.xml`.
+
 ### A. Menjalankan Seluruh Test Suite Otomatis
 
 Jalankan seluruh rangkaian tes (QP1 s/d QP5) dari root repositori:

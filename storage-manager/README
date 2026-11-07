@@ -1,1 +1,21 @@
 Storage Manager
+
+## Kompilasi dengan Maven
+
+Semua komponen terdaftar sebagai modul Maven di `pom.xml` root, dan SM bergantung pada modul `shared`. Jalankan dari **root repositori** (butuh JDK 17+ dan Maven 3.9+):
+
+```bash
+mvn -pl storage-manager -am compile        # kompilasi SM beserta modul shared
+mvn -pl storage-manager -am test-compile   # kompilasi kode utama + test (jika ada src/test/java)
+mvn test-compile                           # kompilasi seluruh komponen sekaligus
+```
+
+Hasil kompilasi ada di `storage-manager/target/classes`. Jalankan driver langsung dengan `java`:
+
+```bash
+# Linux / macOS
+java -cp "storage-manager/target/classes:shared/target/classes" sqlike.storage.StorageDriver
+
+# Windows (ganti : dengan ;)
+java -cp "storage-manager/target/classes;shared/target/classes" sqlike.storage.StorageDriver
+```
