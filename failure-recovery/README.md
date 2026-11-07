@@ -119,9 +119,8 @@ memakai satu maintenance lock.
 ## Status integrasi (Milestone 2)
 
 Branch ini mengikuti `develop/frm`: `LogManager` FR2 (PR #64), `RecoveryManager` FR5, dan
-`MaintenanceService` FR4 (checkpoint, checkpoint berkala, PITR, `WalRecoveryLog`). `WalRecoveryLog`
-sudah disesuaikan dengan API FR2 (`logCheckpoint(flushedThroughLSN, snapshotId)`, `readHistory()`
-semua epoch, `archiveActiveLog` + `startNewLog(snapshotId, targetLSN)`). Saat startup pertama, facade
+`MaintenanceService` FR4 (checkpoint, checkpoint berkala, PITR, `WalRecoveryLog` yang sudah
+mengikuti API FR2 sejak PR #65). Saat startup pertama, facade
 membuat satu checkpoint sebagai snapshot dasar PITR. `lastTxId` hasil recovery memakai
 `max(hasil FR5, LogManager.getMaxTxId())` supaya txId dari epoch arsip tidak dipakai ulang setelah PITR.
 `close()` juga menutup `LogManager` (melepas `<wal>.lock`). Kegagalan WAL yang butuh recovery
@@ -142,6 +141,6 @@ urut LSN menurun) sebelum `logAbort` diterima; tanpa itu muncul `WalException "R
 |---|---|
 | FR2 | Selesai (PR #64) |
 | FR3 | Skenario `rollback`, `aborted-and-committed`. `feat/frm/rollback-v2` perlu di-rebase ke `develop/frm` terbaru, lalu: sebelum tiap undo panggil `clr = logManager.logCompensation(txId, record.lsn())` dan tulis before-image dengan `sm.writeAt(table, rid, before, clr.lsn())`; lewati perubahan yang sudah punya CLR (`undoOfLSN`); `RollbackTests` tidak boleh lagi `extends LogManager` (kelasnya `final`), pakai `LogManager` asli di folder sementara. Setelah merge, konstruktor facade memasang `new RollbackManager(log, sm)` |
-| FR4 | Selesai (`WalRecoveryLog` disesuaikan di branch ini) |
+| FR4 | Selesai (PR #65) |
 | FR5 | Skenario `uncommitted-flushed`, `checkpoint-recovery`. Di fase undo, untuk transaksi tanpa COMMIT/ABORT: per perubahan yang belum punya CLR, urut LSN menurun, panggil `logCompensation(txId, rec.lsn())` lalu tulis before-image dengan LSN CLR tersebut; baru setelah itu `logAbort(txId)`. Abaikan record COMPENSATION saat klasifikasi redo/undo |
 | Kontrak | Saat `contracts/` root ada: hapus salinan `IConcurrencyControlManager`, `IStorageManager`, `IWalDurability`, `sqlike.storage.*` di modul ini; ganti penantian di `ConcurrencyControlAdapter` dengan `awaitNoActiveTransactions(timeoutMs)`; tambah `logSchemaChange` (tipe `SchemaChange` sudah ada dari FR2) |

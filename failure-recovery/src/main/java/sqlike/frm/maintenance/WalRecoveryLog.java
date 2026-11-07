@@ -9,10 +9,7 @@ import sqlike.frm.log.LogManager;
 import sqlike.frm.log.LogRecord;
 import sqlike.frm.pitr.HistoricalLogPort;
 
-/**
- * {@link CheckpointLogPort} and {@link HistoricalLogPort} backed by {@link LogManager}. Snapshot
- * IDs are recorded in {@code SnapshotCatalog}; the CHECKPOINT record also carries them.
- */
+/** {@link CheckpointLogPort} and {@link HistoricalLogPort} backed by {@link LogManager}. */
 public class WalRecoveryLog implements CheckpointLogPort, HistoricalLogPort {
 
     private final LogManager wal;
@@ -36,23 +33,14 @@ public class WalRecoveryLog implements CheckpointLogPort, HistoricalLogPort {
         return wal.logCheckpoint(flushedThroughLSN, snapshotId);
     }
 
-    /** Every epoch, archived ones first, in LSN order. */
     @Override
     public List<LogRecord> readHistory() {
         return wal.readHistory();
     }
 
-    /**
-     * Archives the old timeline and opens a new WAL epoch whose LSNs continue after the last one.
-     * Snapshots are tracked by {@code SnapshotCatalog}, so the epoch marker only names the cut.
-     */
     @Override
-    public void separateHistory() {
-        long boundary = wal.getLastLsn();
+    public void separateHistory(String snapshotId, long targetLSN) {
         wal.archiveActiveLog();
-        wal.startNewLog(EPOCH_MARKER_PREFIX + boundary, boundary);
+        wal.startNewLog(snapshotId, targetLSN);
     }
-
-    /** Label of the CHECKPOINT marker that starts a new epoch after PITR. */
-    public static final String EPOCH_MARKER_PREFIX = "pitr-cut-";
 }

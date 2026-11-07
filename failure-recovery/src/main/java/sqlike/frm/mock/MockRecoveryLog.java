@@ -93,9 +93,14 @@ public class MockRecoveryLog implements CheckpointLogPort, HistoricalLogPort {
     }
 
     @Override
-    public synchronized void separateHistory() {
+    public synchronized void separateHistory(String snapshotId, long targetLSN) {
+        if (targetLSN < 0 || targetLSN > lastLsn) {
+            throw new IllegalArgumentException("target LSN " + targetLSN + " is outside the log");
+        }
         archived.addAll(active);
         active.clear();
+        CheckpointInfo marker = new CheckpointInfo(lastLsn + 1L, lastLsn, clock.get(), snapshotId);
+        append(Optional.empty(), LogType.CHECKPOINT, Optional.empty(), Optional.of(marker));
     }
 
     public synchronized List<LogRecord> activeLog() {

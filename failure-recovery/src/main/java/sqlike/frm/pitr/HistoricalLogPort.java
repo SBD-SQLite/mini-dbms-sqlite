@@ -19,9 +19,10 @@ public interface HistoricalLogPort {
     List<LogRecord> readHistory();
 
     /**
-     * Moves the active log into the archive and opens a new active log that continues LSNs after
-     * the last one. Called after a historical restore so crash recovery never redoes the
-     * discarded timeline.
+     * Archives the active log and opens a new one that starts with a CHECKPOINT marker for
+     * {@code snapshotId}. LSNs continue after the last one, and records after {@code targetLSN}
+     * belong to the discarded timeline. Called after a historical restore so crash recovery
+     * never redoes that timeline.
      */
-    void separateHistory();
+    void separateHistory(String snapshotId, long targetLSN);
 }
