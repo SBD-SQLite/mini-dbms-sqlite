@@ -1,4 +1,4 @@
-pacakge sqlike.block
+package sqlike.block
 
 
 public class BufferFrame{
