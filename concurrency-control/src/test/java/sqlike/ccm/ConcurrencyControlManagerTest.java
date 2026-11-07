@@ -31,6 +31,7 @@ public final class ConcurrencyControlManagerTest {
     public static void main(String[] args) throws Exception {
         Check check = new Check("CCM facade");
         check.test("begin is rejected until recovery finished", ConcurrencyControlManagerTest::beginBeforeReady);
+        check.test("a failed logBegin aborts the transaction", ConcurrencyControlManagerTest::logBeginFails);
         check.done();
     }
 
@@ -71,5 +72,16 @@ public final class ConcurrencyControlManagerTest {
         require(code(early.error()) == ErrorCode.INVALID_STATE, "the error must be INVALID_STATE");
         ccm.initAfterRecovery(7);
         require(ccm.beginTransaction().txId() == 8, "ids continue after lastTxId");
+    }
+
+    private static void logBeginFails() {
+        Rig r = rig();
+        r.frm().setFailOnOperation("logBegin", 1);
+        TransactionResponse failed = r.ccm().beginTransaction();
+        require(failed.status() == TransactionStatus.ABORTED, "status must be ABORTED");
+        require(code(failed.error()) == ErrorCode.WAL_FAILURE, "error must be WAL_FAILURE");
+        require(!r.frm().wasRolledBack(failed.txId()), "nothing was logged, so nothing is undone");
+        TransactionResponse next = r.ccm().beginTransaction();
+        require(next.status() == TransactionStatus.ACTIVE && next.txId() > failed.txId(), "ids are not reused");
     }
 }

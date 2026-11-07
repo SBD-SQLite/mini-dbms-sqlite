@@ -53,8 +53,13 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
             return new TransactionResponse(0L, 0L, TransactionStatus.FAILED,
                     Optional.of(error(ErrorCode.INVALID_STATE, e.getMessage())));
         }
-        // TODO(CC3): if logging BEGIN fails, abort the transaction instead of returning ACTIVE.
-        frmBridge.logBegin(tx.getTxId());
+        try {
+            frmBridge.logBegin(tx.getTxId());
+        } catch (FrmFailureException e) {
+            transactions.setStatus(tx.getTxId(), TransactionStatus.FAILED);
+            transactions.setStatus(tx.getTxId(), TransactionStatus.ABORTED);
+            return withError(tx, error(ErrorCode.WAL_FAILURE, e.getMessage()));
+        }
         protocol.onBegin(tx);
         return tx.toResponse();
     }
