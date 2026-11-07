@@ -46,6 +46,9 @@ public final class ConcurrencyControlManagerTest {
         check.test("abort waits for a running apply", ConcurrencyControlManagerTest::abortWaitsForApply);
         check.test("an apply that never ends leaves the transaction FAILED", ConcurrencyControlManagerTest::applyTimeoutOnAbort);
         check.test("commit does not run while an apply is in flight", ConcurrencyControlManagerTest::applyTimeoutOnCommit);
+        check.test("pause holds new transactions but not running ones", ConcurrencyControlManagerTest::gate);
+        check.test("initAfterRecovery keeps a paused gate closed", ConcurrencyControlManagerTest::recoveryKeepsGate);
+        check.test("the protocol can change only when idle", ConcurrencyControlManagerTest::protocolChange);
         check.done();
     }
 
@@ -329,5 +332,48 @@ public final class ConcurrencyControlManagerTest {
         require(!r.frm().wasCommitted(tx), "COMMIT must not be logged");
         r.ccm().endApply(tx, lsn);
         require(r.ccm().abort(tx).status() == TransactionStatus.ABORTED, "the transaction can still be aborted");
+    }
+
+    private static void gate() throws Exception {
+        Rig r = rig();
+        long running = begin(r);
+        r.ccm().pauseNewTransactions();
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<TransactionResponse> held = pool.submit(() -> r.ccm().beginTransaction());
+            expectBlocked(held);
+            granted(r.ccm().requestWrite(running, change("a", 0)));
+            require(!r.ccm().awaitNoActiveTransactions(50), "must time out while a transaction runs");
+            require(r.ccm().commit(running).status() == TransactionStatus.COMMITTED, "a running transaction may commit");
+            require(r.ccm().awaitNoActiveTransactions(500), "idle after the commit");
+            r.ccm().resumeTransactions();
+            require(get(held).status() == TransactionStatus.ACTIVE, "the held transaction starts after resume");
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    private static void recoveryKeepsGate() throws Exception {
+        Rig r = rig();
+        r.ccm().pauseNewTransactions();
+        r.ccm().initAfterRecovery(5);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<TransactionResponse> held = pool.submit(() -> r.ccm().beginTransaction());
+            expectBlocked(held);
+            r.ccm().resumeTransactions();
+            require(get(held).txId() == 6, "ids continue after lastTxId once the gate opens");
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    private static void protocolChange() throws Exception {
+        Rig r = rig();
+        long tx = begin(r);
+        rejects(IllegalStateException.class, () -> r.ccm().setProtocol(ProtocolType.TIMESTAMP_BASED));
+        r.ccm().commit(tx);
+        r.ccm().setProtocol(ProtocolType.TIMESTAMP_BASED);
+        require(r.ccm().getActiveProtocol() == ProtocolType.TIMESTAMP_BASED, "the protocol must change when idle");
     }
 }

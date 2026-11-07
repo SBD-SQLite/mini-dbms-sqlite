@@ -210,13 +210,11 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
     @Override
     public void setProtocol(ProtocolType protocol) {
         Objects.requireNonNull(protocol, "protocol");
-        if (transactions.hasActive()) {
-            throw new IllegalStateException("Cannot change protocol while transactions are active");
-        }
-        // TODO(CC1): block new transactions while the protocol is being replaced.
-        if (this.protocol.getType() != protocol) {
-            this.protocol = createProtocol(protocol);
-        }
+        transactions.runIfNoneActive(() -> {
+            if (this.protocol.getType() != protocol) {
+                this.protocol = createProtocol(protocol);
+            }
+        });
     }
 
     @Override
@@ -234,6 +232,11 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
     @Override
     public void awaitNoActiveTransactions() {
         transactions.awaitNoActive();
+    }
+
+    @Override
+    public boolean awaitNoActiveTransactions(long timeoutMs) {
+        return transactions.awaitNoActive(timeoutMs);
     }
 
     @Override
