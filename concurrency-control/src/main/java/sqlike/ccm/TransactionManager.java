@@ -40,13 +40,20 @@ public class TransactionManager {
     private final Map<Long, Transaction> transactions = new ConcurrentHashMap<>();
     private long nextTxId = 1;
     private boolean paused;
+    private boolean ready;
     private int unfinished;
 
     /** Creates an ACTIVE transaction with a unique, increasing txId. Waits while paused. */
     public Transaction create() {
         lock.lock();
         try {
-            while (paused) {
+            while (true) {
+                if (!ready) {
+                    throw new IllegalStateException("CCM is not ready: recovery has not finished");
+                }
+                if (!paused) {
+                    break;
+                }
                 gateChanged.await();
             }
             long txId = nextTxId++;
@@ -109,7 +116,29 @@ public class TransactionManager {
             transactions.clear();
             nextTxId = lastTxId + 1;
             unfinished = 0;
+            ready = true;
             idle.signalAll();
+            gateChanged.signalAll();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public boolean isReady() {
+        lock.lock();
+        try {
+            return ready;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Stops new transactions until the next {@link #resetAfterRecovery(long)} (fail-stop). */
+    public void markNotReady() {
+        lock.lock();
+        try {
+            ready = false;
+            gateChanged.signalAll();
         } finally {
             lock.unlock();
         }

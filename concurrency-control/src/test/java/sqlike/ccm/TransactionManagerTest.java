@@ -22,6 +22,10 @@ public final class TransactionManagerTest {
         check.test("awaitNoActive times out while a transaction is unfinished", TransactionManagerTest::awaitTimesOut);
         check.test("awaitNoActive wakes when the last transaction ends", TransactionManagerTest::awaitWakes);
         check.test("pause is idempotent and recovery keeps the gate", TransactionManagerTest::resetKeepsGate);
+        check.test("create is rejected before recovery", TransactionManagerTest::rejectedBeforeRecovery);
+        check.test("recovery opens the manager after lastTxId", TransactionManagerTest::opensAfterRecovery);
+        check.test("markNotReady stops new transactions until recovery", TransactionManagerTest::notReadyAgain);
+        check.test("a waiting creator is rejected when the manager stops being ready", TransactionManagerTest::waiterRejected);
         check.done();
     }
 
@@ -124,6 +128,47 @@ public final class TransactionManagerTest {
             expectBlocked(blocked);
             m.resume();
             require(get(blocked).getTxId() == 6, "ids continue after lastTxId");
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    private static void rejectedBeforeRecovery() throws Exception {
+        TransactionManager m = new TransactionManager();
+        require(!m.isReady(), "a new manager is not ready");
+        rejects(IllegalStateException.class, () -> m.create());
+    }
+
+    private static void opensAfterRecovery() {
+        TransactionManager m = new TransactionManager();
+        m.resetAfterRecovery(41);
+        require(m.isReady(), "recovery makes the manager ready");
+        Transaction tx = m.create();
+        require(tx.getTxId() == 42 && tx.getTimestamp() == 42, "id and timestamp continue after lastTxId");
+    }
+
+    private static void notReadyAgain() throws Exception {
+        TransactionManager m = manager();
+        m.markNotReady();
+        rejects(IllegalStateException.class, () -> m.create());
+        m.resetAfterRecovery(0);
+        require(m.create().getTxId() == 1, "recovery reopens the manager");
+    }
+
+    private static void waiterRejected() throws Exception {
+        TransactionManager m = manager();
+        m.pause();
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<Transaction> blocked = pool.submit(() -> m.create());
+            expectBlocked(blocked);
+            m.markNotReady();
+            try {
+                blocked.get(2, java.util.concurrent.TimeUnit.SECONDS);
+                throw new AssertionError("the waiting creator must be rejected");
+            } catch (java.util.concurrent.ExecutionException e) {
+                require(e.getCause() instanceof IllegalStateException, "rejection must be an IllegalStateException");
+            }
         } finally {
             pool.shutdownNow();
         }
