@@ -19,6 +19,13 @@ public class MutationTargetCollector {
         return storage;
     }
 
+    public List<StoredRecord> collect(Operator source, sqlike.qp.port.QpContracts.TableId tableId, ExecutionContext context) {
+        if (tableId == null) {
+            throw new IllegalArgumentException("Target table cannot be null in MutationTargetCollector");
+        }
+        return collect(source, tableId.value(), context);
+    }
+
     public List<StoredRecord> collect(Operator source, String tableName, ExecutionContext context) {
         if (source == null) {
             throw new IllegalArgumentException("Source operator cannot be null in MutationTargetCollector");

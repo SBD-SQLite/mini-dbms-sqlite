@@ -11,4 +11,16 @@ public record CreateIndexSpec(IndexMetadata definition) {
             throw new IllegalArgumentException("Index definition cannot be null in CreateIndexSpec");
         }
     }
+
+    public IndexMetadata value() {
+        return definition;
+    }
+
+    public sqlike.qp.port.QpContracts.TableId tableId() {
+        return new sqlike.qp.port.QpContracts.TableId(definition.tableName());
+    }
+
+    public String tableName() {
+        return definition.tableName();
+    }
 }

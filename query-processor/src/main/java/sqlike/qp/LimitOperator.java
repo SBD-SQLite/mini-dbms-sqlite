@@ -1,0 +1,75 @@
+package sqlike.qp;
+
+import java.util.Optional;
+import sqlike.shared.LimitSpec;
+
+/**
+ * Physical operator for LIMIT <count> (QP-16* / PRD §13).
+ * Preserves output schema even when count is 0 and closes the child operator immediately
+ * once the row limit is reached.
+ */
+public final class LimitOperator extends AbstractUnaryOperator {
+    private final LimitSpec spec;
+    private long remaining;
+    private boolean childClosed;
+
+    public LimitOperator(Operator child, LimitSpec spec, Schema schema) {
+        super(child, schema);
+        if (spec == null) {
+            throw new IllegalArgumentException("LimitSpec cannot be null in LimitOperator");
+        }
+        if (spec.count() < 0) {
+            throw new IllegalArgumentException("LIMIT count cannot be negative: " + spec.count());
+        }
+        this.spec = spec;
+    }
+
+    public LimitOperator(Operator child, LimitSpec spec) {
+        this(child, spec, child != null ? child.schema() : Schema.of(java.util.List.of()));
+    }
+
+    public LimitSpec getSpec() {
+        return spec;
+    }
+
+    @Override
+    protected void doOpen() {
+        this.remaining = spec.count();
+        this.childClosed = false;
+        child.open(requireContext());
+        if (this.remaining == 0) {
+            closeChildOnce();
+        }
+    }
+
+    @Override
+    protected Optional<RowEnvelope> doNext() {
+        if (remaining <= 0) {
+            closeChildOnce();
+            return Optional.empty();
+        }
+        Optional<RowEnvelope> next = child.next();
+        if (next.isEmpty()) {
+            closeChildOnce();
+            return Optional.empty();
+        }
+        remaining--;
+        if (remaining == 0) {
+            closeChildOnce();
+        }
+        return next;
+    }
+
+    @Override
+    protected void doClose() {
+        closeChildOnce();
+    }
+
+    private void closeChildOnce() {
+        if (!childClosed) {
+            childClosed = true;
+            child.close();
+        }
+    }
+}
+

@@ -18,4 +18,8 @@ public record ResourceId(
     public static ResourceId ofRecord(String tableName, RID rid) {
         return new ResourceId(ResourceScope.RECORD, tableName, Optional.of(rid));
     }
+
+    public static ResourceId ofCatalog() {
+        return new ResourceId(ResourceScope.CATALOG, "__catalog__", Optional.empty());
+    }
 }

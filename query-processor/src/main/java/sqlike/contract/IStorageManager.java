@@ -2,6 +2,7 @@ package sqlike.contract;
 
 import java.util.List;
 import java.util.Optional;
+import sqlike.shared.DropBehavior;
 import sqlike.shared.IndexCondition;
 import sqlike.shared.IndexMetadata;
 import sqlike.shared.InsertReservation;
@@ -9,41 +10,75 @@ import sqlike.shared.RID;
 import sqlike.shared.Record;
 import sqlike.shared.RecordCursor;
 import sqlike.shared.RecordImage;
+import sqlike.shared.SchemaImage;
 import sqlike.shared.TableSchema;
 import sqlike.shared.TableStatistics;
 import sqlike.shared.Value;
-import sqlike.storage.StorageException;
 
 public interface IStorageManager {
-    RecordCursor scan(String table) throws StorageException;
+    RecordCursor scan(String table);
 
-    Optional<Record> fetch(String table, RID rid) throws StorageException;
+    Optional<Record> fetch(String table, RID rid);
 
-    InsertReservation reserveInsert(String table, List<Value> values) throws StorageException;
+    InsertReservation reserveInsert(String table, List<Value> values);
 
-    RID insert(InsertReservation reservation, long lsn) throws StorageException;
+    RID insert(InsertReservation reservation, long lsn);
 
-    void update(String table, RID rid, List<Value> values, long lsn) throws StorageException;
+    void update(String table, RID rid, List<Value> values, long lsn);
 
-    void delete(String table, RID rid, long lsn) throws StorageException;
+    void delete(String table, RID rid, long lsn);
 
-    void releaseReservation(InsertReservation reservation) throws StorageException;
+    void releaseReservation(InsertReservation reservation);
 
-    void restoreRecord(String table, RID rid, RecordImage image, long lsn) throws StorageException;
+    void restoreRecord(String table, RID rid, RecordImage image, long lsn);
 
-    List<String> listTables() throws StorageException;
+    List<String> listTables();
 
-    TableSchema getSchema(String table) throws StorageException;
+    TableSchema getSchema(String table);
 
-    TableStatistics getStatistics(String table) throws StorageException;
+    TableStatistics getStatistics(String table);
 
-    void createIndex(IndexMetadata definition) throws StorageException;
+    List<IndexMetadata> getIndexes(String table);
 
-    List<IndexMetadata> getIndexes(String table) throws StorageException;
+    void createIndex(IndexMetadata definition);
 
-    List<RID> lookupIndex(String name, IndexCondition condition) throws StorageException;
+    List<RID> lookupIndex(String name, IndexCondition condition);
 
-    void flushAll() throws StorageException;
+    void flushAll();
 
-    void close() throws StorageException;
+    default void close() {
+    }
+
+    // Class diagram Tab 6 signatures
+    default void createTable(TableSchema schema) {
+        createTable(schema, 1L);
+    }
+
+    default void dropTable(String table, DropBehavior behavior) {
+        dropTable(table, behavior, 1L);
+    }
+
+    // PRD §3.3 LSN-bearing schema & snapshot signatures
+    default void createTable(TableSchema schema, long lsn) {
+        throw new UnsupportedOperationException("createTable is not implemented");
+    }
+
+    default void dropTable(String table, DropBehavior behavior, long lsn) {
+        throw new UnsupportedOperationException("dropTable is not implemented");
+    }
+
+    default void restoreSchema(SchemaImage image, long lsn) {
+        throw new UnsupportedOperationException("restoreSchema is not implemented");
+    }
+
+    default void createIndex(IndexMetadata definition, long lsn) {
+        createIndex(definition);
+    }
+
+    default String createSnapshot() {
+        return "snap-0";
+    }
+
+    default void restoreSnapshot(String snapshotId) {
+    }
 }

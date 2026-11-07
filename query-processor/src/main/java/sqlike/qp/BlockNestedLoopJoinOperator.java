@@ -1,4 +1,5 @@
 package sqlike.qp;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -9,6 +10,8 @@ import sqlike.shared.JoinSpec;
 import sqlike.shared.JoinType;
 
 public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
+    private static final long DEFAULT_MAX_OUTER_BYTES = 64L * 1024L;
+
     private JoinSpec spec;
     private JoinLayout layout;
     private IExpressionEvaluator evaluator;
@@ -24,19 +27,33 @@ public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
     private List<RowEnvelope> mockRows;
     private int mockPosition;
 
-    public BlockNestedLoopJoinOperator(Operator left, Operator right, JoinSpec spec, JoinLayout layout, IExpressionEvaluator evaluator, IValueComparator comparator, RowSizeEstimator estimator, Schema schema) {
-        super(left, right, schema);
+    public BlockNestedLoopJoinOperator(
+            Operator left,
+            Operator right,
+            JoinSpec spec,
+            JoinLayout layout,
+            IExpressionEvaluator evaluator,
+            IValueComparator comparator,
+            RowSizeEstimator estimator,
+            Schema schema) {
+        super(
+                left,
+                right,
+                layout != null && Objects.equals(schema, layout.getOutputSchema())
+                        ? layout.getOutputSchema()
+                        : schema);
         this.spec = Objects.requireNonNull(spec);
         this.layout = Objects.requireNonNull(layout);
         this.evaluator = Objects.requireNonNull(evaluator);
         this.comparator = Objects.requireNonNull(comparator);
         this.estimator = Objects.requireNonNull(estimator);
-        if (spec.algorithm() != JoinAlgorithm.BLOCK_NESTED_LOOP || spec.joinType() == null
+        if (spec.algorithm() != JoinAlgorithm.BLOCK_NESTED_LOOP
+                || spec.joinType() == null
                 || !schema.equals(layout.getOutputSchema())) {
-            throw new IllegalArgumentException("Join fixture requires BNLJ and the layout output schema");
+            throw new IllegalArgumentException("Join requires BNLJ and the layout output schema");
         }
         if (spec.joinType() == JoinType.THETA && spec.condition().isEmpty()) {
-            throw new IllegalArgumentException("THETA fixture requires a bound join condition");
+            throw new IllegalArgumentException("THETA join requires a bound join condition");
         }
         var columns = new ArrayList<>(left.schema().columns());
         columns.addAll(right.schema().columns());
@@ -52,7 +69,7 @@ public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
         currentInner = Optional.empty();
         outerIndex = 0;
         batchBytes = 0;
-        maxOuterBytes = 0;
+        maxOuterBytes = DEFAULT_MAX_OUTER_BYTES;
         outerEnded = false;
     }
 
@@ -76,9 +93,24 @@ public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
         return estimator;
     }
 
+    public void setMaxOuterBytes(long maxOuterBytes) {
+        if (maxOuterBytes <= 0) {
+            throw new IllegalArgumentException("maxOuterBytes must be positive");
+        }
+        this.maxOuterBytes = maxOuterBytes;
+    }
+
+    public long getMaxOuterBytes() {
+        return maxOuterBytes;
+    }
+
     public void setMockRows(List<RowEnvelope> rows) {
         if (getState() != OperatorState.NEW && getState() != OperatorState.CLOSED) {
             throw new QpException(ErrorCode.INVALID_STATE, "Close join before changing its fixture");
+        }
+        if (rows == null) {
+            mockRows = null;
+            return;
         }
         List<RowEnvelope> copy = List.copyOf(rows);
         for (RowEnvelope row : copy) {
@@ -91,20 +123,54 @@ public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
 
     @Override
     protected void doOpen() {
-        if (mockRows == null) {
-            throw new QpException(ErrorCode.INVALID_STATE, "Register M1 join rows before open");
-        }
         clearBatch();
         pendingOuter = Optional.empty();
         currentInner = Optional.empty();
         outerEnded = false;
         mockPosition = 0;
         super.doOpen();
+        if (mockRows == null) {
+            try {
+                if (fillOuterBatch()) {
+                    currentInner = right.next();
+                    outerIndex = 0;
+                }
+            } catch (RuntimeException | Error error) {
+                try {
+                    doClose();
+                } catch (RuntimeException | Error cleanupError) {
+                    if (cleanupError != error) {
+                        error.addSuppressed(cleanupError);
+                    }
+                }
+                throw error;
+            }
+        }
     }
 
     @Override
     protected Optional<RowEnvelope> doNext() {
-        return mockPosition < mockRows.size() ? Optional.of(mockRows.get(mockPosition++)) : Optional.empty();
+        if (mockRows != null) {
+            return mockPosition < mockRows.size() ? Optional.of(mockRows.get(mockPosition++)) : Optional.empty();
+        }
+        while (!outerBatch.isEmpty()) {
+            while (currentInner.isPresent()) {
+                RowEnvelope rightRow = currentInner.get();
+                while (outerIndex < outerBatch.size()) {
+                    RowEnvelope leftRow = outerBatch.get(outerIndex++);
+                    if (matches(leftRow, rightRow)) {
+                        return Optional.of(layout.combineForOutput(leftRow, rightRow));
+                    }
+                }
+                outerIndex = 0;
+                currentInner = right.next();
+            }
+            if (!fillOuterBatch()) {
+                break;
+            }
+            reopenInner();
+        }
+        return Optional.empty();
     }
 
     @Override
@@ -120,14 +186,72 @@ public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
         }
     }
 
-    // helper algoritma masih dummy M1, aktifkan saat BNLJ penuh mulai dikerjakan.
-    private boolean fillOuterBatch() {return false;}
+    private boolean fillOuterBatch() {
+        clearBatch();
+        if (pendingOuter.isPresent()) {
+            RowEnvelope pending = pendingOuter.get();
+            pendingOuter = Optional.empty();
+            long size = estimator.estimate(pending);
+            outerBatch.add(pending);
+            batchBytes += size;
+        }
+        long budget = maxOuterBytes > 0 ? maxOuterBytes : DEFAULT_MAX_OUTER_BYTES;
+        while (!outerEnded) {
+            Optional<RowEnvelope> nextOuter = left.next();
+            if (nextOuter.isEmpty()) {
+                outerEnded = true;
+                break;
+            }
+            RowEnvelope row = nextOuter.get();
+            long rowBytes = estimator.estimate(row);
+            if (!outerBatch.isEmpty() && batchBytes + rowBytes > budget) {
+                pendingOuter = Optional.of(row);
+                break;
+            }
+            outerBatch.add(row);
+            batchBytes += rowBytes;
+        }
+        outerIndex = 0;
+        return !outerBatch.isEmpty();
+    }
 
-    private void reopenInner() {}
+    private void reopenInner() {
+        right.close();
+        right.open(requireContext());
+        currentInner = right.next();
+        outerIndex = 0;
+    }
 
-    private boolean matches(RowEnvelope left, RowEnvelope right) {return false;}
+    private boolean matches(RowEnvelope leftRow, RowEnvelope rightRow) {
+        return switch (spec.joinType()) {
+            case CARTESIAN -> spec.condition().isEmpty()
+                    || evaluator.evaluateCondition(
+                            spec.condition().get(),
+                            layout.combineForPredicate(leftRow, rightRow),
+                            layout.getInputSchema());
+            case THETA -> evaluator.evaluateCondition(
+                    spec.condition().orElseThrow(() -> new IllegalStateException("THETA join missing condition")),
+                    layout.combineForPredicate(leftRow, rightRow),
+                    layout.getInputSchema());
+            case NATURAL -> naturalMatches(leftRow, rightRow)
+                    && (spec.condition().isEmpty()
+                            || evaluator.evaluateCondition(
+                                    spec.condition().get(),
+                                    layout.combineForPredicate(leftRow, rightRow),
+                                    layout.getInputSchema()));
+        };
+    }
 
-    private boolean naturalMatches(RowEnvelope left, RowEnvelope right) {return false;}
+    private boolean naturalMatches(RowEnvelope leftRow, RowEnvelope rightRow) {
+        for (String colName : spec.commonColumns()) {
+            int leftOffset = left.schema().findColumnOffset(null, colName);
+            int rightOffset = right.schema().findColumnOffset(null, colName);
+            if (!comparator.equal(leftRow.row().getValue(leftOffset), rightRow.row().getValue(rightOffset))) {
+                return false;
+            }
+        }
+        return true;
+    }
 
     private void clearBatch() {
         outerBatch.clear();

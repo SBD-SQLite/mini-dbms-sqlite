@@ -1,4 +1,5 @@
 package sqlike.qp;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -17,11 +18,13 @@ import sqlike.shared.SortDirection;
 import sqlike.shared.SortSpec;
 import sqlike.shared.Value;
 
-/** M1 fixture/lifecycle checks; expected rows are scripted, not computed by BNLJ or sort. */
+/**
+ * QP4 verification driver testing both real BNLJ / Sort execution and lifecycle contracts.
+ */
 public class QP4TestDriver {
     private static final IValueComparator VALUES = new ValueComparator();
     private static final IExpressionEvaluator EVALUATOR = new ExpressionEvaluator(VALUES);
-    private static final ExecutionContext CONTEXT = ExecutionContext.of(41, "qp4-m1");
+    private static final ExecutionContext CONTEXT = ExecutionContext.of(41, "qp4-test");
     private static int scenarios;
     private static int checks;
 
@@ -30,11 +33,13 @@ public class QP4TestDriver {
         run("comparator direction, numeric promotion and ties", QP4TestDriver::comparator);
         run("logical estimator and UTF-8 byte sizes", QP4TestDriver::estimator);
         run("explicit Cartesian/theta/natural fixtures and rescan", QP4TestDriver::joins);
-        run("empty fixtures, invalid state and fixture ownership", QP4TestDriver::lifecycle);
+        run("empty inputs, invalid state and fixture ownership", QP4TestDriver::lifecycle);
         run("ASC/DESC/default sort fixtures and RID preservation", QP4TestDriver::sorts);
         run("QP3 filter/project composition and three-table lifecycle", QP4TestDriver::composition);
         run("partial open and cleanup errors", QP4TestDriver::failures);
-        System.out.println("QP4 M1: " + scenarios + "/8 scenarios, " + checks + " checks PASS (fixtures only)");
+        run("real BNLJ algorithm (Cartesian, Theta, Natural, multi-batch, 3-table)", QP4TestDriver::realBnlj);
+        run("real SortOperator materialization and sorting (ASC, DESC, ties, RID)", QP4TestDriver::realSort);
+        System.out.println("QP4: " + scenarios + "/10 scenarios, " + checks + " checks PASS");
     }
 
     private static void layout() {
@@ -45,6 +50,8 @@ public class QP4TestDriver {
         JoinLayout layout = new JoinLayout(left, right, output, mapping);
         mapping.set(0, 1);
         check(layout.getInputSchema().columnCount() == 4, "predicate schema concatenates both children");
+        check(layout.getInputSchema().findColumnOffset("A", "id") == 0, "left table prefix resolves to left offset");
+        check(layout.getInputSchema().findColumnOffset("B", "id") == 2, "right table prefix resolves to right offset");
         check(layout.getOutputMapping().equals(List.of(0, 3)), "mapping copied defensively");
         RowEnvelope a = RowEnvelope.of(row(1, 10), new RID(new PageId("A", 0), 0));
         RowEnvelope b = RowEnvelope.of(row(1, 20), new RID(new PageId("B", 0), 0));
@@ -133,7 +140,8 @@ public class QP4TestDriver {
         Schema b = schema("B", "value");
         BlockNestedLoopJoinOperator join = join(new Probe(a), new Probe(b), schema(null, "id", "value"), List.of(0, 1), spec(JoinType.CARTESIAN, List.of()));
         expect(QpException.class, join::next);
-        expect(QpException.class, () -> join.open(CONTEXT));
+        join.open(CONTEXT);
+        check(drain(join).isEmpty(), "empty children yield empty join result");
         join.close();
         List<RowEnvelope> supplied = new ArrayList<>(List.of(RowEnvelope.of(row(1, 2))));
         join.setMockRows(supplied);
@@ -165,8 +173,12 @@ public class QP4TestDriver {
         for (SortDirection direction : new SortDirection[] {null, SortDirection.ASC, SortDirection.DESC}) {
             Probe child = new Probe(schema);
             SortOperator sort = sort(child, direction);
-            expect(QpException.class, () -> sort.open(CONTEXT));
+            sort.open(CONTEXT);
+            check(drain(sort).isEmpty(), "empty child sort yields empty result");
             sort.close();
+            child.opens = 0;
+            child.closes = 0;
+            child.nextCalls = 0;
             RowEnvelope marked = RowEnvelope.of(row(2), new RID(new PageId("T", 0), 1));
             List<RowEnvelope> fixture = direction == SortDirection.DESC
                     ? List.of(envelope(10), marked, envelope(2), envelope(-3))
@@ -180,7 +192,7 @@ public class QP4TestDriver {
                 sort.close();
                 sort.close();
             }
-            check(child.opens == 2 && child.closes == 2 && child.nextCalls == 0, "sort uses fixture, not child sort algorithm");
+            check(child.opens == 2 && child.closes == 2 && child.nextCalls == 0, "sort uses fixture when setMockRows is registered");
             sort.setMockRows(List.of());
             sort.open(CONTEXT);
             check(drain(sort).isEmpty() && sort.schema().equals(schema), "empty sort header");
@@ -214,7 +226,7 @@ public class QP4TestDriver {
             check(drain(nested).size() == 1, "three-table fixture lifecycle");
             nested.close();
         }
-        check(a.nextCalls == 0 && b.nextCalls == 0 && c.nextCalls == 0, "composition does not execute production join");
+        check(a.nextCalls == 0 && b.nextCalls == 0 && c.nextCalls == 0, "composition does not execute production join when fixture set");
     }
 
     private static void failures() {
@@ -251,6 +263,97 @@ public class QP4TestDriver {
         }
         sort.close();
         check(child.closes == 1, "partial sort open cleanup is idempotent");
+    }
+
+    private static void realBnlj() {
+        Schema aSchema = schema("A", "id", "amount");
+        Schema bSchema = schema("B", "id", "value");
+        List<RowEnvelope> aRows = List.of(
+                RowEnvelope.of(row(1, 100), new RID(new PageId("A", 0), 0)),
+                RowEnvelope.of(row(2, 200), new RID(new PageId("A", 0), 1)),
+                RowEnvelope.of(row(3, 300), new RID(new PageId("A", 0), 2)));
+        List<RowEnvelope> bRows = List.of(
+                RowEnvelope.of(row(2, 20), new RID(new PageId("B", 0), 0)),
+                RowEnvelope.of(row(3, 30), new RID(new PageId("B", 0), 1)),
+                RowEnvelope.of(row(4, 40), new RID(new PageId("B", 0), 2)));
+
+        // 1. Real THETA JOIN (A.id = B.id) with multi-batch outer buffer
+        Probe leftTheta = new Probe(aSchema, aRows);
+        Probe rightTheta = new Probe(bSchema, bRows);
+        Expression eqCond = new Expression(
+                ExpressionKind.BINARY,
+                Optional.empty(),
+                Optional.empty(),
+                Optional.of(ExpressionOperator.EQ),
+                List.of(column("A", "id"), column("B", "id")));
+        JoinSpec thetaSpec = new JoinSpec(JoinType.THETA, Optional.of(eqCond), JoinAlgorithm.BLOCK_NESTED_LOOP, List.of());
+        Schema thetaOut = schema(null, "id", "amount", "id", "value");
+        BlockNestedLoopJoinOperator thetaJoin = join(leftTheta, rightTheta, thetaOut, List.of(0, 1, 2, 3), thetaSpec);
+        thetaJoin.setMaxOuterBytes(50); // force multiple outer batches (each 2-int row with RID is 48 bytes)
+        thetaJoin.open(CONTEXT);
+        List<Row> thetaResult = drain(thetaJoin).stream().map(RowEnvelope::row).toList();
+        thetaJoin.close();
+        check(thetaResult.equals(List.of(row(2, 200, 2, 20), row(3, 300, 3, 30))), "real THETA join matches A.id = B.id");
+        check(rightTheta.opens == 3, "multi-batch BNLJ rescans inner relation once per outer batch");
+
+        // 2. Real NATURAL JOIN on common column "id"
+        Probe leftNat = new Probe(aSchema, aRows);
+        Probe rightNat = new Probe(bSchema, bRows);
+        JoinSpec natSpec = spec(JoinType.NATURAL, List.of("id"));
+        Schema natOut = schema(null, "id", "amount", "value");
+        BlockNestedLoopJoinOperator natJoin = join(leftNat, rightNat, natOut, List.of(0, 1, 3), natSpec);
+        natJoin.open(CONTEXT);
+        List<Row> natResult = drain(natJoin).stream().map(RowEnvelope::row).toList();
+        natJoin.close();
+        check(natResult.equals(List.of(row(2, 200, 20), row(3, 300, 30))), "real NATURAL join deduplicates id and matches values");
+        check(natJoin.schema().findColumnOffset("A", "id") == 0 && natJoin.schema().findColumnOffset("B", "id") == 0,
+                "NATURAL join common column accessible via both A.id and B.id");
+
+        // 3. Real 3-table JOIN (A JOIN B JOIN C)
+        Schema cSchema = schema("C", "id", "bonus");
+        List<RowEnvelope> cRows = List.of(RowEnvelope.of(row(3, 5)));
+        Probe cProbe = new Probe(cSchema, cRows);
+        Expression bcCond = new Expression(
+                ExpressionKind.BINARY,
+                Optional.empty(),
+                Optional.empty(),
+                Optional.of(ExpressionOperator.EQ),
+                List.of(column("B", "id"), column("C", "id")));
+        JoinSpec bcSpec = new JoinSpec(JoinType.THETA, Optional.of(bcCond), JoinAlgorithm.BLOCK_NESTED_LOOP, List.of());
+        Schema threeOut = schema(null, "id", "amount", "value", "cid", "bonus");
+        BlockNestedLoopJoinOperator threeJoin = join(natJoin, cProbe, threeOut, List.of(0, 1, 2, 3, 4), bcSpec);
+        threeJoin.open(CONTEXT);
+        List<Row> threeResult = drain(threeJoin).stream().map(RowEnvelope::row).toList();
+        threeJoin.close();
+        check(threeResult.equals(List.of(row(3, 300, 30, 3, 5))), "real 3-table join produces correct tuple");
+    }
+
+    private static void realSort() {
+        Schema schema = schema("T", "key", "seq");
+        RowEnvelope r1 = RowEnvelope.of(row(10, 1), new RID(new PageId("T", 0), 1));
+        RowEnvelope r2 = RowEnvelope.of(row(2, 2), new RID(new PageId("T", 0), 2));
+        RowEnvelope r3 = RowEnvelope.of(row(-5, 3), new RID(new PageId("T", 0), 3));
+        RowEnvelope r4 = RowEnvelope.of(row(2, 4), new RID(new PageId("T", 0), 4));
+        List<RowEnvelope> unsorted = List.of(r1, r2, r3, r4);
+
+        // ASC sort
+        Probe childAsc = new Probe(schema, unsorted);
+        ColumnRef col = ColumnRef.of("T", "key");
+        SortOperator sortAsc = new SortOperator(
+                childAsc, new SortSpec(col, SortDirection.ASC), new RowComparator(schema, col, SortDirection.ASC, VALUES), schema);
+        sortAsc.open(CONTEXT);
+        List<RowEnvelope> ascResult = drain(sortAsc);
+        sortAsc.close();
+        check(ascResult.equals(List.of(r3, r2, r4, r1)), "real ASC sort orders rows and preserves tie stability + RIDs");
+
+        // DESC sort
+        Probe childDesc = new Probe(schema, unsorted);
+        SortOperator sortDesc = new SortOperator(
+                childDesc, new SortSpec(col, SortDirection.DESC), new RowComparator(schema, col, SortDirection.DESC, VALUES), schema);
+        sortDesc.open(CONTEXT);
+        List<RowEnvelope> descResult = drain(sortDesc);
+        sortDesc.close();
+        check(descResult.equals(List.of(r1, r2, r4, r3)), "real DESC sort orders rows in descending order");
     }
 
     private static BlockNestedLoopJoinOperator join(Operator left, Operator right, Schema schema, List<Integer> mapping, JoinSpec spec) {
@@ -322,6 +425,8 @@ public class QP4TestDriver {
     }
 
     private static final class Probe extends AbstractOperator {
+        private final List<RowEnvelope> data;
+        private int cursor;
         private int opens;
         private int closes;
         private int nextCalls;
@@ -329,11 +434,19 @@ public class QP4TestDriver {
         private boolean failClose;
         private ExecutionContext lastContext;
 
-        private Probe(Schema schema) {super(schema);}
+        private Probe(Schema schema) {
+            this(schema, List.of());
+        }
+
+        private Probe(Schema schema, List<RowEnvelope> data) {
+            super(schema);
+            this.data = List.copyOf(data);
+        }
 
         @Override
         protected void doOpen() {
             opens++;
+            cursor = 0;
             lastContext = requireContext();
             if (failOpen) {throw new IllegalStateException("fixture open failure");}
         }
@@ -341,12 +454,13 @@ public class QP4TestDriver {
         @Override
         protected Optional<RowEnvelope> doNext() {
             nextCalls++;
-            return Optional.empty();
+            return cursor < data.size() ? Optional.of(data.get(cursor++)) : Optional.empty();
         }
 
         @Override
         protected void doClose() {
             closes++;
+            cursor = 0;
             if (failClose) {throw new IllegalStateException("fixture close failure");}
         }
     }

@@ -48,6 +48,8 @@ public class QP2TestDriver {
             testPlanValidatorParameters();
             testPlanTranslatorSelectPipeline();
             testPlanTranslatorCommandExecutors();
+            testPlanTranslatorRealOperatorsAndExecutors();
+            testPlanTranslatorBonusOperatorsAndSubqueries();
             testPlanTranslatorErrorHandling();
 
             System.out.println("\n--------------------------------------------------");
@@ -383,6 +385,113 @@ public class QP2TestDriver {
 
         CommandExecutor indexExec = translator.translateCommand(createIndexNode);
         assertEquals(PlanNodeKind.CREATE_INDEX, ((MockCommandExecutor) indexExec).getKind(), "Kind is CREATE_INDEX");
+    }
+
+    // =========================================================================
+    // 8b. PlanTranslator Real Operators & Executors with Stub Storage
+    // =========================================================================
+    private static void testPlanTranslatorRealOperatorsAndExecutors() throws Exception {
+        System.out.println("[TEST] PlanTranslator Real Operators & Executors...");
+        java.nio.file.Path snap = java.nio.file.Files.createTempDirectory("qp2-real-").resolve("sm.stub");
+        java.util.List<String> trace = new java.util.ArrayList<>();
+        sqlike.qp.stub.StubStorage stubSm = new sqlike.qp.stub.StubStorage(snap, trace);
+        stubSm.define(new sqlike.shared.TableSchema("1", "employee", List.of(
+                new ColumnSchema("id", DataType.INTEGER, Optional.empty()),
+                new ColumnSchema("name", DataType.VARCHAR, Optional.of(50)),
+                new ColumnSchema("salary", DataType.INTEGER, Optional.empty())
+        )));
+
+        ValueComparator comparator = new ValueComparator();
+        ExpressionEvaluator evaluator = new ExpressionEvaluator(comparator);
+        PlanValidator validator = new PlanValidator();
+        RowSizeEstimator estimator = new RowSizeEstimator();
+        MutationCoordinator mutations = new MutationCoordinator(stubSm);
+        MutationTargetCollector collector = new MutationTargetCollector(stubSm);
+
+        PlanTranslator translator = new PlanTranslator(
+                stubSm, evaluator, comparator, mutations, collector, estimator, validator);
+
+        PlanNode scanNode = new PlanNode(PlanNodeKind.SCAN, List.of(), List.of(), Optional.empty(),
+                Optional.of(new ScanSpec("employee", Optional.empty(), Optional.empty())),
+                Optional.empty(), List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
+        assertTrue(translator.translateSelect(scanNode) instanceof TableScanOperator, "Real TableScanOperator created");
+
+        PlanNode joinNode = new PlanNode(PlanNodeKind.JOIN, List.of(scanNode, scanNode), List.of(), Optional.empty(),
+                Optional.empty(), Optional.empty(), List.of(),
+                Optional.of(new JoinSpec(JoinType.NATURAL, Optional.empty(), JoinAlgorithm.BLOCK_NESTED_LOOP, List.of("id"))),
+                Optional.empty(), Optional.empty(), Optional.empty());
+        assertTrue(translator.translateSelect(joinNode) instanceof BlockNestedLoopJoinOperator, "Real BlockNestedLoopJoinOperator created");
+
+        PlanNode sortNode = new PlanNode(PlanNodeKind.SORT, List.of(scanNode), List.of(), Optional.empty(),
+                Optional.empty(), Optional.empty(), List.of(), Optional.empty(),
+                Optional.of(new SortSpec(ColumnRef.of("employee", "salary"), SortDirection.DESC)),
+                Optional.empty(), Optional.empty());
+        assertTrue(translator.translateSelect(sortNode) instanceof SortOperator, "Real SortOperator created");
+
+        Value v1 = new Value(DataType.INTEGER, Optional.of(1), Optional.empty(), Optional.empty());
+        PlanNode insertNode = new PlanNode(PlanNodeKind.INSERT, List.of(), List.of(), Optional.empty(),
+                Optional.empty(), Optional.empty(), List.of(), Optional.empty(), Optional.empty(),
+                Optional.of(new MutationSpec("employee", List.of(v1), Optional.empty(), Optional.empty())), Optional.empty());
+        assertTrue(translator.translateCommand(insertNode) instanceof InsertExecutor, "Real InsertExecutor created");
+
+        PlanNode deleteNode = new PlanNode(PlanNodeKind.DELETE, List.of(scanNode), List.of(), Optional.empty(),
+                Optional.empty(), Optional.empty(), List.of(), Optional.empty(), Optional.empty(),
+                Optional.of(new MutationSpec("employee", List.of(), Optional.empty(), Optional.empty())), Optional.empty());
+        assertTrue(translator.translateCommand(deleteNode) instanceof DeleteExecutor, "Real DeleteExecutor created");
+    }
+
+    // =========================================================================
+    // 8c. PlanTranslator Bonus Operators, DDL Executors & Subquery Evaluator
+    // =========================================================================
+    private static void testPlanTranslatorBonusOperatorsAndSubqueries() throws Exception {
+        System.out.println("[TEST] PlanTranslator Bonus (LIMIT, CREATE_TABLE, DROP_TABLE, AS, SUBQUERY)...");
+        java.nio.file.Path snap = java.nio.file.Files.createTempDirectory("qp2-bonus-").resolve("sm.stub");
+        java.util.List<String> trace = new java.util.ArrayList<>();
+        sqlike.qp.stub.StubStorage stubSm = new sqlike.qp.stub.StubStorage(snap, trace);
+        stubSm.define(new sqlike.shared.TableSchema("1", "employee", List.of(
+                new ColumnSchema("id", DataType.INTEGER, Optional.empty()),
+                new ColumnSchema("name", DataType.VARCHAR, Optional.of(50)),
+                new ColumnSchema("salary", DataType.INTEGER, Optional.empty())
+        )));
+
+        ValueComparator comparator = new ValueComparator();
+        ExpressionEvaluator evaluator = new ExpressionEvaluator(comparator);
+        PlanValidator validator = new PlanValidator();
+        RowSizeEstimator estimator = new RowSizeEstimator();
+        MutationCoordinator mutations = new MutationCoordinator(stubSm);
+        MutationTargetCollector collector = new MutationTargetCollector(stubSm);
+
+        PlanTranslator translator = new PlanTranslator(
+                stubSm, evaluator, comparator, mutations, collector, estimator, validator);
+
+        // 1. Aliased SCAN + LIMIT operator
+        PlanNode aliasedScan = new PlanNode(PlanNodeKind.SCAN, List.of(), List.of(), Optional.empty(),
+                Optional.of(new ScanSpec("employee", Optional.empty(), Optional.empty(), Optional.of("e"))),
+                Optional.empty(), List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),
+                Optional.empty(), Optional.empty(), Optional.empty());
+        PlanNode limitNode = new PlanNode(PlanNodeKind.LIMIT, List.of(aliasedScan), List.of(), Optional.empty(),
+                Optional.empty(), Optional.empty(), List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),
+                Optional.of(new sqlike.shared.LimitSpec(5)), Optional.empty(), Optional.empty());
+        Operator limitOp = translator.translateSelect(limitNode);
+        assertTrue(limitOp instanceof LimitOperator, "Real LimitOperator created");
+        assertEquals(0, limitOp.schema().findColumnOffset("e", "id"), "Alias 'e' resolves column offset on Schema");
+
+        // 2. CREATE_TABLE and DROP_TABLE executors
+        sqlike.shared.CreateTableSpec createSpec = new sqlike.shared.CreateTableSpec(
+                "dept",
+                List.of(new ColumnSchema("id", DataType.INTEGER, Optional.empty())),
+                List.of("id"),
+                List.of());
+        PlanNode createTableNode = new PlanNode(PlanNodeKind.CREATE_TABLE, List.of(), List.of(), Optional.empty(),
+                Optional.empty(), Optional.empty(), List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),
+                Optional.empty(), Optional.of(createSpec), Optional.empty());
+        assertTrue(translator.translateCommand(createTableNode) instanceof CreateTableExecutor, "Real CreateTableExecutor created");
+
+        sqlike.shared.DropTableSpec dropSpec = new sqlike.shared.DropTableSpec("dept", sqlike.shared.DropBehavior.RESTRICT);
+        PlanNode dropTableNode = new PlanNode(PlanNodeKind.DROP_TABLE, List.of(), List.of(), Optional.empty(),
+                Optional.empty(), Optional.empty(), List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),
+                Optional.empty(), Optional.empty(), Optional.of(dropSpec));
+        assertTrue(translator.translateCommand(dropTableNode) instanceof DropTableExecutor, "Real DropTableExecutor created");
     }
 
     // =========================================================================

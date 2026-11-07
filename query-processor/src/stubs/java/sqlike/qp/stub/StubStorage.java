@@ -8,6 +8,7 @@ import sqlike.contract.IStorageManager;
 import sqlike.shared.*;
 import sqlike.shared.Record;
 import sqlike.shared.RecordCursor;
+import sqlike.qp.Schema;
 import sqlike.qp.port.StorageAdapter.TransactionScope;
 import sqlike.qp.port.QpContracts.TxId;
 import static sqlike.qp.port.QpContracts.*;
@@ -104,6 +105,35 @@ public final class StubStorage implements IStorageManager, TransactionScope {
             throw failure("Index already exists: " + definition.indexName());
         newIndexes.computeIfAbsent(tx(), key -> new ArrayList<>()).add(definition); trace.add("SM.createIndex." + definition.indexType());
     }
+    @Override public void createTable(TableSchema schema, long lsn) {
+        if (lsn <= 0) throw failure("Schema write requires a logged LSN");
+        if (schemas.containsKey(schema.tableName())) throw failure("Table already exists: " + schema.tableName());
+        schemas.put(schema.tableName(), schema);
+        trace.add("SM.createTable." + schema.tableName());
+    }
+    @Override public void dropTable(String table, DropBehavior behavior, long lsn) {
+        if (lsn <= 0) throw failure("Schema write requires a logged LSN");
+        TableSchema removed = schemas.remove(table);
+        if (removed == null) throw failure("Unknown table: " + table);
+        rows.keySet().removeIf(rid -> rid.pageId().tableId().equalsIgnoreCase(table));
+        changes.values().forEach(m -> m.keySet().removeIf(rid -> rid.pageId().tableId().equalsIgnoreCase(table)));
+        definitions.removeIf(idx -> idx.tableName().equalsIgnoreCase(table));
+        newIndexes.values().forEach(list -> list.removeIf(idx -> idx.tableName().equalsIgnoreCase(table)));
+        if (behavior == DropBehavior.CASCADE) {
+            for (var entry : new ArrayList<>(schemas.entrySet())) {
+                TableSchema ts = entry.getValue();
+                var remainingFks = ts.foreignKeys().stream()
+                        .filter(fk -> !fk.referencedTable().equalsIgnoreCase(table))
+                        .toList();
+                if (remainingFks.size() != ts.foreignKeys().size()) {
+                    schemas.put(entry.getKey(), new TableSchema(
+                            ts.tableId(), ts.tableName(), ts.columns(), ts.primaryKey(), remainingFks));
+                }
+            }
+        }
+        rebuild();
+        trace.add("SM.dropTable." + table + "." + behavior);
+    }
     @Override public List<RID> lookupIndex(String name, IndexCondition condition) {
         lookups++; trace.add("SM.lookupIndex");
         var definition = definitions.stream().filter(i -> i.indexName().equals(name)).findFirst().orElseThrow(() -> failure("Unknown index: " + name));
@@ -157,7 +187,7 @@ public final class StubStorage implements IStorageManager, TransactionScope {
             try (var out = new DataOutputStream(Files.newOutputStream(temporary))) {
                 out.writeUTF("QP5_SM_STUB_1"); out.writeLong(lastTx); out.writeInt(nextRid); out.writeInt(schemas.size());
                 for (var table : schemas.values()) {
-                    out.writeUTF(table.tableName()); out.writeLong(table.tableId()); out.writeInt(table.columns().size());
+                    out.writeUTF(table.tableName()); out.writeUTF(table.tableId()); out.writeInt(table.columns().size());
                     for (var column : table.columns()) { out.writeUTF(column.name()); out.writeUTF(column.dataType().name()); out.writeInt(column.maxLength().orElse(0)); }
                 }
                 out.writeInt(records.size());
@@ -177,7 +207,7 @@ public final class StubStorage implements IStorageManager, TransactionScope {
             if (!in.readUTF().equals("QP5_SM_STUB_1")) throw new IOException("Bad snapshot header");
             lastTx = in.readLong(); nextRid = in.readInt(); int count = in.readInt();
             for (int i = 0; i < count; i++) {
-                String name = in.readUTF(); long id = in.readLong(); int columns = in.readInt(); var fields = new ArrayList<ColumnSchema>();
+                String name = in.readUTF(); String id = in.readUTF(); int columns = in.readInt(); var fields = new ArrayList<ColumnSchema>();
                 for (int c = 0; c < columns; c++) {
                     String column = in.readUTF(); DataType type = DataType.valueOf(in.readUTF()); int length = in.readInt();
                     fields.add(new ColumnSchema(column, type, length == 0 ? Optional.empty() : Optional.of(length)));
@@ -200,4 +230,5 @@ public final class StubStorage implements IStorageManager, TransactionScope {
             for (int i = 0; i < count; i++) definitions.add(new IndexMetadata(in.readUTF(), in.readUTF(), in.readUTF(), IndexType.valueOf(in.readUTF())));
         } catch (IOException | IllegalArgumentException e) { throw failure("Stub snapshot read failed: " + e.getMessage()); }
     }
+    @Override public void close() { }
 }

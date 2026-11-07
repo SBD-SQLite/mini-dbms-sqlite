@@ -8,5 +8,7 @@ public enum StatementType {
     BEGIN,
     COMMIT,
     ABORT,
-    CREATE_INDEX
+    CREATE_INDEX,
+    CREATE_TABLE,
+    DROP_TABLE
 }

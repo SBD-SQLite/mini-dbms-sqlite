@@ -12,6 +12,12 @@ public record IndexScanSpec(String tableName, String indexName, Optional<IndexCo
         condition = condition == null ? Optional.empty() : condition;
     }
 
+    public IndexScanSpec(ScanSpec scanSpec) {
+        this(scanSpec != null ? scanSpec.tableName() : "",
+             scanSpec != null ? scanSpec.indexName().orElse("") : "",
+             scanSpec != null ? scanSpec.condition() : Optional.empty());
+    }
+
     public static IndexScanSpec fromScanSpec(ScanSpec scanSpec) {
         if (scanSpec == null) {
             throw new IllegalArgumentException("ScanSpec cannot be null");

@@ -36,7 +36,10 @@ public final class FilterOperator extends AbstractUnaryOperator {
                 return Optional.empty();
             }
             RowEnvelope envelope = candidate.get();
-            if (evaluator.evaluateCondition(predicate, envelope.row(), child.schema())) {
+            boolean matched = evaluator instanceof ExpressionEvaluator ee
+                    ? ee.evaluateConditionWithContext(predicate, envelope.row(), child.schema(), requireContext())
+                    : evaluator.evaluateCondition(predicate, envelope.row(), child.schema());
+            if (matched) {
                 return Optional.of(envelope);
             }
         }

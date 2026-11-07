@@ -11,5 +11,8 @@ public enum PlanNodeKind {
     INSERT,
     UPDATE,
     DELETE,
-    CREATE_INDEX
+    CREATE_INDEX,
+    LIMIT,
+    CREATE_TABLE,
+    DROP_TABLE
 }

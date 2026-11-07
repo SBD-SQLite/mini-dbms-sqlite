@@ -124,6 +124,45 @@ public class PlanValidator {
                     throw new IllegalArgumentException("CREATE_INDEX node must contain IndexMetadata parameters");
                 }
             }
+            case LIMIT -> {
+                if (node.limit().isEmpty() || node.limit().get().count() < 0) {
+                    throw new IllegalArgumentException("LIMIT node must contain non-negative LimitSpec parameters");
+                }
+            }
+            case CREATE_TABLE -> {
+                if (node.createTable().isEmpty()) {
+                    throw new IllegalArgumentException("CREATE_TABLE node must contain CreateTableSpec parameters");
+                }
+            }
+            case DROP_TABLE -> {
+                if (node.dropTable().isEmpty()) {
+                    throw new IllegalArgumentException("DROP_TABLE node must contain DropTableSpec parameters");
+                }
+            }
+        }
+        node.predicate().ifPresent(expr -> validateExpression(expr, Collections.newSetFromMap(new IdentityHashMap<>())));
+        node.join().flatMap(sqlike.shared.JoinSpec::condition)
+                .ifPresent(expr -> validateExpression(expr, Collections.newSetFromMap(new IdentityHashMap<>())));
+        node.mutation().flatMap(sqlike.shared.MutationSpec::updateExpression)
+                .ifPresent(expr -> validateExpression(expr, Collections.newSetFromMap(new IdentityHashMap<>())));
+    }
+
+    private void validateExpression(sqlike.shared.Expression expr, Set<PlanNode> path) {
+        if (expr == null) {
+            return;
+        }
+        if (expr.kind() == sqlike.shared.ExpressionKind.SUBQUERY) {
+            var sub = expr.subquery().orElseThrow(
+                    () -> new IllegalArgumentException("SUBQUERY expression must contain SubquerySpec"));
+            int expectedOperands = sub.type() == sqlike.shared.SubqueryType.IN ? 1 : 0;
+            if (expr.operands().size() != expectedOperands) {
+                throw new IllegalArgumentException(
+                        "SUBQUERY " + sub.type() + " expects " + expectedOperands + " operand(s)");
+            }
+            validateNode(sub.root(), path);
+        }
+        for (var operand : expr.operands()) {
+            validateExpression(operand, path);
         }
     }
 
@@ -133,8 +172,8 @@ public class PlanValidator {
             throw new IllegalArgumentException("PlanNodeKind cannot be null");
         }
         return switch (kind) {
-            case SCAN, INDEX_SCAN, INSERT, CREATE_INDEX -> 0;
-            case FILTER, PROJECT, SORT, UPDATE, DELETE -> 1;
+            case SCAN, INDEX_SCAN, INSERT, CREATE_INDEX, CREATE_TABLE, DROP_TABLE -> 0;
+            case FILTER, PROJECT, SORT, UPDATE, DELETE, LIMIT -> 1;
             case JOIN, CARTESIAN -> 2;
         };
     }
