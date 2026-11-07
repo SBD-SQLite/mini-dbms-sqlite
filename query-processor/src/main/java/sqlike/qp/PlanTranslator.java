@@ -259,6 +259,11 @@ public class PlanTranslator {
         return new TableScanOperator(storage, spec, outputSchema);
     }
 
+    private Operator buildIndexScan(PlanNode node, IndexScanSpec spec) {
+        Optional<String> alias = node != null ? node.scan().flatMap(ScanSpec::alias) : Optional.empty();
+        return buildIndexScan(node, spec, alias);
+    }
+
     private Operator buildIndexScan(PlanNode node, IndexScanSpec spec, Optional<String> alias) {
         String qualifier = alias != null && alias.isPresent() && !alias.get().isBlank()
                 ? alias.get()

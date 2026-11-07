@@ -133,6 +133,10 @@ public class MutationTargetCollector {
         }
     }
 
+    private Rid requireRid(RowEnvelope row, TableId tableId) {
+        return new Rid(requireRid(row, tableId != null ? tableId.value() : ""));
+    }
+
     private RID requireRid(RowEnvelope row, String tableName) {
         if (row == null) {
             throw new IllegalArgumentException("RowEnvelope cannot be null in requireRid");

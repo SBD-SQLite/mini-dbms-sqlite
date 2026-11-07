@@ -536,6 +536,18 @@ public final class Qp5AcceptanceTest {
                 "SELECT e.id FROM employees AS e "
                 + "WHERE EXISTS (SELECT p.id FROM projects AS p WHERE p.lead_id = e.id AND p.budget > 60000);");
         assertEquals(List.of(List.of(3)), values(existsCorrelated));
+
+        // Scalar subquery inside UPDATE SET expression (propagates ExecutionContext)
+        Result updateScalar = database.execute(
+                "UPDATE employees SET salary = (SELECT budget FROM projects WHERE id = 10) WHERE id = 1;");
+        assertAffected(1, updateScalar);
+        assertEquals(List.of(List.of(50000.0)), values(database.execute("SELECT salary FROM employees WHERE id = 1;")));
+
+        // 0-row scalar subquery inside UPDATE SET must fail because columns are non-null
+        Result updateNullScalar = database.runner.execute(
+                database.session,
+                "UPDATE employees SET salary = (SELECT budget FROM projects WHERE id = 999) WHERE id = 1;");
+        assertTrue(!updateNullScalar.success(), "UPDATE with 0-row scalar subquery (NULL) must fail");
     }
 
     private static void tcpServerMultiClientAndDisconnectAbort() throws Exception {

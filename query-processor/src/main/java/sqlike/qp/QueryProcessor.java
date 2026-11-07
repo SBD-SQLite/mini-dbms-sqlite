@@ -333,8 +333,10 @@ public final class QueryProcessor implements IQueryProcessor {
         try {
             requireReady();
             ExecutionContext context = ExecutionContext.of(txId);
-            if (concurrencyAdapter != null && access != null && plan != null) {
+            if (concurrencyAdapter != null) {
                 concurrencyAdapter.registerExternalTransaction(txId);
+            }
+            if (access != null && plan != null && access.isTransactionActive(new TxId(txId))) {
                 access.acquireAll(PreparedStatement.of(plan), context);
             }
             return planExecutor.execute(plan, context);
@@ -499,6 +501,19 @@ public final class QueryProcessor implements IQueryProcessor {
         Operator op = translator.translateSelect(root);
         long rows = engine.executeSelect(op, context, sink);
         return ExecutionSummary.ok(rows, rows + " row(s) returned");
+    }
+
+    private ExecutionSummary handleFailure(
+            SessionState session,
+            Optional<ExecutionContext> context,
+            DbmsError error,
+            boolean started) {
+        ErrorInfo info = new ErrorInfo(
+                ErrorCode.INVALID_STATE,
+                ComponentType.QP,
+                error != null ? error.message() : "Execution failed",
+                Optional.empty());
+        return handleFailure(session, started ? context : Optional.empty(), info);
     }
 
     private ExecutionSummary handleFailure(

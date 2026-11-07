@@ -109,7 +109,7 @@ public final class ExecutionEngine implements PlanExecutor {
             CommandExecutor cmd = translator.translateCommand(root);
             long affected = executeCommand(cmd, context);
             String msg = switch (kind) {
-                case CREATE_INDEX -> "Index created successfully";
+                case CREATE_INDEX -> "Index " + root.createIndex().map(m -> m.indexName()).orElse("") + " created successfully";
                 case CREATE_TABLE -> "Table " + root.createTable().map(c -> c.tableName()).orElse("") + " created successfully";
                 case DROP_TABLE -> "Table " + root.dropTable().map(d -> d.tableName()).orElse("") + " dropped successfully";
                 default -> affected + " row(s) affected";

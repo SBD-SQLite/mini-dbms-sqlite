@@ -243,21 +243,26 @@ public class BlockNestedLoopJoinOperator extends AbstractBinaryOperator {
     private boolean matches(RowEnvelope leftRow, RowEnvelope rightRow) {
         return switch (spec.joinType()) {
             case CARTESIAN -> spec.condition().isEmpty()
-                    || evaluator.evaluateCondition(
-                            spec.condition().get(),
-                            layout.combineForPredicate(leftRow, rightRow),
-                            layout.getInputSchema());
-            case THETA -> evaluator.evaluateCondition(
+                    || evaluateJoinCondition(spec.condition().get(), leftRow, rightRow);
+            case THETA -> evaluateJoinCondition(
                     spec.condition().orElseThrow(() -> new IllegalStateException("THETA join missing condition")),
-                    layout.combineForPredicate(leftRow, rightRow),
-                    layout.getInputSchema());
+                    leftRow,
+                    rightRow);
             case NATURAL -> naturalMatches(leftRow, rightRow)
                     && (spec.condition().isEmpty()
-                            || evaluator.evaluateCondition(
-                                    spec.condition().get(),
-                                    layout.combineForPredicate(leftRow, rightRow),
-                                    layout.getInputSchema()));
+                            || evaluateJoinCondition(spec.condition().get(), leftRow, rightRow));
         };
+    }
+
+    private boolean evaluateJoinCondition(
+            sqlike.shared.Expression condition,
+            RowEnvelope leftRow,
+            RowEnvelope rightRow) {
+        Row combined = layout.combineForPredicate(leftRow, rightRow);
+        if (evaluator instanceof ExpressionEvaluator ee && context != null) {
+            return ee.evaluateConditionWithContext(condition, combined, layout.getInputSchema(), context);
+        }
+        return evaluator.evaluateCondition(condition, combined, layout.getInputSchema());
     }
 
     private boolean naturalMatches(RowEnvelope leftRow, RowEnvelope rightRow) {
