@@ -4,9 +4,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
@@ -28,8 +26,8 @@ import sqlike.shared.SchemaImage;
 import sqlike.shared.Value;
 
 /**
- * FR3 rollback tests (FR-04). Uses an in-memory {@link LogManager} stand-in so the tests do not
- * depend on FR2's file log, and {@link MockStorageManager} as SM.
+ * FR3 rollback tests (FR-04). Uses FR2's real {@link LogManager} on a temporary file and
+ * {@link MockStorageManager} as SM.
  *
  * <p>Run: compile {@code shared/src/main/java}, {@code failure-recovery/src/main/java}, and this
  * file, then {@code java -cp <out> sqlike.frm.RollbackTests}.
@@ -52,14 +50,15 @@ public final class RollbackTests {
         run("UPDATE twice on one record returns to the first before-image", RollbackTests::updateTwice);
         run("INSERT is removed and DELETE comes back on the same RID", RollbackTests::insertAndDelete);
         run("other transactions' records are untouched", RollbackTests::otherTransactionUntouched);
-        run("undo uses the original LSN of each record", RollbackTests::usesOriginalLsn);
-        run("rollback writes no log record (CCM writes ABORT)", RollbackTests::writesNoLog);
+        run("each undo writes a COMPENSATION record and uses its LSN", RollbackTests::usesCompensationLsn);
+        run("rollback writes no ABORT, and logAbort is accepted after it", RollbackTests::abortAcceptedAfterRollback);
         run("committed transaction is rejected with INVALID_STATE", RollbackTests::committedRejected);
         run("unknown transaction is rejected with NOT_FOUND", RollbackTests::unknownRejected);
         run("aborted transaction is left unchanged", RollbackTests::abortedIsNoOp);
         run("SM failure is propagated, not swallowed", RollbackTests::smFailurePropagates);
         run("retry after a failure part-way gives the correct result", RollbackTests::retryAfterFailure);
         run("schema change is rejected with UNSUPPORTED_OPERATION", RollbackTests::schemaChangeRejected);
+        run("schema change is rejected before any compensation is logged", RollbackTests::schemaChangeRejectedFirst);
 
         System.out.printf("%n%d passed, %d failed%n", passed, failures.size());
         failures.forEach(f -> System.out.println("  FAIL " + f));
@@ -72,7 +71,7 @@ public final class RollbackTests {
 
     private static void updateTwice() {
         Fixture f = new Fixture();
-        f.log.begin(1);
+        f.begin(1);
         f.update(1, R1, row(1, "Ani", 10.0));
         f.update(1, R1, row(1, "Ani", 20.0));
         f.rollback.rollback(1);
@@ -81,7 +80,7 @@ public final class RollbackTests {
 
     private static void insertAndDelete() {
         Fixture f = new Fixture();
-        f.log.begin(1);
+        f.begin(1);
         f.insert(1, R4, row(4, "Dewi", 4.0));
         f.delete(1, R2);
         f.rollback.rollback(1);
@@ -91,41 +90,45 @@ public final class RollbackTests {
 
     private static void otherTransactionUntouched() {
         Fixture f = new Fixture();
-        f.log.begin(1);
+        f.begin(1);
         f.update(1, R1, row(1, "Ani", 1.0));
-        f.log.begin(2);
+        f.begin(2);
         f.update(2, R3, row(3, "Citra", 33.0));
-        f.log.commit(2);
+        f.commit(2);
         f.rollback.rollback(1);
         expect(f.value(R1), row(1, "Ani", 100.0), "R1");
         expect(f.value(R3), row(3, "Citra", 33.0), "R3");
     }
 
-    private static void usesOriginalLsn() {
+    private static void usesCompensationLsn() {
         Fixture f = new Fixture();
         RecordingSm sm = new RecordingSm(f.sm);
         RollbackManager rollback = new RollbackManager(f.log, sm);
-        f.log.begin(1);
+        f.begin(1);
         long first = f.update(1, R1, row(1, "Ani", 1.0));
         long second = f.update(1, R2, row(2, "Budi", 2.0));
         rollback.rollback(1);
-        expect(sm.lsns, List.of(second, first), "LSNs passed to SM (newest first)");
+        List<LogRecord> clrs = f.records(1, LogType.COMPENSATION);
+        expect(clrs.stream().map(r -> r.undoOfLSN().orElseThrow()).toList(), List.of(second, first),
+                "COMPENSATION undoOfLSN (newest change first)");
+        expect(sm.lsns, clrs.stream().map(LogRecord::lsn).toList(), "LSNs passed to SM");
     }
 
-    private static void writesNoLog() {
+    private static void abortAcceptedAfterRollback() {
         Fixture f = new Fixture();
-        f.log.begin(1);
+        f.begin(1);
         f.update(1, R1, row(1, "Ani", 1.0));
-        int before = f.log.records.size();
         f.rollback.rollback(1);
-        expect(f.log.records.size(), before, "log size");
+        expect(f.records(1, LogType.ABORT).size(), 0, "ABORT records written by rollback");
+        f.log.logAbort(1); // what CCM does next; FR2 rejects it if a change has no COMPENSATION
+        expect(f.records(1, LogType.ABORT).size(), 1, "ABORT records after logAbort");
     }
 
     private static void committedRejected() {
         Fixture f = new Fixture();
-        f.log.begin(1);
+        f.begin(1);
         f.update(1, R1, row(1, "Ani", 1.0));
-        f.log.commit(1);
+        f.commit(1);
         expectError(() -> f.rollback.rollback(1), ErrorCode.INVALID_STATE);
         expect(f.value(R1), row(1, "Ani", 1.0), "R1 keeps the committed value");
     }
@@ -137,20 +140,20 @@ public final class RollbackTests {
 
     private static void abortedIsNoOp() {
         Fixture f = new Fixture();
-        f.log.begin(1);
+        f.begin(1);
         f.update(1, R1, row(1, "Ani", 1.0));
         f.rollback.rollback(1);
-        f.log.abort(1);
-        f.log.begin(2);
+        f.log.logAbort(1);
+        f.begin(2);
         f.update(2, R1, row(1, "Ani", 300.0));
-        f.log.commit(2);
+        f.commit(2);
         f.rollback.rollback(1);
         expect(f.value(R1), row(1, "Ani", 300.0), "R1 keeps T2's later value");
     }
 
     private static void smFailurePropagates() {
         Fixture f = new Fixture();
-        f.log.begin(1);
+        f.begin(1);
         f.update(1, R1, row(1, "Ani", 1.0));
         FailingSm failing = new FailingSm(f.sm, 1);
         RollbackManager rollback = new RollbackManager(f.log, failing);
@@ -164,7 +167,7 @@ public final class RollbackTests {
 
     private static void retryAfterFailure() {
         Fixture f = new Fixture();
-        f.log.begin(1);
+        f.begin(1);
         f.update(1, R1, row(1, "Ani", 1.0));
         f.update(1, R2, row(2, "Budi", 2.0));
         f.update(1, R3, row(3, "Citra", 3.0));
@@ -179,28 +182,44 @@ public final class RollbackTests {
         expect(f.value(R1), row(1, "Ani", 100.0), "R1");
         expect(f.value(R2), row(2, "Budi", 200.0), "R2");
         expect(f.value(R3), row(3, "Citra", 300.0), "R3");
+        expect(f.records(1, LogType.COMPENSATION).size(), 3, "one COMPENSATION per change");
+        f.log.logAbort(1);
     }
 
     private static void schemaChangeRejected() {
         Fixture f = new Fixture();
-        f.log.begin(1);
-        SchemaImage absent = new SchemaImage("t2", Optional.empty(), List.of(), Optional.empty());
-        f.log.add(new LogRecord(f.log.next(), Instant.now(), Optional.of(1L), LogType.SCHEMA_CHANGE,
-                Optional.empty(), Optional.empty(),
-                Optional.of(new SchemaChange(List.of(absent), List.of(absent))), Optional.empty()));
+        f.begin(1);
+        f.log.logSchemaChange(1, schemaChange());
         expectError(() -> f.rollback.rollback(1), ErrorCode.UNSUPPORTED_OPERATION);
+    }
+
+    private static void schemaChangeRejectedFirst() {
+        Fixture f = new Fixture();
+        f.begin(1);
+        f.log.logSchemaChange(1, schemaChange());
+        f.update(1, R1, row(1, "Ani", 1.0));
+        expectError(() -> f.rollback.rollback(1), ErrorCode.UNSUPPORTED_OPERATION);
+        expect(f.records(1, LogType.COMPENSATION).size(), 0, "COMPENSATION records");
+        expect(f.value(R1), row(1, "Ani", 1.0), "R1 untouched");
+    }
+
+    private static SchemaChange schemaChange() {
+        SchemaImage absent = new SchemaImage("t2", Optional.empty(), List.of(), Optional.empty());
+        return new SchemaChange(List.of(absent), List.of(absent));
     }
 
     // ------------------------------------------------------------------ fixture
 
     private static final class Fixture {
         final MockStorageManager sm;
-        final MemoryLog log = new MemoryLog();
+        final LogManager log;
         final RollbackManager rollback;
 
         Fixture() {
             try {
-                sm = new MockStorageManager(Files.createTempDirectory("frm-rollback-test"));
+                Path dir = Files.createTempDirectory("frm-rollback-test");
+                sm = new MockStorageManager(dir.resolve("data"));
+                log = new LogManager(dir.resolve("wal").resolve("frm.wal").toString());
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
@@ -209,6 +228,14 @@ public final class RollbackTests {
             sm.seed(T, R2, row(2, "Budi", 200.0));
             sm.seed(T, R3, row(3, "Citra", 300.0));
             rollback = new RollbackManager(log, sm);
+        }
+
+        void begin(long tx) {
+            log.logBegin(tx);
+        }
+
+        void commit(long tx) {
+            log.logCommit(tx);
         }
 
         long insert(long tx, RID rid, List<Value> values) {
@@ -234,81 +261,9 @@ public final class RollbackTests {
         List<Value> value(RID rid) {
             return sm.readAt(T, rid).values();
         }
-    }
 
-    /** In-memory stand-in for FR2's LogManager. */
-    private static final class MemoryLog extends LogManager {
-        final List<LogRecord> records = new ArrayList<>();
-        private long nextLsn = 1;
-
-        MemoryLog() {
-            super("unused");
-        }
-
-        long next() {
-            return nextLsn++;
-        }
-
-        void add(LogRecord record) {
-            records.add(record);
-        }
-
-        void begin(long tx) {
-            logBegin(tx);
-        }
-
-        void commit(long tx) {
-            logCommit(tx);
-        }
-
-        void abort(long tx) {
-            logAbort(tx);
-        }
-
-        private long marker(long tx, LogType type) {
-            long lsn = next();
-            records.add(new LogRecord(lsn, Instant.now(), Optional.of(tx), type, Optional.empty(), Optional.empty()));
-            return lsn;
-        }
-
-        @Override
-        public long logBegin(long tx) {
-            return marker(tx, LogType.BEGIN);
-        }
-
-        @Override
-        public long logChange(long tx, DataChange change) {
-            long lsn = next();
-            records.add(new LogRecord(lsn, Instant.now(), Optional.of(tx),
-                    LogType.valueOf(change.operation().name()), Optional.of(change), Optional.empty()));
-            return lsn;
-        }
-
-        @Override
-        public void logCommit(long tx) {
-            marker(tx, LogType.COMMIT);
-        }
-
-        @Override
-        public void logAbort(long tx) {
-            marker(tx, LogType.ABORT);
-        }
-
-        @Override
-        public List<LogRecord> readLogs(Long tx) {
-            return records.stream().filter(r -> tx == null || r.txID().equals(Optional.of(tx))).toList();
-        }
-
-        @Override
-        public List<LogRecord> readLogsBackward(long tx) {
-            List<LogRecord> list = new ArrayList<>(readLogs(tx));
-            Collections.reverse(list);
-            return list;
-        }
-
-        @Override
-        public long getLastLsn() {
-            return nextLsn - 1;
+        List<LogRecord> records(long tx, LogType type) {
+            return log.readLogs(tx).stream().filter(r -> r.type() == type).toList();
         }
     }
 
