@@ -43,7 +43,7 @@ public final class TimestampProtocolTest {
 
     private static void staleRead() {
         TimestampProtocol protocol = new TimestampProtocol();
-        ResourceId a = ResourceId.ofTable("a");
+        ResourceId a = Resources.table("a");
         Transaction older = tx(1);
         Transaction newer = tx(2);
         require(protocol.checkWrite(newer, a) == AccessStatus.GRANTED, "newer write must be granted");
@@ -53,7 +53,7 @@ public final class TimestampProtocolTest {
 
     private static void staleWrite() {
         TimestampProtocol protocol = new TimestampProtocol();
-        ResourceId a = ResourceId.ofTable("a");
+        ResourceId a = Resources.table("a");
         Transaction older = tx(1);
         Transaction newer = tx(2);
         require(protocol.checkRead(newer, a) == AccessStatus.GRANTED, "newer read must be granted");
@@ -62,14 +62,14 @@ public final class TimestampProtocolTest {
 
     private static void olderThanWriter() {
         TimestampProtocol protocol = new TimestampProtocol();
-        ResourceId a = ResourceId.ofTable("a");
+        ResourceId a = Resources.table("a");
         require(protocol.checkWrite(tx(2), a) == AccessStatus.GRANTED, "newer write must be granted");
         require(protocol.checkWrite(tx(1), a) == AccessStatus.ABORTED, "older write must be aborted");
     }
 
     private static void waitsForWriter() throws Exception {
         TimestampProtocol protocol = new TimestampProtocol();
-        ResourceId a = ResourceId.ofTable("a");
+        ResourceId a = Resources.table("a");
         Transaction writer = tx(1);
         Transaction reader = tx(2);
         require(protocol.checkWrite(writer, a) == AccessStatus.GRANTED, "writer must be granted");
@@ -86,7 +86,7 @@ public final class TimestampProtocolTest {
 
     private static void rolledBackWriter() {
         TimestampProtocol protocol = new TimestampProtocol();
-        ResourceId a = ResourceId.ofTable("a");
+        ResourceId a = Resources.table("a");
         Transaction writer = tx(2);
         require(protocol.checkWrite(writer, a) == AccessStatus.GRANTED, "writer must be granted");
         abort(protocol, writer);
@@ -96,7 +96,7 @@ public final class TimestampProtocolTest {
 
     private static void retryAfterViolation() {
         TimestampProtocol protocol = new TimestampProtocol();
-        ResourceId a = ResourceId.ofTable("a");
+        ResourceId a = Resources.table("a");
         Transaction newer = tx(2);
         require(protocol.checkWrite(newer, a) == AccessStatus.GRANTED, "newer write must be granted");
         commit(protocol, newer);
@@ -115,7 +115,7 @@ public final class TimestampProtocolTest {
                 "record write must be granted");
         ExecutorService pool = Executors.newSingleThreadExecutor();
         try {
-            Future<AccessStatus> scan = pool.submit(() -> protocol.checkRead(scanner, ResourceId.ofTable("items")));
+            Future<AccessStatus> scan = pool.submit(() -> protocol.checkRead(scanner, Resources.table("items")));
             expectBlocked(scan);
             commit(protocol, writer);
             require(get(scan) == AccessStatus.GRANTED, "table read must wait for the record writer");

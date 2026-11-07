@@ -67,7 +67,7 @@ final class Check {
     }
 
     static ResourceId record(String table, int slot) {
-        return ResourceId.ofRecord(table, new RID(new PageId(table, 0L), slot));
+        return Resources.record(table, new RID(new PageId(table, 0L), slot));
     }
 
     static DataChange change(String table, int slot) {

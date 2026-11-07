@@ -7,7 +7,8 @@ Current status (Milestone 2)
 - Every IConcurrencyControlManager method, including the PRD section 3.4 additions (requestWriteAccess,
   requestSchemaWrite, beginApply/endApply, awaitNoActiveTransactions(timeoutMs)), is implemented by
   sqlike.ccm.ConcurrencyControlManager.
-- Locking is table level (PRD section 9). RECORD requests lock their table; CATALOG has its own resource.
+- Locking is table level (PRD section 9). RECORD requests lock their table. The catalog is its own resource,
+  the reserved table name __catalog__ (a scope named CATALOG is recognized too, see sqlike.ccm.Resources).
   Default protocol: LOCK_BASED (rigorous 2PL, FIFO queue, S to X upgrade). The active protocol is logged and
   printed when CCM starts.
 - Deadlocks: wait-for graph, checked every 100 ms, victim is the youngest transaction. A two-transaction
@@ -28,9 +29,11 @@ Current status (Milestone 2)
 
 Packages (src/main/java)
 - sqlike.contract  IConcurrencyControlManager (CCM) and IFailureRecoveryManager (FRM), copied from the contract
-- sqlike.shared    shared data types copied from the contract; delete once a supergroup shared package exists
+- sqlike.shared    only SchemaChange and SchemaImage, which are not in the root shared/ module yet.
+                   Every other shared type comes from shared/src/main/java (CCM keeps no copies).
 - sqlike.ccm       CCM classes:
     ConcurrencyControlManager, CCMConfig, TransactionManager, Transaction   transactions and protocol choice (CC-01, CC-02)
+    Resources                                                                helpers that build table, record, and catalog resources
     FRMBridge                                                                WAL logging, abort, recovery (CC-03, CC-04, CC-05)
     IConcurrencyProtocol, LockBasedProtocol                                  lock-based access (CC-06)
     DeadlockHandler                                                          deadlock handling (CC-07)
@@ -39,7 +42,7 @@ Packages (src/main/java)
     CCMDriver, Scenario, MockFRM                                             standalone driver (CC-10)
 
 Build and run the driver (JDK 17 or newer), from the repository root:
-  javac --release 17 -d out $(find concurrency-control/src/main/java -name '*.java')
+  javac --release 17 -d out $(find shared/src/main/java concurrency-control/src/main/java -name '*.java')
   java -cp out sqlike.ccm.CCMDriver
 The driver runs every scenario against ConcurrencyControlManager with MockFRM and prints
 "Total: N/N skenario LULUS" when all of them pass.

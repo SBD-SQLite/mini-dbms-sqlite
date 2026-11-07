@@ -89,7 +89,7 @@ public final class LockBasedProtocolTest {
         try (Fixture f = new Fixture()) {
             Transaction first = f.begin(1);
             Transaction second = f.begin(2);
-            granted(f.protocol.checkRead(first, ResourceId.ofTable("Accounts")));
+            granted(f.protocol.checkRead(first, Resources.table("Accounts")));
             granted(get(f.submit(() -> f.protocol.checkRead(second, record("accounts", 1)))));
             require(f.protocol.getWaitingTransactions().isEmpty(), "shared readers should not wait");
             f.commit(first);
@@ -435,7 +435,7 @@ public final class LockBasedProtocolTest {
             Transaction ddl = f.begin(1);
             Transaction data = f.begin(2);
             Transaction binder = f.begin(3);
-            ResourceId catalog = new ResourceId(ResourceScope.CATALOG, "__catalog__", Optional.empty());
+            ResourceId catalog = Resources.catalog();
             granted(f.protocol.checkWrite(ddl, catalog));
             granted(get(f.submit(() -> f.protocol.checkWrite(data, table("accounts")))));
             Future<AccessStatus> read = f.submit(() -> f.protocol.checkRead(binder, catalog));
@@ -480,11 +480,11 @@ public final class LockBasedProtocolTest {
     }
 
     private static ResourceId table(String name) {
-        return ResourceId.ofTable(name);
+        return Resources.table(name);
     }
 
     private static ResourceId record(String name, int slot) {
-        return ResourceId.ofRecord(name, new RID(new PageId(name + "-id", 0), slot));
+        return Resources.record(name, new RID(new PageId(name + "-id", 0), slot));
     }
 
     private static DataChange change(ResourceId resource) {
