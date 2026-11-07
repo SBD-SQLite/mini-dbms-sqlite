@@ -6,8 +6,10 @@ import sqlike.frm.RecoveryState;
 import sqlike.frm.port.SmPort;
 import sqlike.shared.RecoveryResult;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 public class RecoveryManager {
     private RecoveryState state;
@@ -38,8 +40,17 @@ public class RecoveryManager {
             // fase analysis
             RecoveryPlan plan = analyzer.analyze(records);
 
-            // fase undo
+            // fase undo: LogManager.logAbort menolak ABORT tanpa COMPENSATION per perubahan,
+            // jadi catat COMPENSATION (yang belum ada) sebelum menerapkan undo
+            Set<Long> compensated = new HashSet<>();
+            for (LogRecord record : records) {
+                record.undoOfLSN().ifPresent(compensated::add);
+            }
             for (LogRecord undoRec : plan.undoChanges) {
+                long txId = undoRec.txID().orElseThrow();
+                if (plan.needsAbortTx.contains(txId) && !compensated.contains(undoRec.lsn())) {
+                    logManager.logCompensation(txId, undoRec.lsn());
+                }
                 applier.undo(undoRec);
             }
 
@@ -59,7 +70,7 @@ public class RecoveryManager {
             state = RecoveryState.READY;
             
             lastResult = new RecoveryResult(
-                plan.maxTxId,
+                Math.max(plan.maxTxId, logManager.getMaxTxId()),
                 plan.lastTimestamp,
                 plan.lastRecoveredLSN,
                 plan.checkpointLsn != null ? Optional.of(plan.checkpointLsn) : Optional.empty()
