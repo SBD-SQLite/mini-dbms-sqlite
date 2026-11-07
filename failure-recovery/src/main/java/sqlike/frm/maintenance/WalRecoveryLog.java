@@ -11,7 +11,7 @@ import sqlike.frm.pitr.HistoricalLogPort;
 
 /**
  * {@link CheckpointLogPort} and {@link HistoricalLogPort} backed by {@link LogManager}. Snapshot
- * IDs live in {@code SnapshotCatalog}, so the CHECKPOINT record does not store them.
+ * IDs are recorded in {@code SnapshotCatalog}; the CHECKPOINT record also carries them.
  */
 public class WalRecoveryLog implements CheckpointLogPort, HistoricalLogPort {
 
@@ -33,21 +33,26 @@ public class WalRecoveryLog implements CheckpointLogPort, HistoricalLogPort {
 
     @Override
     public CheckpointInfo logCheckpoint(long flushedThroughLSN, String snapshotId) {
-        CheckpointInfo logged = wal.logCheckpoint(flushedThroughLSN);
-        return new CheckpointInfo(
-                logged.checkpointLSN(), logged.flushedThroughLSN(), logged.createdAt(), snapshotId);
+        return wal.logCheckpoint(flushedThroughLSN, snapshotId);
     }
 
+    /** Every epoch, archived ones first, in LSN order. */
     @Override
     public List<LogRecord> readHistory() {
-        // TODO(FR2): LogManager.readLogs reads only the active log; archived logs must come first.
-        return wal.readLogs(null);
+        return wal.readHistory();
     }
 
+    /**
+     * Archives the old timeline and opens a new WAL epoch whose LSNs continue after the last one.
+     * Snapshots are tracked by {@code SnapshotCatalog}, so the epoch marker only names the cut.
+     */
     @Override
     public void separateHistory() {
-        // TODO(FR2): archiveActiveLog + startNewLog must keep LSNs continuing after the last one.
+        long boundary = wal.getLastLsn();
         wal.archiveActiveLog();
-        wal.startNewLog();
+        wal.startNewLog(EPOCH_MARKER_PREFIX + boundary, boundary);
     }
+
+    /** Label of the CHECKPOINT marker that starts a new epoch after PITR. */
+    public static final String EPOCH_MARKER_PREFIX = "pitr-cut-";
 }

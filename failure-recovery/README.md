@@ -118,25 +118,30 @@ memakai satu maintenance lock.
 
 ## Status integrasi (Milestone 2)
 
-Branch ini sudah menggabungkan `feat/frm/log-implementation` (FR2), `feat/frm/recovery` (FR5), dan
-`feat/frm/checkpoint-pitr` (FR4). Facade memakai `RecoveryManager` FR5 dan `MaintenanceService`
-FR4 (checkpoint, checkpoint berkala, PITR, `WalRecoveryLog`). Saat startup pertama, facade membuat
-satu checkpoint sebagai snapshot dasar PITR. Kegagalan WAL yang butuh recovery (`WalException`),
-termasuk COMMIT yang hasilnya tidak pasti, membuat FRM FAILED (fail-stop) dan
+Branch ini mengikuti `develop/frm`: `LogManager` FR2 (PR #64), `RecoveryManager` FR5, dan
+`MaintenanceService` FR4 (checkpoint, checkpoint berkala, PITR, `WalRecoveryLog`). `WalRecoveryLog`
+sudah disesuaikan dengan API FR2 (`logCheckpoint(flushedThroughLSN, snapshotId)`, `readHistory()`
+semua epoch, `archiveActiveLog` + `startNewLog(snapshotId, targetLSN)`). Saat startup pertama, facade
+membuat satu checkpoint sebagai snapshot dasar PITR. `lastTxId` hasil recovery memakai
+`max(hasil FR5, LogManager.getMaxTxId())` supaya txId dari epoch arsip tidak dipakai ulang setelah PITR.
+`close()` juga menutup `LogManager` (melepas `<wal>.lock`). Kegagalan WAL yang butuh recovery
+(`WalException`), termasuk COMMIT yang hasilnya tidak pasti, membuat FRM FAILED (fail-stop) dan
 `FrmException.isCommitUnknown()` bernilai true.
 
 Hasil driver saat ini:
 
 | Konfigurasi | Hasil |
 |---|---|
-| Modul FRM apa adanya | 2/9 PASS; `LogManager` masih TODO dan rollback belum tersambung |
-| FR1+FR4+FR5 asli dengan log dan rollback pengganti sementara (di luar repo) | 8/9 PASS |
+| Modul FRM apa adanya | 5/9 PASS (startup-gate, log-view, checkpoint-timeout, committed-not-flushed, point-in-time-recovery) |
 | FRM referensi sementara (di luar repo) | 9/9 PASS; 7 bug yang ditanam semuanya tertangkap |
+
+FR2 mewajibkan setiap perubahan transaksi punya record COMPENSATION (`logCompensation(txId, lsnAsli)`,
+urut LSN menurun) sebelum `logAbort` diterima; tanpa itu muncul `WalException "Rollback belum selesai untuk T<id>"`.
 
 | Pemilik | Yang dibutuhkan agar skenario PASS |
 |---|---|
-| FR2 | Isi `LogManager`: tulis/baca WAL ke file memakai `LogRecordEncoder`, LSN unik, `ensureDurable`, `readLogs`, `readLogsBackward`, `showLogs`, `archiveActiveLog` + `startNewLog` yang melanjutkan LSN; lempar `WalException` saat gagal; sediakan high-water mark `maxTxId` epoch sebelumnya (`WalEpoch`) |
-| FR3 | `feat/frm/rollback` belum bisa di-merge (40 error compile, menimpa file FR4 dan facade, memakai tipe tiruan). Buat `sqlike.frm.rollback.RollbackManager implements RollbackPort`: baca `readLogsBackward(txId)`, tulis before-image lewat `SmPort.writeAt` dengan LSN aslinya, tolak transaksi committed/tidak dikenal, abaikan yang sudah ABORT, jangan menulis ABORT (PRD §11); lalu pasang di konstruktor facade |
-| FR4 | `WalRecoveryLog.readHistory()` harus ikut membaca log arsip setelah FR2 menyediakannya |
-| FR5 | `lastTxId` setelah PITR harus memakai `max(log aktif, maxTxId epoch)` dari FR2 (skenario `point-in-time-recovery`); `lastTimestamp` saat ini waktu jam, facade menormalkannya ke txId sesuai PRD §14 |
+| FR2 | Selesai (PR #64) |
+| FR3 | Skenario `rollback`, `aborted-and-committed`. `feat/frm/rollback-v2` perlu di-rebase ke `develop/frm` terbaru, lalu: sebelum tiap undo panggil `clr = logManager.logCompensation(txId, record.lsn())` dan tulis before-image dengan `sm.writeAt(table, rid, before, clr.lsn())`; lewati perubahan yang sudah punya CLR (`undoOfLSN`); `RollbackTests` tidak boleh lagi `extends LogManager` (kelasnya `final`), pakai `LogManager` asli di folder sementara. Setelah merge, konstruktor facade memasang `new RollbackManager(log, sm)` |
+| FR4 | Selesai (`WalRecoveryLog` disesuaikan di branch ini) |
+| FR5 | Skenario `uncommitted-flushed`, `checkpoint-recovery`. Di fase undo, untuk transaksi tanpa COMMIT/ABORT: per perubahan yang belum punya CLR, urut LSN menurun, panggil `logCompensation(txId, rec.lsn())` lalu tulis before-image dengan LSN CLR tersebut; baru setelah itu `logAbort(txId)`. Abaikan record COMPENSATION saat klasifikasi redo/undo |
 | Kontrak | Saat `contracts/` root ada: hapus salinan `IConcurrencyControlManager`, `IStorageManager`, `IWalDurability`, `sqlike.storage.*` di modul ini; ganti penantian di `ConcurrencyControlAdapter` dengan `awaitNoActiveTransactions(timeoutMs)`; tambah `logSchemaChange` (tipe `SchemaChange` sudah ada dari FR2) |
