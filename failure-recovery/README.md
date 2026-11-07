@@ -92,7 +92,7 @@ Setelah `run-driver` sekali (kelas sudah ada di `failure-recovery/out`):
 
 ```bash
 javac -d failure-recovery/out-test -cp failure-recovery/out failure-recovery/src/test/java/sqlike/frm/*.java
-java -cp "failure-recovery/out:failure-recovery/out-test" sqlike.frm.RollbackTests      # FR3, 11 test
+java -cp "failure-recovery/out:failure-recovery/out-test" sqlike.frm.RollbackTests      # FR3, 12 test
 java -cp "failure-recovery/out:failure-recovery/out-test" sqlike.frm.MaintenanceTests   # FR4, 13 test
 ```
 
@@ -130,26 +130,29 @@ memakai satu maintenance lock.
 
 ## Status integrasi (Milestone 2)
 
-Branch ini sudah menggabungkan `feat/frm/log-implementation` (FR2), `feat/frm/recovery` (FR5),
-`feat/frm/checkpoint-pitr` (FR4), dan rollback FR3 versi baru (`feat/frm/rollback-v2`). Facade memakai
-`RecoveryManager` FR5, `MaintenanceService` FR4 (checkpoint, checkpoint berkala, PITR,
-`WalRecoveryLog`), dan `RollbackManager` FR3 yang berbagi `LogManager` yang sama. Saat startup pertama, facade membuat
-satu checkpoint sebagai snapshot dasar PITR. Kegagalan WAL yang butuh recovery (`WalException`),
-termasuk COMMIT yang hasilnya tidak pasti, membuat FRM FAILED (fail-stop) dan
+Branch ini mengikuti `develop/frm`: `LogManager` FR2 (PR #64), `RecoveryManager` FR5,
+`RollbackManager` FR3 (memakai `LogManager` yang sama), dan `MaintenanceService` FR4 (checkpoint, checkpoint berkala, PITR, `WalRecoveryLog` yang sudah
+mengikuti API FR2 sejak PR #65). Saat startup pertama, facade
+membuat satu checkpoint sebagai snapshot dasar PITR. `lastTxId` hasil recovery memakai
+`max(hasil FR5, LogManager.getMaxTxId())` supaya txId dari epoch arsip tidak dipakai ulang setelah PITR.
+`close()` juga menutup `LogManager` (melepas `<wal>.lock`). Kegagalan WAL yang butuh recovery
+(`WalException`), termasuk COMMIT yang hasilnya tidak pasti, membuat FRM FAILED (fail-stop) dan
 `FrmException.isCommitUnknown()` bernilai true.
 
 Hasil driver saat ini:
 
 | Konfigurasi | Hasil |
 |---|---|
-| Modul FRM apa adanya | 2/9 PASS; `LogManager` FR2 masih TODO |
-| FR1+FR3+FR4+FR5 asli dengan log pengganti sementara (di luar repo) | 8/9 PASS |
+| Modul FRM apa adanya | 6/9 PASS (startup-gate, log-view, rollback, checkpoint-timeout, committed-not-flushed, point-in-time-recovery) |
 | FRM referensi sementara (di luar repo) | 9/9 PASS; 7 bug yang ditanam semuanya tertangkap |
+
+FR2 mewajibkan setiap perubahan transaksi punya record COMPENSATION (`logCompensation(txId, lsnAsli)`,
+urut LSN menurun) sebelum `logAbort` diterima; tanpa itu muncul `WalException "Rollback belum selesai untuk T<id>"`.
 
 | Pemilik | Yang dibutuhkan agar skenario PASS |
 |---|---|
-| FR2 | Isi `LogManager`: tulis/baca WAL ke file memakai `LogRecordEncoder`, LSN unik, `ensureDurable`, `readLogs`, `readLogsBackward`, `showLogs`, `archiveActiveLog` + `startNewLog` yang melanjutkan LSN; lempar `WalException` saat gagal; sediakan high-water mark `maxTxId` epoch sebelumnya (`WalEpoch`) |
-| FR3 | Selesai untuk M2 (`RollbackTests` 11/11). Rollback DDL menunggu `SmPort.restoreSchema` |
-| FR4 | `WalRecoveryLog.readHistory()` harus ikut membaca log arsip setelah FR2 menyediakannya |
-| FR5 | `lastTxId` setelah PITR harus memakai `max(log aktif, maxTxId epoch)` dari FR2 (skenario `point-in-time-recovery`); `lastTimestamp` saat ini waktu jam, facade menormalkannya ke txId sesuai PRD §14 |
+| FR2 | Selesai (PR #64) |
+| FR3 | Selesai (`feat/frm/rollback-v2`): tiap undo menulis COMPENSATION lalu before-image dengan LSN CLR tersebut |
+| FR4 | Selesai (PR #65) |
+| FR5 | Skenario `uncommitted-flushed`, `aborted-and-committed`, `checkpoint-recovery`. Di fase undo, untuk transaksi tanpa COMMIT/ABORT: per perubahan yang belum punya CLR, urut LSN menurun, panggil `logCompensation(txId, rec.lsn())` lalu tulis before-image dengan LSN CLR tersebut; baru setelah itu `logAbort(txId)`. Abaikan record COMPENSATION saat klasifikasi redo/undo |
 | Kontrak | Saat `contracts/` root ada: hapus salinan `IConcurrencyControlManager`, `IStorageManager`, `IWalDurability`, `sqlike.storage.*` di modul ini; ganti penantian di `ConcurrencyControlAdapter` dengan `awaitNoActiveTransactions(timeoutMs)`; tambah `logSchemaChange` (tipe `SchemaChange` sudah ada dari FR2) |

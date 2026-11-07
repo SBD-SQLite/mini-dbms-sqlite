@@ -220,7 +220,9 @@ public class FailureRecoveryManager
             state = RecoveryState.FAILED;
             throw new FrmException(ErrorCode.RECOVERY_FAILURE, "crash recovery returned no result");
         }
-        long lastTxId = Math.max(0L, result.lastTxId());
+        // FR5 only reads the active epoch; after PITR the old txIds live in archived epochs,
+        // so take FR2's max over every epoch too (txIds must never be reused).
+        long lastTxId = Math.max(Math.max(0L, result.lastTxId()), logManager.getMaxTxId());
         // PRD §14: one generator, logical timestamp = txId (not the wall-clock time of the log).
         lastRecovery = new RecoveryResult(lastTxId, lastTxId,
                 Math.max(0L, result.lastRecoveredLSN()), result.checkpointLSN());
@@ -325,7 +327,11 @@ public class FailureRecoveryManager
 
     @Override
     public void close() {
-        maintenance.close();
+        try {
+            maintenance.close();
+        } finally {
+            logManager.close(); // releases <wal>.lock so the log can be reopened
+        }
     }
 
     // ------------------------------------------------------------------ internals
