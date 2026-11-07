@@ -50,16 +50,29 @@ public class CheckpointManager {
                     throw new IllegalStateException(
                             "checkpoint timed out waiting for active transactions");
                 }
-
-                long flushedThroughLSN = checkpointLog.getLastLsn();
-                storageManager.flushAll();
-                String snapshotId = storageManager.createSnapshot();
-                return checkpointLog.logCheckpoint(flushedThroughLSN, snapshotId);
+                return checkpointWhileQuiesced();
             } finally {
                 concurrencyControl.resumeTransactions();
             }
         } finally {
             maintenanceLock.unlock();
         }
+    }
+
+    /**
+     * Executes the core checkpoint steps without locking or pausing transactions.
+     * Assumes the caller has already acquired the lock and verified system is idle.
+     */
+    public CheckpointInfo checkpointWhileQuiesced() {
+        long flushedThroughLSN = checkpointLog.getLastLsn();
+        checkpointLog.ensureDurable(flushedThroughLSN);
+
+        storageManager.flushAll();
+        String snapshotId = storageManager.createSnapshot();
+
+        CheckpointInfo info = checkpointLog.logCheckpoint(flushedThroughLSN, snapshotId);
+        checkpointLog.ensureDurable(info.checkpointLSN());
+
+        return info;
     }
 }
