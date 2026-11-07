@@ -33,6 +33,8 @@ public final class ConcurrencyControlManagerTest {
         check.test("begin is rejected until recovery finished", ConcurrencyControlManagerTest::beginBeforeReady);
         check.test("a failed logBegin aborts the transaction", ConcurrencyControlManagerTest::logBeginFails);
         check.test("finished transactions report that they were aborted", ConcurrencyControlManagerTest::abortedMessages);
+        check.test("a granted write logs one change and a read logs none", ConcurrencyControlManagerTest::oneLogPerWrite);
+        check.test("a failed change log aborts the transaction", ConcurrencyControlManagerTest::writeLogFails);
         check.done();
     }
 
@@ -103,5 +105,34 @@ public final class ConcurrencyControlManagerTest {
         r.ccm().commit(done);
         require(code(r.ccm().requestRead(done, record("a", 0)).error()) == ErrorCode.INVALID_STATE,
                 "a committed transaction is INVALID_STATE, not aborted");
+    }
+
+    private static long changeRecords(Rig r) {
+        return r.frm().getLog().stream().filter(line -> line.contains(" CHANGE tx=")).count();
+    }
+
+    private static void oneLogPerWrite() {
+        Rig r = rig();
+        long tx = begin(r);
+        granted(r.ccm().requestRead(tx, record("a", 0)));
+        require(changeRecords(r) == 0, "reads must not be logged");
+        AccessResponse write = r.ccm().requestWrite(tx, change("a", 0));
+        granted(write);
+        require(write.changeLSN().orElse(0L) > 0, "a granted write carries a positive LSN");
+        require(changeRecords(r) == 1, "exactly one change record per granted write");
+    }
+
+    private static void writeLogFails() {
+        Rig r = rig();
+        long tx = begin(r);
+        r.frm().setFailOnOperation("logChange", 1);
+        AccessResponse failed = r.ccm().requestWrite(tx, change("a", 0));
+        require(failed.status() == AccessStatus.ABORTED && code(failed.error()) == ErrorCode.WAL_FAILURE,
+                "the write must be refused with WAL_FAILURE");
+        require(r.frm().wasRolledBack(tx) && r.frm().wasAborted(tx), "the transaction must be rolled back");
+        require(code(r.ccm().requestRead(tx, record("a", 0)).error()) == ErrorCode.TRANSACTION_ABORTED,
+                "later requests see the abort");
+        long other = begin(r);
+        granted(r.ccm().requestWrite(other, change("a", 0)));
     }
 }

@@ -86,8 +86,13 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
             ResourceId resource = ResourceId.ofRecord(change.tableName(), change.rid());
             return switch (protocol.checkWrite(tx, resource)) {
                 case GRANTED -> {
-                    // TODO(CC3): if logging the change fails, the write must not be applied; abort instead.
-                    long lsn = frmBridge.logWrite(txId, change);
+                    long lsn;
+                    try {
+                        lsn = frmBridge.logWrite(txId, change);
+                    } catch (FrmFailureException e) {
+                        yield abortedAccess(tx, ErrorCode.WAL_FAILURE, e.getMessage());
+                    }
+                    tx.grantLsn(lsn);
                     recorder.record(new ScheduleOperation(txId, resource, true));
                     yield granted(Optional.of(lsn));
                 }
