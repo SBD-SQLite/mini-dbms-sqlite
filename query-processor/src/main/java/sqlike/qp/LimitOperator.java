@@ -1,6 +1,7 @@
 package sqlike.qp;
 
 import java.util.Optional;
+import sqlike.shared.ErrorCode;
 import sqlike.shared.LimitSpec;
 
 /**
@@ -34,9 +35,11 @@ public final class LimitOperator extends AbstractUnaryOperator {
 
     @Override
     protected void doOpen() {
+        ExecutionContext ctx = requireContext();
+        checkContextActive(ctx);
         this.remaining = spec.count();
         this.childClosed = false;
-        child.open(requireContext());
+        child.open(ctx);
         if (this.remaining == 0) {
             closeChildOnce();
         }
@@ -44,11 +47,18 @@ public final class LimitOperator extends AbstractUnaryOperator {
 
     @Override
     protected Optional<RowEnvelope> doNext() {
+        checkContextActive(requireContext());
         if (remaining <= 0) {
             closeChildOnce();
             return Optional.empty();
         }
-        Optional<RowEnvelope> next = child.next();
+        Optional<RowEnvelope> next;
+        try {
+            next = child.next();
+        } catch (RuntimeException e) {
+            closeChildOnce();
+            throw e;
+        }
         if (next.isEmpty()) {
             closeChildOnce();
             return Optional.empty();
@@ -71,5 +81,14 @@ public final class LimitOperator extends AbstractUnaryOperator {
             child.close();
         }
     }
-}
 
+    private void checkContextActive(ExecutionContext ctx) {
+        try {
+            ctx.check();
+        } catch (IllegalStateException e) {
+            closeChildOnce();
+            String msg = e.getMessage() != null ? e.getMessage() : "Transaction cancelled in LimitOperator";
+            throw new QpException(ErrorCode.TRANSACTION_ABORTED, msg);
+        }
+    }
+}
