@@ -1,1 +1,26 @@
 Query Optimizer
+
+## Kompilasi dengan Maven
+
+Semua komponen terdaftar sebagai modul Maven di `pom.xml` root, dan QO bergantung pada modul `shared`. Jalankan dari **root repositori** (butuh JDK 17+ dan Maven 3.9+):
+
+```bash
+mvn -pl query-optimizer -am compile        # kompilasi QO beserta modul shared
+mvn -pl query-optimizer -am test-compile   # kompilasi kode utama + test (src/test/java)
+mvn test-compile                           # kompilasi seluruh komponen sekaligus
+```
+
+Hasil kompilasi ada di `query-optimizer/target/classes` dan `query-optimizer/target/test-classes`. Test QO bukan JUnit, jadi `mvn test` hanya mengompilasi dan tidak menjalankannya. Jalankan `QODriver` langsung dengan `java` dari root repositori, karena `QO1Test` membaca `query-optimizer/src/test/resources/scenarios.txt` dengan path relatif:
+
+```bash
+# Linux / macOS
+java -cp "query-optimizer/target/classes:query-optimizer/target/test-classes:shared/target/classes" sqlike.qo.QODriver --test
+
+# Windows (ganti : dengan ;)
+java -cp "query-optimizer/target/classes;query-optimizer/target/test-classes;shared/target/classes" sqlike.qo.QODriver --test
+```
+
+Opsi lain `QODriver`:
+- tanpa argumen: menu interaktif
+- `--scenarios [file]`: menjalankan file skenario
+- `--explain "<SQL>"`: mencetak rencana kueri untuk satu perintah SQL

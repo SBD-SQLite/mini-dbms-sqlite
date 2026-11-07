@@ -12,6 +12,31 @@ recovery. Kontrak publiknya `sqlike.contract.IFailureRecoveryManager` (PRD v1.0 
 | FR4 | Checkpoint dan PITR | `frm.checkpoint.*`, `frm.pitr.*` |
 | FR5 | Crash recovery | `frm.recovery.*`, `frm.model.*` |
 
+## Kompilasi dengan Maven
+
+Semua komponen terdaftar sebagai modul Maven di `pom.xml` root, dan FRM bergantung pada modul
+`shared`. Jalankan dari **root repositori** (butuh Maven 3.9+):
+
+```bash
+mvn -pl failure-recovery -am compile        # kompilasi FRM beserta modul shared
+mvn -pl failure-recovery -am test-compile   # kompilasi kode utama + unit test
+mvn test-compile                            # kompilasi seluruh komponen sekaligus
+```
+
+Hasil kompilasi ada di `failure-recovery/target/classes` dan `failure-recovery/target/test-classes`.
+Unit test FRM bukan JUnit, jadi `mvn test` hanya mengompilasi dan tidak menjalankannya.
+Jalankan driver atau test langsung dengan `java`:
+
+```bash
+# Linux / macOS
+java -cp "failure-recovery/target/classes:failure-recovery/target/test-classes:shared/target/classes" sqlike.frm.MaintenanceTests
+java -cp "failure-recovery/target/classes:shared/target/classes" sqlike.frm.driver.FRMDriver --data-dir failure-recovery/frm-data
+
+# Windows (ganti : dengan ;)
+java -cp "failure-recovery/target/classes;failure-recovery/target/test-classes;shared/target/classes" sqlike.frm.MaintenanceTests
+java -cp "failure-recovery/target/classes;shared/target/classes" sqlike.frm.driver.FRMDriver --data-dir failure-recovery/frm-data
+```
+
 ## Menjalankan driver (FR-09)
 
 Butuh JDK 17 atau lebih baru (`javac` dan `java` ada di PATH). Skrip meng-compile `shared/` di root
