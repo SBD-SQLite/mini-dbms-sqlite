@@ -7,14 +7,17 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 
 import sqlike.shared.TransactionStatus;
 
 /**
  * Transaction IDs, statuses, and the new-transaction gate used during maintenance (CC1, CC-01).
  *
- * <p>Milestone 1 MOCK: IDs, lookup, and status changes work; status-change validation and the
- * maintenance gate are not enforced yet.
+ * <p>One lock guards the pause flag and the count of unfinished transactions, so waiting never spins.
+ * Pause only holds back new transactions; running ones can still finish.
  */
 public class TransactionManager {
 
@@ -31,17 +34,32 @@ public class TransactionManager {
         TRANSITIONS.put(TransactionStatus.ABORTED, EnumSet.noneOf(TransactionStatus.class));
     }
 
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Condition gateChanged = lock.newCondition();
+    private final Condition idle = lock.newCondition();
     private final Map<Long, Transaction> transactions = new ConcurrentHashMap<>();
     private long nextTxId = 1;
-    private volatile boolean acceptingNew = true;
+    private boolean paused;
+    private int unfinished;
 
-    /** Creates an ACTIVE transaction with a unique, increasing txId. The timestamp equals the txId. */
-    public synchronized Transaction create() {
-        // TODO(CC1): reject (or block) new transactions while acceptingNew is false.
-        long txId = nextTxId++;
-        Transaction tx = new Transaction(txId, txId);
-        transactions.put(txId, tx);
-        return tx;
+    /** Creates an ACTIVE transaction with a unique, increasing txId. Waits while paused. */
+    public Transaction create() {
+        lock.lock();
+        try {
+            while (paused) {
+                gateChanged.await();
+            }
+            long txId = nextTxId++;
+            Transaction tx = new Transaction(txId, txId);
+            transactions.put(txId, tx);
+            unfinished++;
+            return tx;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while waiting to start a transaction", e);
+        } finally {
+            lock.unlock();
+        }
     }
 
     public Optional<Transaction> get(long txId) {
@@ -54,52 +72,99 @@ public class TransactionManager {
         if (tx == null) {
             throw new IllegalArgumentException("Unknown transaction " + txId);
         }
-        synchronized (tx) {
+        lock.lock();
+        try {
             TransactionStatus current = tx.getStatus();
             if (!TRANSITIONS.get(current).contains(status)) {
                 throw new IllegalStateException(
                         "Invalid transition " + current + " -> " + status + " for transaction " + txId);
             }
             tx.setStatus(status);
+            if (status == TransactionStatus.COMMITTED || status == TransactionStatus.ABORTED) {
+                unfinished--;
+                idle.signalAll();
+            }
+        } finally {
+            lock.unlock();
         }
     }
 
     /** Returns whether any transaction has not finished yet (neither COMMITTED nor ABORTED). */
     public boolean hasActive() {
-        for (Transaction tx : transactions.values()) {
-            TransactionStatus status = tx.getStatus();
-            if (status != TransactionStatus.COMMITTED && status != TransactionStatus.ABORTED) {
-                return true;
-            }
+        lock.lock();
+        try {
+            return unfinished > 0;
+        } finally {
+            lock.unlock();
         }
-        return false;
     }
 
     /** Drops old transaction state so the next txId is greater than {@code lastTxId} (CC-05). */
-    public synchronized void resetAfterRecovery(long lastTxId) {
+    public void resetAfterRecovery(long lastTxId) {
         if (lastTxId < 0) {
             throw new IllegalArgumentException("lastTxId must not be negative");
         }
-        transactions.clear();
-        nextTxId = lastTxId + 1;
-        acceptingNew = true;
+        lock.lock();
+        try {
+            transactions.clear();
+            nextTxId = lastTxId + 1;
+            unfinished = 0;
+            idle.signalAll();
+        } finally {
+            lock.unlock();
+        }
     }
 
+    /** Holds back new transactions. Safe to call repeatedly. */
     public void pause() {
-        // MOCK: TODO(CC1): new transactions must wait until resume().
-        acceptingNew = false;
+        lock.lock();
+        try {
+            paused = true;
+        } finally {
+            lock.unlock();
+        }
     }
 
-    public void awaitNoActive() {
-        // MOCK: returns immediately. TODO(CC1): block until hasActive() is false.
-    }
-
+    /** Lets held-back transactions start. */
     public void resume() {
-        // MOCK: TODO(CC1): wake transactions waiting in create().
-        acceptingNew = true;
+        lock.lock();
+        try {
+            paused = false;
+            gateChanged.signalAll();
+        } finally {
+            lock.unlock();
+        }
     }
 
-    public boolean isAcceptingNew() {
-        return acceptingNew;
+    /** Waits without a limit until no unfinished transaction remains. */
+    public void awaitNoActive() {
+        lock.lock();
+        try {
+            while (unfinished > 0) {
+                idle.awaitUninterruptibly();
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Returns true when no unfinished transaction remains, false on timeout or interrupt. */
+    public boolean awaitNoActive(long timeoutMs) {
+        long remaining = TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        lock.lock();
+        try {
+            while (unfinished > 0) {
+                if (remaining <= 0) {
+                    return false;
+                }
+                remaining = idle.awaitNanos(remaining);
+            }
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } finally {
+            lock.unlock();
+        }
     }
 }

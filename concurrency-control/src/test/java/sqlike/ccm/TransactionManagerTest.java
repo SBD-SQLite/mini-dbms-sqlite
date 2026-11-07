@@ -1,7 +1,13 @@
 package sqlike.ccm;
 
+import static sqlike.ccm.Check.expectBlocked;
+import static sqlike.ccm.Check.get;
 import static sqlike.ccm.Check.rejects;
 import static sqlike.ccm.Check.require;
+
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import sqlike.shared.TransactionStatus;
 
@@ -12,6 +18,10 @@ public final class TransactionManagerTest {
         Check check = new Check("CC1 TransactionManager");
         check.test("valid status transitions", TransactionManagerTest::validTransitions);
         check.test("invalid and final transitions are rejected", TransactionManagerTest::invalidTransitions);
+        check.test("pause holds new transactions until resume", TransactionManagerTest::pauseHoldsCreate);
+        check.test("awaitNoActive times out while a transaction is unfinished", TransactionManagerTest::awaitTimesOut);
+        check.test("awaitNoActive wakes when the last transaction ends", TransactionManagerTest::awaitWakes);
+        check.test("pause is idempotent and recovery keeps the gate", TransactionManagerTest::resetKeepsGate);
         check.done();
     }
 
@@ -57,5 +67,65 @@ public final class TransactionManagerTest {
         rejects(IllegalStateException.class, () -> m.setStatus(failed, TransactionStatus.COMMITTED));
         m.setStatus(failed, TransactionStatus.ABORTED);
         rejects(IllegalStateException.class, () -> m.setStatus(failed, TransactionStatus.ACTIVE));
+    }
+
+    private static void pauseHoldsCreate() throws Exception {
+        TransactionManager m = manager();
+        Transaction running = m.create();
+        m.pause();
+        m.pause();
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<Transaction> blocked = pool.submit(() -> m.create());
+            expectBlocked(blocked);
+            m.setStatus(running.getTxId(), TransactionStatus.PARTIALLY_COMMITTED);
+            m.setStatus(running.getTxId(), TransactionStatus.COMMITTED);
+            m.resume();
+            require(get(blocked).getTxId() == 2, "released transaction must get the next id");
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    private static void awaitTimesOut() {
+        TransactionManager m = manager();
+        long id = m.create().getTxId();
+        require(m.hasActive(), "a new transaction is unfinished");
+        require(!m.awaitNoActive(50), "must time out while the transaction is active");
+        m.setStatus(id, TransactionStatus.FAILED);
+        require(!m.awaitNoActive(50), "a FAILED transaction is still unfinished");
+        m.setStatus(id, TransactionStatus.ABORTED);
+        require(m.awaitNoActive(50), "must be idle after ABORTED");
+        require(!m.hasActive(), "no unfinished transaction remains");
+    }
+
+    private static void awaitWakes() throws Exception {
+        TransactionManager m = manager();
+        long id = m.create().getTxId();
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<Boolean> idle = pool.submit(() -> m.awaitNoActive(2000));
+            expectBlocked(idle);
+            m.setStatus(id, TransactionStatus.PARTIALLY_COMMITTED);
+            m.setStatus(id, TransactionStatus.COMMITTED);
+            require(get(idle), "the waiter must report idle");
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    private static void resetKeepsGate() throws Exception {
+        TransactionManager m = manager();
+        m.pause();
+        m.resetAfterRecovery(5);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<Transaction> blocked = pool.submit(() -> m.create());
+            expectBlocked(blocked);
+            m.resume();
+            require(get(blocked).getTxId() == 6, "ids continue after lastTxId");
+        } finally {
+            pool.shutdownNow();
+        }
     }
 }
