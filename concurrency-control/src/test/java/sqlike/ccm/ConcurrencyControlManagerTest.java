@@ -40,6 +40,7 @@ public final class ConcurrencyControlManagerTest {
         check.test("a transient rollback failure is retried", ConcurrencyControlManagerTest::rollbackRetried);
         check.test("a failed rollback keeps the transaction FAILED and its locks", ConcurrencyControlManagerTest::rollbackStuck);
         check.test("a failed logAbort keeps the locks until a retry works", ConcurrencyControlManagerTest::logAbortStuck);
+        check.test("write access locks without logging", ConcurrencyControlManagerTest::writeAccess);
         check.done();
     }
 
@@ -226,5 +227,25 @@ public final class ConcurrencyControlManagerTest {
         require(r.frm().wasRolledBack(tx) && !r.frm().wasAborted(tx), "undo done, ABORT missing");
         r.frm().setFailOnOperation("logAbort", 0);
         require(r.ccm().abort(tx).status() == TransactionStatus.ABORTED, "the retry logs ABORT");
+    }
+
+    private static void writeAccess() throws Exception {
+        Rig r = rig();
+        long first = begin(r);
+        long second = begin(r);
+        AccessResponse access = r.ccm().requestWriteAccess(first, ResourceId.ofTable("a"));
+        granted(access);
+        require(access.changeLSN().isEmpty(), "write access has no LSN");
+        require(changeRecords(r) == 0, "write access must not write a log record");
+        granted(r.ccm().requestWrite(first, change("a", 0)));
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<AccessResponse> blocked = pool.submit(() -> r.ccm().requestWriteAccess(second, ResourceId.ofTable("a")));
+            expectBlocked(blocked);
+            r.ccm().commit(first);
+            granted(get(blocked));
+        } finally {
+            pool.shutdownNow();
+        }
     }
 }

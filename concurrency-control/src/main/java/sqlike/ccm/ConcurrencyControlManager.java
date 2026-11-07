@@ -104,6 +104,17 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
     }
 
     @Override
+    public AccessResponse requestWriteAccess(long txId, ResourceId resource) {
+        Objects.requireNonNull(resource, "resource");
+        return withActiveTransaction(txId, tx -> switch (protocol.checkWrite(tx, resource)) {
+            case GRANTED -> granted(Optional.empty());
+            case WAIT -> waiting();
+            case ABORTED -> abortedAccess(tx, ErrorCode.TRANSACTION_ABORTED,
+                    "Write access on " + resource.tableName() + " violates the protocol");
+        });
+    }
+
+    @Override
     public TransactionResponse commit(long txId) {
         Optional<Transaction> found = transactions.get(txId);
         if (found.isEmpty()) {
