@@ -45,6 +45,38 @@ public final class QpConfiguration {
                 Path.of(System.getProperty("java.io.tmpdir", "/tmp")));
     }
 
+    /** Options: --port, --max-clients, --join-buffer, --index, --temp. */
+    public static QpConfiguration fromArgs(String[] args) {
+        QpConfiguration base = defaults();
+        int port = base.port;
+        int maxClients = base.maxClients;
+        long joinBufferBytes = base.joinBufferBytes;
+        IndexType indexKind = base.defaultIndexKind;
+        Path temporaryDirectory = base.temporaryDirectory;
+        if (args != null) {
+            for (int i = 0; i < args.length; i++) {
+                String option = args[i];
+                if (i + 1 >= args.length) {
+                    throw new IllegalArgumentException("Missing value for option " + option);
+                }
+                String value = args[++i];
+                try {
+                    switch (option) {
+                        case "--port" -> port = Integer.parseInt(value);
+                        case "--max-clients" -> maxClients = Integer.parseInt(value);
+                        case "--join-buffer" -> joinBufferBytes = Long.parseLong(value);
+                        case "--index" -> indexKind = IndexType.valueOf(value.toUpperCase());
+                        case "--temp" -> temporaryDirectory = Path.of(value);
+                        default -> throw new IllegalArgumentException("Unknown option: " + option);
+                    }
+                } catch (NumberFormatException e) {
+                    throw new IllegalArgumentException("Invalid number for " + option + ": " + value);
+                }
+            }
+        }
+        return new QpConfiguration(port, maxClients, joinBufferBytes, indexKind, temporaryDirectory);
+    }
+
     public int getPort() {
         return port;
     }
