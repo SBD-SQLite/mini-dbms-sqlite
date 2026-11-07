@@ -2,9 +2,11 @@ package sqlike.qp;
 
 import java.util.*;
 import sqlike.qp.port.QpContracts.*;
-import sqlike.qp.stub.StubRuntime.*;
+import sqlike.shared.ColumnRef;
+import sqlike.shared.RID;
 import static sqlike.qp.port.QpContracts.failure;
 
+/** The source applies any WHERE predicate and preserves each target row's RID. */
 public final class UpdateExecutor extends AbstractCommandExecutor {
     private final Operator source;
     private final UpdateSpec spec;
@@ -12,37 +14,77 @@ public final class UpdateExecutor extends AbstractCommandExecutor {
     private final MutationTargetCollector collector;
     private final IExpressionEvaluator evaluator;
     private final MutationCoordinator mutations;
-    public UpdateExecutor(Operator source, UpdateSpec spec, Schema tableSchema, MutationTargetCollector collector,
-                          IExpressionEvaluator evaluator, MutationCoordinator mutations) {
-        this.source = Objects.requireNonNull(source); 
+    private ExecutionContext currentContext;
+
+    public UpdateExecutor(
+            Operator source,
+            UpdateSpec spec,
+            Schema tableSchema,
+            MutationTargetCollector collector,
+            IExpressionEvaluator evaluator,
+            MutationCoordinator mutations) {
+        super();
+        this.source = Objects.requireNonNull(source);
         this.spec = Objects.requireNonNull(spec);
-        this.tableSchema = Objects.requireNonNull(tableSchema); 
+        this.tableSchema = Objects.requireNonNull(tableSchema);
         this.collector = Objects.requireNonNull(collector);
-        this.evaluator = Objects.requireNonNull(evaluator); 
+        this.evaluator = Objects.requireNonNull(evaluator);
         this.mutations = Objects.requireNonNull(mutations);
     }
-    @Override protected long doExecute(ExecutionContext context) {
-        context.requireGrant(spec.tableId(), AccessMode.WRITE);
-        var targets = new LinkedHashMap<Rid, StoredRecord>();
-        for (StoredRecord record : collector.collect(source, spec.tableId(), context)) {
-            if (!record.tableId().equals(spec.tableId())) throw failure("Wrong update target table");
-            targets.putIfAbsent(record.rid(), record);
-        }
-        var values = new ArrayList<Row>();
-        for (StoredRecord before : targets.values()) { context.check(); values.add(calculateAfter(before)); }
-        long count = 0; int index = 0;
-        for (StoredRecord before : targets.values()) {
-            if (mutations.update(spec.tableId(), before, values.get(index++), context)) count++;
-        }
-        return count;
+
+    public Operator getSource() {
+        return source;
     }
-    @Override protected void doClose() { source.close(); }
+
+    public UpdateSpec getSpec() {
+        return spec;
+    }
+
+    @Override
+    protected long doExecute(ExecutionContext context) {
+        context.requireGrant(spec.tableName(), AccessMode.WRITE);
+        this.currentContext = context;
+        try {
+            // Materialize targets and evaluate SET before writing so scans cannot revisit updated rows.
+            var targets = new LinkedHashMap<RID, StoredRecord>();
+            for (StoredRecord record : collector.collect(source, spec.tableName(), context)) {
+                targets.putIfAbsent(record.rid(), record);
+            }
+            var values = new ArrayList<Row>();
+            for (StoredRecord before : targets.values()) {
+                context.check();
+                values.add(calculateAfter(before));
+            }
+            long count = 0;
+            int index = 0;
+            for (StoredRecord before : targets.values()) {
+                if (mutations.update(spec.tableName(), before, values.get(index++), context)) {
+                    count++;
+                }
+            }
+            return count;
+        } finally {
+            this.currentContext = null;
+        }
+    }
+
+    @Override
+    protected void doClose() {
+        source.close();
+    }
+
     private Row calculateAfter(StoredRecord before) {
-        int column = tableSchema.offset(spec.column());
-        var value = evaluator.evaluate(spec.value(), before.row(), tableSchema).value();
-        if (value == null) throw failure("SET requires a value");
-        var copy = new ArrayList<>(before.row().values()); 
-        copy.set(column, tableSchema.coerce(column, value)); 
+        ColumnRef colRef = spec.column();
+        int column = tableSchema.offset(colRef);
+        var res = (evaluator instanceof ExpressionEvaluator ee && currentContext != null)
+                ? ee.evaluateWithContext(spec.value().value(), before.row(), tableSchema, currentContext)
+                : evaluator.evaluate(spec.value().value(), before.row(), tableSchema);
+        var value = res.value();
+        if (res.isSqlNull() || value == null) {
+            throw failure("SET requires a non-null value for column " + colRef.columnName());
+        }
+        var copy = new ArrayList<>(before.row().values());
+        copy.set(column, tableSchema.coerce(column, value));
         return new Row(copy);
     }
 }

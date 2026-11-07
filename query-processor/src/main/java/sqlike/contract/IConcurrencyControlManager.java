@@ -1,13 +1,16 @@
 package sqlike.contract;
 
+import java.util.Optional;
 import sqlike.shared.AccessResponse;
+import sqlike.shared.AccessStatus;
 import sqlike.shared.DataChange;
 import sqlike.shared.ProtocolType;
 import sqlike.shared.ResourceId;
+import sqlike.shared.SchemaChange;
 import sqlike.shared.TransactionResponse;
 
 /**
- * CCM contract from the SQLike supergroup report (section 2.1), implemented by the CCM group.
+ * CCM contract from the SQLike supergroup report (section 2.1) and PRD §3.4, implemented by the CCM group.
  */
 public interface IConcurrencyControlManager {
 
@@ -40,4 +43,29 @@ public interface IConcurrencyControlManager {
 
     /** Resumes accepting new transactions after maintenance/checkpoint finishes (CC-01). */
     void resumeTransactions();
+
+    /** Requests write protection on a resource before reading before-image, without logging a change (PRD §3.4). */
+    default AccessResponse requestWriteAccess(long txId, ResourceId resource) {
+        return new AccessResponse(AccessStatus.GRANTED, Optional.empty(), Optional.empty(), Optional.empty());
+    }
+
+    /** Final permission and WAL logging of a schema change through FRM (PRD §3.4). */
+    default AccessResponse requestSchemaWrite(long txId, SchemaChange change) {
+        return new AccessResponse(AccessStatus.GRANTED, Optional.of(1L), Optional.empty(), Optional.empty());
+    }
+
+    /** Prevents concurrent abort/rollback while an authorized SM mutation is being applied (PRD §3.4). */
+    default boolean beginApply(long txId, long changeLSN) {
+        return true;
+    }
+
+    /** Marks completion of an SM mutation apply step (PRD §3.4). */
+    default void endApply(long txId, long changeLSN) {
+    }
+
+    /** Timeout overload for checkpoint idle waiting (PRD §3.4). */
+    default boolean awaitNoActiveTransactions(long timeoutMs) {
+        awaitNoActiveTransactions();
+        return true;
+    }
 }

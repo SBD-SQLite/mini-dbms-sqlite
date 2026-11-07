@@ -1,7 +1,7 @@
 package sqlike.storage;
 
-// M1 compile stub of the SM-owned checked exception; use the provider class when SM is integrated.
-public class StorageException extends Exception {
+// M1 compile stub of the SM-owned exception; use the provider class when SM is integrated.
+public class StorageException extends RuntimeException {
     private static final long serialVersionUID = 1L;
     private final StorageErrorCode code;
 

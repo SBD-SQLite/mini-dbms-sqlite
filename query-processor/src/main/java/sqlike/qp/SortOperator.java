@@ -1,4 +1,5 @@
 package sqlike.qp;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -20,9 +21,10 @@ public class SortOperator extends AbstractUnaryOperator {
         this.spec = Objects.requireNonNull(spec);
         this.comparator = Objects.requireNonNull(comparator);
         SortDirection direction = spec.direction() == null ? SortDirection.ASC : spec.direction();
-        if (!schema.equals(child.schema()) || comparator.getKeyOffset() != schema.findColumnOffset(spec.column())
+        if (!schema.equals(child.schema())
+                || comparator.getKeyOffset() != schema.findColumnOffset(spec.column())
                 || comparator.getDirection() != direction) {
-            throw new IllegalArgumentException("Sort fixture schema/comparator must match SortSpec");
+            throw new IllegalArgumentException("Sort schema/comparator must match SortSpec");
         }
         rows = new ArrayList<>();
         position = 0;
@@ -40,13 +42,17 @@ public class SortOperator extends AbstractUnaryOperator {
         if (getState() != OperatorState.NEW && getState() != OperatorState.CLOSED) {
             throw new QpException(ErrorCode.INVALID_STATE, "Close sort before changing its fixture");
         }
+        if (rows == null) {
+            mockRows = null;
+            return;
+        }
         List<RowEnvelope> copy = List.copyOf(rows);
         for (int i = 0; i < copy.size(); i++) {
             if (copy.get(i).row().size() != schema().columnCount()) {
                 throw new IllegalArgumentException("Sort fixture row width must match schema");
             }
             if (i > 0 && comparator.compare(copy.get(i - 1), copy.get(i)) > 0) {
-                throw new IllegalArgumentException("M1 sort rows must already follow SortSpec order");
+                throw new IllegalArgumentException("Sort fixture rows must already follow SortSpec order");
             }
         }
         mockRows = copy;
@@ -54,8 +60,9 @@ public class SortOperator extends AbstractUnaryOperator {
 
     @Override
     protected void doOpen() {
-        if (mockRows == null || childOpened) {
-            throw new QpException(ErrorCode.INVALID_STATE, "Register M1 sort rows and close the previous scan before open");
+        requireContext().check();
+        if (childOpened) {
+            throw new QpException(ErrorCode.INVALID_STATE, "Close the previous scan before open");
         }
         rows.clear();
         position = 0;
@@ -77,6 +84,7 @@ public class SortOperator extends AbstractUnaryOperator {
 
     @Override
     protected Optional<RowEnvelope> doNext() {
+        requireContext().check();
         return position < rows.size() ? Optional.of(rows.get(position++)) : Optional.empty();
     }
 
@@ -94,7 +102,27 @@ public class SortOperator extends AbstractUnaryOperator {
     }
 
     private void materializeInput() {
-        rows.addAll(mockRows);
+        requireContext().check();
+        if (mockRows != null) {
+            rows.addAll(mockRows);
+            return;
+        }
+        while (true) {
+            requireContext().check();
+            Optional<RowEnvelope> next = child.next();
+            if (next.isEmpty()) {
+                break;
+            }
+            RowEnvelope row = next.get();
+            if (row.row().size() != schema().columnCount()) {
+                throw new IllegalArgumentException("Child row width must match sort schema");
+            }
+            rows.add(row);
+        }
+        rows.sort((left, right) -> {
+            requireContext().check();
+            return comparator.compare(left, right);
+        });
+        requireContext().check();
     }
-
 }

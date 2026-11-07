@@ -1,18 +1,33 @@
 package sqlike.qp;
 
 import java.util.Objects;
-import sqlike.qp.port.QpContracts.*;
-import sqlike.qp.stub.StubRuntime.AbstractCommandExecutor;
+import sqlike.qp.port.QpContracts.AccessMode;
 
 public final class InsertExecutor extends AbstractCommandExecutor {
     private final InsertSpec spec;
     private final MutationCoordinator mutations;
+
     public InsertExecutor(InsertSpec spec, MutationCoordinator mutations) {
-        this.spec = Objects.requireNonNull(spec); this.mutations = Objects.requireNonNull(mutations);
+        super();
+        this.spec = Objects.requireNonNull(spec);
+        this.mutations = Objects.requireNonNull(mutations);
     }
-    @Override protected long doExecute(ExecutionContext context) { 
-        mutations.insert(spec.tableId(), spec.row(), context); 
-        return 1; 
+
+    public InsertSpec getSpec() {
+        return spec;
     }
-    @Override protected void doClose() { }
+
+    public MutationCoordinator getMutations() {
+        return mutations;
+    }
+
+    @Override
+    protected long doExecute(ExecutionContext context) {
+        context.requireGrant(spec.tableName(), AccessMode.WRITE);
+        mutations.insert(spec.tableName(), spec.row(), context);
+        return 1;
+    }
+
+    @Override
+    protected void doClose() { }
 }
