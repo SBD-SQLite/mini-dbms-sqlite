@@ -2,6 +2,7 @@ package sqlike.qp;
 
 import java.util.*;
 import sqlike.shared.AccessStatus;
+import sqlike.shared.ErrorCode;
 import sqlike.qp.port.QpContracts.*;
 import static sqlike.qp.port.QpContracts.failure;
 
@@ -12,6 +13,7 @@ public final class AccessCoordinator {
         this.concurrency = Objects.requireNonNull(concurrency);
     }
 
+    /** Acquire planned grants before opening operators, in table order with WRITE taking precedence. */
     public void acquireAll(PreparedStatement statement, ExecutionContext context) {
         if (statement == null || statement.accesses() == null || statement.accesses().isEmpty()) {
             return;
@@ -38,7 +40,7 @@ public final class AccessCoordinator {
         }
     }
 
-    private AccessGrant acquireOne(ResourceKey resource, AccessMode mode, ExecutionContext context) {
+    AccessGrant acquireOne(ResourceKey resource, AccessMode mode, ExecutionContext context) {
         context.check();
         TxId tx = new TxId(context.txId);
         if (concurrency.getState(tx) != TransactionState.ACTIVE) {
@@ -63,8 +65,11 @@ public final class AccessCoordinator {
             }
             decision = concurrency.waitAccess(decision.requestId());
         }
+        if (decision.status() == AccessStatus.ABORTED) {
+            throw new QpException(ErrorCode.TRANSACTION_ABORTED, "CCM aborted the transaction during an access request");
+        }
         if (decision.status() != AccessStatus.GRANTED) {
-            throw failure("CCM denied access or aborted transaction");
+            throw failure("CCM denied access: " + decision.status());
         }
         context.check();
         return decision.grant().orElseThrow(() -> failure("GRANTED has no access grant"));

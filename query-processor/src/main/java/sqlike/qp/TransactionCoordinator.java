@@ -5,6 +5,8 @@ import sqlike.qp.port.QpContracts.*;
 import static sqlike.qp.port.QpContracts.failure;
 
 public final class TransactionCoordinator {
+    private static final String COMMIT_OUTCOME_UNKNOWN = "Commit outcome unknown. Recovery required.";
+
     private final IConcurrencyControl concurrency;
     private final QpConfiguration configuration;
 
@@ -34,6 +36,9 @@ public final class TransactionCoordinator {
 
     public TransactionState commit(SessionState session) {
         TxId tx = new TxId(session.getCurrentTxId().orElseThrow(() -> failure("No transaction to commit")));
+        if (concurrency.getState(tx) == TransactionState.PARTIALLY_COMMITTED) {
+            return TransactionState.PARTIALLY_COMMITTED;
+        }
         TransactionState state = concurrency.commit(tx);
         clearCompleted(session, state);
         return state;
@@ -41,17 +46,27 @@ public final class TransactionCoordinator {
 
     public TransactionState abort(SessionState session, String reason) {
         TxId tx = new TxId(session.getCurrentTxId().orElseThrow(() -> failure("No transaction to abort")));
+        if (concurrency.getState(tx) == TransactionState.PARTIALLY_COMMITTED) {
+            return TransactionState.PARTIALLY_COMMITTED;
+        }
         TransactionState state = concurrency.abort(tx, reason);
         clearCompleted(session, state);
         return state;
     }
 
+    /**
+     * Route QP1's public auto-commit here and failures to {@link #handleRuntimeFailure}.
+     * This preserves PARTIALLY_COMMITTED for recovery.
+     */
     public void finishImplicit(SessionState session, ExecutionContext context) {
         if (!session.getId().equals(context.sessionId.orElse(null)) || session.getCurrentTxId().filter(id -> id == context.txId).isEmpty()) {
             throw failure("Context does not match session transaction");
         }
         if (context.implicit) {
             TransactionState state = commit(session);
+            if (state == TransactionState.PARTIALLY_COMMITTED) {
+                throw failure(COMMIT_OUTCOME_UNKNOWN);
+            }
             if (state != TransactionState.COMMITTED) {
                 throw failure("Auto-commit rejected: " + state);
             }
@@ -66,6 +81,10 @@ public final class TransactionCoordinator {
             return;
         }
         TransactionState state = concurrency.getState(new TxId(context.txId));
+        if (state == TransactionState.PARTIALLY_COMMITTED) {
+            // Recovery must resolve the commit outcome before any rollback.
+            return;
+        }
         if (state != TransactionState.COMMITTED && state != TransactionState.ABORTED) {
             state = concurrency.abort(new TxId(context.txId), error.message());
         }
@@ -82,6 +101,9 @@ public final class TransactionCoordinator {
         TransactionState state = concurrency.getState(new TxId(session.getCurrentTxId().orElseThrow()));
         if (state != TransactionState.COMMITTED && state != TransactionState.ABORTED) {
             state = abort(session, "Session closed");
+        }
+        if (state == TransactionState.PARTIALLY_COMMITTED) {
+            throw failure(COMMIT_OUTCOME_UNKNOWN);
         }
         clearCompleted(session, state);
         if (session.getCurrentTxId().isPresent()) {
@@ -101,6 +123,9 @@ public final class TransactionCoordinator {
         if (state == TransactionState.ABORTED) {
             clearCompleted(session, state);
             throw failure("Previous transaction was aborted; retry in a new transaction");
+        }
+        if (state == TransactionState.PARTIALLY_COMMITTED) {
+            throw failure(COMMIT_OUTCOME_UNKNOWN);
         }
         if (state != TransactionState.ACTIVE) {
             throw failure("Transaction is " + state + "; ABORT required");

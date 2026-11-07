@@ -6,6 +6,7 @@ import sqlike.shared.ColumnRef;
 import sqlike.shared.RID;
 import static sqlike.qp.port.QpContracts.failure;
 
+/** The source applies any WHERE predicate and preserves each target row's RID. */
 public final class UpdateExecutor extends AbstractCommandExecutor {
     private final Operator source;
     private final UpdateSpec spec;
@@ -41,6 +42,7 @@ public final class UpdateExecutor extends AbstractCommandExecutor {
     @Override
     protected long doExecute(ExecutionContext context) {
         context.requireGrant(spec.tableName(), AccessMode.WRITE);
+        // Materialize targets and evaluate SET before writing so scans cannot revisit updated rows.
         var targets = new LinkedHashMap<RID, StoredRecord>();
         for (StoredRecord record : collector.collect(source, spec.tableName(), context)) {
             targets.putIfAbsent(record.rid(), record);
