@@ -21,6 +21,7 @@ import sqlike.frm.port.CcmPort;
 import sqlike.frm.port.RollbackPort;
 import sqlike.frm.port.SmPort;
 import sqlike.frm.recovery.RecoveryManager;
+import sqlike.frm.rollback.RollbackManager;
 import sqlike.shared.DataChange;
 import sqlike.shared.ErrorCode;
 import sqlike.shared.RecoveryResult;
@@ -33,7 +34,7 @@ import sqlike.shared.RecoveryTargetKind;
  *
  * <ul>
  *   <li>FR2 {@link LogManager}: logBegin, logChange, logCommit, logAbort, ensureDurable, log view</li>
- *   <li>FR3 {@link RollbackPort}: rollback</li>
+ *   <li>FR3 {@link RollbackManager} (through {@link RollbackPort}): rollback</li>
  *   <li>FR4 {@link MaintenanceService}: checkpoint, periodic checkpoint, and recoverTo</li>
  *   <li>FR5 {@link RecoveryManager}: recover</li>
  * </ul>
@@ -52,12 +53,6 @@ import sqlike.shared.RecoveryTargetKind;
  */
 public class FailureRecoveryManager
         implements IFailureRecoveryManager, IWalDurability, LogViewer, AutoCloseable {
-
-    /** Used until FR3's RollbackManager is wired; fails loudly instead of pretending to undo. */
-    public static final RollbackPort ROLLBACK_NOT_WIRED = txId -> {
-        throw new FrmException(ErrorCode.UNSUPPORTED_OPERATION,
-                "rollback is not wired yet: FR3 RollbackManager must implement RollbackPort");
-    };
 
     private final FrmConfig config;
     private final LogManager logManager;
@@ -80,7 +75,12 @@ public class FailureRecoveryManager
     }
 
     public FailureRecoveryManager(SmPort sm, CcmPort ccm, FrmConfig config) {
-        this(sm, ccm, config, ROLLBACK_NOT_WIRED);
+        this(sm, ccm, config, new LogManager(config.logPath().toString()));
+    }
+
+    /** Uses a given FR2 log (e.g. a test double) with FR3's {@link RollbackManager} on that log. */
+    public FailureRecoveryManager(SmPort sm, CcmPort ccm, FrmConfig config, LogManager log) {
+        this(sm, ccm, config, new RollbackManager(log, sm), log);
     }
 
     public FailureRecoveryManager(SmPort sm, CcmPort ccm, FrmConfig config, RollbackPort rollback) {
