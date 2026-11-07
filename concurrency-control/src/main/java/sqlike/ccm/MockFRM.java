@@ -5,6 +5,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -38,14 +39,24 @@ public class MockFRM implements IFailureRecoveryManager {
     private final Set<Long> abortedTransactions = new HashSet<>();
     private final Set<Long> rolledBackTransactions = new HashSet<>();
     private boolean failNext = false;
-    private String failOnOperation = null;
+    private final Map<String, Integer> failuresLeft = new HashMap<>();
 
     public synchronized void setFailNext(boolean failNext) {
         this.failNext = failNext;
     }
 
     public synchronized void setFailOnOperation(String operation) {
-        this.failOnOperation = operation;
+        setFailOnOperation(operation, 1);
+    }
+
+    /** Makes the next {@code times} calls of {@code operation} throw; {@code times <= 0} clears it. */
+    public synchronized void setFailOnOperation(String operation, int times) {
+        String key = operation.toLowerCase(Locale.ROOT);
+        if (times <= 0) {
+            failuresLeft.remove(key);
+        } else {
+            failuresLeft.put(key, times);
+        }
     }
 
     public synchronized List<String> getLog() {
@@ -61,7 +72,7 @@ public class MockFRM implements IFailureRecoveryManager {
         abortedTransactions.clear();
         rolledBackTransactions.clear();
         failNext = false;
-        failOnOperation = null;
+        failuresLeft.clear();
     }
 
     public synchronized void seedValue(ResourceId resource, int value) {
@@ -105,9 +116,18 @@ public class MockFRM implements IFailureRecoveryManager {
     }
 
     private void checkFailNext(String operation) {
-        if (failNext || (failOnOperation != null && failOnOperation.equalsIgnoreCase(operation))) {
+        String key = operation.toLowerCase(Locale.ROOT);
+        Integer left = failuresLeft.get(key);
+        boolean injected = left != null && left > 0;
+        if (injected) {
+            if (left == 1) {
+                failuresLeft.remove(key);
+            } else {
+                failuresLeft.put(key, left - 1);
+            }
+        }
+        if (failNext || injected) {
             failNext = false;
-            failOnOperation = null;
             throw new RuntimeException("MockFRM simulated WAL failure on " + operation);
         }
     }
