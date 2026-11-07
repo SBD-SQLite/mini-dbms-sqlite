@@ -8,7 +8,7 @@ trap 'rm -rf "$ccm_build"' EXIT
 sources=()
 while IFS= read -r -d '' source; do
     sources+=("$source")
-done < <(find "$ccm_root/src/main/java" "$ccm_root/src/test/java" -name '*.java' -print0)
+done < <(find "$ccm_root/../shared/src/main/java" "$ccm_root/src/main/java" "$ccm_root/src/test/java" -name '*.java' -print0)
 
 javac --release 17 -d "$ccm_build/classes" "${sources[@]}"
 for test_file in "$ccm_root"/src/test/java/sqlike/ccm/*Test.java; do
