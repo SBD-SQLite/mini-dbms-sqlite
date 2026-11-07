@@ -13,12 +13,24 @@ import sqlike.qp.port.QpContracts.RecoveryReport;
 public final class QpBootstrap {
     private final IFailureRecovery recovery;
     private final IConcurrencyControl concurrency;
+    private final QueryProcessor processor;
     private final QueryServer server;
     private final AtomicReference<SystemState> state;
 
+    /** Recovery through the QP ports (stub runtime). */
     public QpBootstrap(IFailureRecovery recovery, IConcurrencyControl concurrency, QueryServer server) {
         this.recovery = Objects.requireNonNull(recovery, "IFailureRecovery cannot be null in QpBootstrap");
         this.concurrency = Objects.requireNonNull(concurrency, "IConcurrencyControl cannot be null in QpBootstrap");
+        this.processor = null;
+        this.server = Objects.requireNonNull(server, "QueryServer cannot be null in QpBootstrap");
+        this.state = new AtomicReference<>(SystemState.STARTING);
+    }
+
+    /** Recovery through QueryProcessor.initialize() (supergroup FRM and CCM). */
+    public QpBootstrap(QueryProcessor processor, QueryServer server) {
+        this.recovery = null;
+        this.concurrency = null;
+        this.processor = Objects.requireNonNull(processor, "QueryProcessor cannot be null in QpBootstrap");
         this.server = Objects.requireNonNull(server, "QueryServer cannot be null in QpBootstrap");
         this.state = new AtomicReference<>(SystemState.STARTING);
     }
@@ -29,11 +41,15 @@ public final class QpBootstrap {
         }
         state.set(SystemState.RECOVERING);
         try {
-            RecoveryReport report = recovery.recover();
-            validateRecovery(report);
-            concurrency.initialize(report);
-            if (server.getProcessor() instanceof QueryProcessor qp) {
-                qp.markReady();
+            if (processor != null) {
+                processor.initialize();
+            } else {
+                RecoveryReport report = recovery.recover();
+                validateRecovery(report);
+                concurrency.initialize(report);
+                if (server.getProcessor() instanceof QueryProcessor qp) {
+                    qp.markReady();
+                }
             }
             server.start();
             state.set(SystemState.READY);
@@ -64,4 +80,3 @@ public final class QpBootstrap {
         }
     }
 }
-
