@@ -9,8 +9,6 @@ import java.net.Socket;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import sqlike.contract.IQueryProcessor;
 import sqlike.qp.port.QpContracts.DbmsError;
@@ -30,7 +28,6 @@ public final class ClientSessionHandler implements Runnable, AutoCloseable {
     private SessionId sessionId;
     private final ProtocolCodec codec;
     private SocketResultSink sink;
-    private ExecutorService statementExecutor;
     private final AtomicBoolean closed;
 
     public ClientSessionHandler(Socket socket, IQueryProcessor processor, ProtocolCodec codec) {
@@ -38,7 +35,6 @@ public final class ClientSessionHandler implements Runnable, AutoCloseable {
         this.processor = Objects.requireNonNull(processor, "IQueryProcessor cannot be null in ClientSessionHandler");
         this.codec = Objects.requireNonNull(codec, "ProtocolCodec cannot be null in ClientSessionHandler");
         this.closed = new AtomicBoolean(false);
-        this.statementExecutor = Executors.newSingleThreadExecutor();
     }
 
     @Override
@@ -71,9 +67,6 @@ public final class ClientSessionHandler implements Runnable, AutoCloseable {
     public void close() {
         if (!closed.compareAndSet(false, true)) {
             return;
-        }
-        if (statementExecutor != null) {
-            statementExecutor.shutdownNow();
         }
         if (sessionId != null && processor instanceof QueryProcessor qp) {
             try {
