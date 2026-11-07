@@ -46,7 +46,13 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
 
     @Override
     public TransactionResponse beginTransaction() {
-        Transaction tx = transactions.create();
+        Transaction tx;
+        try {
+            tx = transactions.create();
+        } catch (IllegalStateException e) {
+            return new TransactionResponse(0L, 0L, TransactionStatus.FAILED,
+                    Optional.of(error(ErrorCode.INVALID_STATE, e.getMessage())));
+        }
         // TODO(CC3): if logging BEGIN fails, abort the transaction instead of returning ACTIVE.
         frmBridge.logBegin(tx.getTxId());
         protocol.onBegin(tx);
