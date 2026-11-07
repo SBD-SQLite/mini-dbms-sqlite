@@ -8,6 +8,7 @@ public enum StorageErrorCode {
     INVALID_RESERVATION,
     INVALID_STATE,
     UNSUPPORTED_OPERATION,
+    CORRUPTED_DATA,
     IO_ERROR,
     WAL_FAILURE
 }

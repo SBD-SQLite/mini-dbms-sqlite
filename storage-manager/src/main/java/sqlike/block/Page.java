@@ -1,4 +1,4 @@
-package sqlike.block
+package sqlike.block;
 
 import sqlike.shared.PageId;
 
