@@ -46,7 +46,6 @@ public class IndexHelper {
 
         if (key.textValue().isPresent()) {
             String text = key.textValue().get();
-        IndexHelper keys = new IndexHelper(schema.columns().get(column), serializer);
 
             for (int i = 0; i < text.length(); i++) {
                 char ch = text.charAt(i);
