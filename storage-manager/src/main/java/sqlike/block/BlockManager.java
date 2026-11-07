@@ -17,4 +17,8 @@ public class BlockManager{
     }
 
 
+    // SM-09 reads the configured page size; no disk behavior is changed.
+    public int getPageSize() {
+        return pageSize;
+    }
 }

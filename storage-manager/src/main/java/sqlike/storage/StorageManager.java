@@ -3,6 +3,11 @@ package sqlike.storage;
 import java.util.List;
 import java.util.Optional;
 import sqlike.contract.IStorageManager;
+import sqlike.record.RecordManager;
+import sqlike.catalog.CatalogManager;
+import sqlike.statistics.StatisticsManager;
+import sqlike.index.IndexManager;
+import sqlike.buffer.BufferPoolManager;
 import sqlike.shared.IndexCondition;
 import sqlike.shared.IndexMetadata;
 import sqlike.shared.InsertReservation;
@@ -33,6 +38,9 @@ public final class StorageManager implements IStorageManager {
         this.statistics = statistics;
         this.indexes = indexes;
         this.buffer = buffer;
+        if (statistics != null && records != null) {
+            statistics.setRecords(records);
+        }
     }
 
     @Override
@@ -73,17 +81,17 @@ public final class StorageManager implements IStorageManager {
 
     @Override
     public List<String> listTables() throws StorageException {
-        return List.of();
+        return catalog.listTables();
     }
 
     @Override
     public TableSchema getSchema(String table) throws StorageException {
-        return null;
+        return catalog.getSchema(table);
     }
 
     @Override
     public TableStatistics getStatistics(String table) throws StorageException {
-        return null;
+        return statistics.getStatistics(table);
     }
 
     @Override
@@ -92,7 +100,7 @@ public final class StorageManager implements IStorageManager {
 
     @Override
     public List<IndexMetadata> getIndexes(String table) throws StorageException {
-        return List.of();
+        return catalog.getIndexes(table);
     }
 
     @Override
