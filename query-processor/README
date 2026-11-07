@@ -158,9 +158,9 @@ java -cp out/classes sqlike.qp.QP1ScriptDriver --verbose query-processor/test-sc
 
 1. **Jalankan Server pada Terminal 1:**
    ```bash
-   java -cp out/classes sqlike.qp.stub.QpServerMain --port 5433 --max-clients 8 --data /tmp/sqlike-data
+   java -cp out/classes sqlike.qp.stub.QpServerMain --port 9543 --max-clients 8 --data /tmp/sqlike-data
    ```
 2. **Hubungkan Klien CLI pada Terminal 2:**
    ```bash
-   java -cp out/classes sqlike.qp.CliClient localhost 5433
+   java -cp out/classes sqlike.qp.CliClient localhost 9543
    ```
