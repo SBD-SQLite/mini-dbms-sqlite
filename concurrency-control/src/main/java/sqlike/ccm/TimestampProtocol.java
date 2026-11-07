@@ -191,15 +191,11 @@ public class TimestampProtocol implements IConcurrencyProtocol {
             throw new IllegalArgumentException("Resource name must not be blank");
         }
         
-        if (resource.scope() == ResourceScope.CATALOG) {
-            if (!name.equals("__catalog__") || resource.rid().isPresent()) {
+        if (Resources.isCatalog(resource)) {
+            if (!name.equals(Resources.CATALOG_NAME) || resource.rid().isPresent()) {
                 throw new IllegalArgumentException("Catalog resources must use __catalog__ without a RID");
             }
-            return new ResourceId(ResourceScope.CATALOG, name, Optional.empty());
-        }
-        
-        if (name.equals("__catalog__")) {
-            throw new IllegalArgumentException("__catalog__ is reserved for catalog resources");
+            return Resources.catalog();
         }
         
         return new ResourceId(ResourceScope.TABLE, name, Optional.empty());

@@ -96,7 +96,7 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
     public AccessResponse requestWrite(long txId, DataChange change) {
         Objects.requireNonNull(change, "change");
         return withActiveTransaction(txId, tx -> {
-            ResourceId resource = ResourceId.ofRecord(change.tableName(), change.rid());
+            ResourceId resource = Resources.record(change.tableName(), change.rid());
             return switch (protocol.checkWrite(tx, resource)) {
                 case GRANTED -> {
                     long lsn;
@@ -132,12 +132,12 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
         Objects.requireNonNull(change, "change");
         return withActiveTransaction(txId, tx -> {
             Set<ResourceId> resources = new LinkedHashSet<>();
-            resources.add(ResourceId.ofCatalog());
+            resources.add(Resources.catalog());
             for (SchemaImage image : change.before()) {
-                resources.add(ResourceId.ofTable(image.tableName()));
+                resources.add(Resources.table(image.tableName()));
             }
             for (SchemaImage image : change.after()) {
-                resources.add(ResourceId.ofTable(image.tableName()));
+                resources.add(Resources.table(image.tableName()));
             }
             for (ResourceId resource : resources) {
                 AccessStatus status = protocol.checkWrite(tx, resource);

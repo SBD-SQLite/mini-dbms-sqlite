@@ -242,14 +242,14 @@ public final class ConcurrencyControlManagerTest {
         Rig r = rig();
         long first = begin(r);
         long second = begin(r);
-        AccessResponse access = r.ccm().requestWriteAccess(first, ResourceId.ofTable("a"));
+        AccessResponse access = r.ccm().requestWriteAccess(first, Resources.table("a"));
         granted(access);
         require(access.changeLSN().isEmpty(), "write access has no LSN");
         require(changeRecords(r) == 0, "write access must not write a log record");
         granted(r.ccm().requestWrite(first, change("a", 0)));
         ExecutorService pool = Executors.newSingleThreadExecutor();
         try {
-            Future<AccessResponse> blocked = pool.submit(() -> r.ccm().requestWriteAccess(second, ResourceId.ofTable("a")));
+            Future<AccessResponse> blocked = pool.submit(() -> r.ccm().requestWriteAccess(second, Resources.table("a")));
             expectBlocked(blocked);
             r.ccm().commit(first);
             granted(get(blocked));
@@ -269,7 +269,7 @@ public final class ConcurrencyControlManagerTest {
                 "the schema change must be logged");
         ExecutorService pool = Executors.newSingleThreadExecutor();
         try {
-            Future<AccessResponse> blocked = pool.submit(() -> r.ccm().requestRead(reader, ResourceId.ofCatalog()));
+            Future<AccessResponse> blocked = pool.submit(() -> r.ccm().requestRead(reader, Resources.catalog()));
             expectBlocked(blocked);
             r.ccm().commit(ddl);
             granted(get(blocked));

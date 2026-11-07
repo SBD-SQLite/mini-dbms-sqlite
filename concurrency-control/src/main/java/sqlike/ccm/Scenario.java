@@ -265,10 +265,10 @@ public class Scenario {
         if (colonIdx > 0) {
             String table = symbol.substring(0, colonIdx).trim();
             int slot = Integer.parseInt(symbol.substring(colonIdx + 1).trim());
-            return ResourceId.ofRecord(table, new RID(new PageId(table, 0L), slot));
+            return Resources.record(table, new RID(new PageId(table, 0L), slot));
         }
         int slot = Math.abs(symbol.hashCode() % 10_000);
-        return ResourceId.ofRecord("items_" + symbol, new RID(new PageId("items_" + symbol, 0L), slot));
+        return Resources.record("items_" + symbol, new RID(new PageId("items_" + symbol, 0L), slot));
     }
 
     public String getName() {
