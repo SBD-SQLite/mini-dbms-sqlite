@@ -35,6 +35,8 @@ public final class ConcurrencyControlManagerTest {
         check.test("finished transactions report that they were aborted", ConcurrencyControlManagerTest::abortedMessages);
         check.test("a granted write logs one change and a read logs none", ConcurrencyControlManagerTest::oneLogPerWrite);
         check.test("a failed change log aborts the transaction", ConcurrencyControlManagerTest::writeLogFails);
+        check.test("commit releases locks only after COMMIT is logged", ConcurrencyControlManagerTest::commitOrder);
+        check.test("a failed COMMIT log is an unknown outcome, not an abort", ConcurrencyControlManagerTest::commitUnknown);
         check.done();
     }
 
@@ -134,5 +136,48 @@ public final class ConcurrencyControlManagerTest {
                 "later requests see the abort");
         long other = begin(r);
         granted(r.ccm().requestWrite(other, change("a", 0)));
+    }
+
+    private static void commitOrder() throws Exception {
+        Rig r = rig();
+        long writer = begin(r);
+        long waiter = begin(r);
+        granted(r.ccm().requestWrite(writer, change("a", 0)));
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<AccessResponse> blocked = pool.submit(() -> r.ccm().requestWrite(waiter, change("a", 1)));
+            expectBlocked(blocked);
+            TransactionResponse commit = r.ccm().commit(writer);
+            require(commit.status() == TransactionStatus.COMMITTED && commit.error().isEmpty(), "commit succeeds");
+            require(r.frm().wasCommitted(writer), "COMMIT must be logged");
+            granted(get(blocked));
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    private static void commitUnknown() throws Exception {
+        Rig r = rig();
+        long first = begin(r);
+        long second = begin(r);
+        granted(r.ccm().requestWrite(first, change("a", 0)));
+        r.frm().setFailOnOperation("logCommit", 1);
+        TransactionResponse commit = r.ccm().commit(first);
+        require(commit.status() == TransactionStatus.PARTIALLY_COMMITTED, "the outcome stays unknown");
+        require(code(commit.error()) == ErrorCode.WAL_FAILURE, "the error must be WAL_FAILURE");
+        require(!r.frm().wasRolledBack(first) && !r.frm().wasCommitted(first), "no undo, no commit");
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<AccessResponse> blocked = pool.submit(() -> r.ccm().requestWrite(second, change("a", 1)));
+            expectBlocked(blocked);
+        } finally {
+            pool.shutdownNow();
+        }
+        require(code(r.ccm().beginTransaction().error()) == ErrorCode.INVALID_STATE, "new transactions are refused");
+        TransactionResponse abort = r.ccm().abort(first);
+        require(abort.status() == TransactionStatus.PARTIALLY_COMMITTED && code(abort.error()) == ErrorCode.INVALID_STATE,
+                "abort must not undo a commit that may have happened");
+        r.ccm().initAfterRecovery(10);
+        require(r.ccm().beginTransaction().txId() == 11, "recovery reopens the manager");
     }
 }

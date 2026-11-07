@@ -116,8 +116,15 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
             }
 
             transactions.setStatus(txId, TransactionStatus.PARTIALLY_COMMITTED);
-            // TODO(CC3): handle WAL failure and an uncertain commit result before releasing locks.
-            frmBridge.logCommit(txId);
+            try {
+                frmBridge.logCommit(txId);
+            } catch (FrmFailureException e) {
+                // COMMIT may already be durable, so do not undo anything: stay PARTIALLY_COMMITTED,
+                // keep the locks, and stop accepting transactions until recovery decides.
+                transactions.markNotReady();
+                return withError(tx, error(ErrorCode.WAL_FAILURE,
+                        "Commit outcome of transaction " + txId + " is unknown: " + e.getMessage()));
+            }
             transactions.setStatus(txId, TransactionStatus.COMMITTED);
             protocol.release(tx);
             recorder.markCommitted(txId);
@@ -135,6 +142,10 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
         TransactionStatus status = tx.getStatus();
         if (status == TransactionStatus.COMMITTED || status == TransactionStatus.ABORTED) {
             return withError(tx, error(ErrorCode.INVALID_STATE, "Transaction " + txId + " is " + status));
+        }
+        if (status == TransactionStatus.PARTIALLY_COMMITTED) {
+            return withError(tx, error(ErrorCode.INVALID_STATE,
+                    "Transaction " + txId + " has an unknown commit outcome; recovery is required"));
         }
         return handleAbort(tx, null);
     }
