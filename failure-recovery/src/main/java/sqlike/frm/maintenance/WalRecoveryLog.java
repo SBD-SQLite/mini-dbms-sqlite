@@ -9,10 +9,7 @@ import sqlike.frm.log.LogManager;
 import sqlike.frm.log.LogRecord;
 import sqlike.frm.pitr.HistoricalLogPort;
 
-/**
- * {@link CheckpointLogPort} and {@link HistoricalLogPort} backed by {@link LogManager}. Snapshot
- * IDs live in {@code SnapshotCatalog}, so the CHECKPOINT record does not store them.
- */
+/** {@link CheckpointLogPort} and {@link HistoricalLogPort} backed by {@link LogManager}. */
 public class WalRecoveryLog implements CheckpointLogPort, HistoricalLogPort {
 
     private final LogManager wal;
@@ -33,21 +30,17 @@ public class WalRecoveryLog implements CheckpointLogPort, HistoricalLogPort {
 
     @Override
     public CheckpointInfo logCheckpoint(long flushedThroughLSN, String snapshotId) {
-        CheckpointInfo logged = wal.logCheckpoint(flushedThroughLSN);
-        return new CheckpointInfo(
-                logged.checkpointLSN(), logged.flushedThroughLSN(), logged.createdAt(), snapshotId);
+        return wal.logCheckpoint(flushedThroughLSN, snapshotId);
     }
 
     @Override
     public List<LogRecord> readHistory() {
-        // TODO(FR2): LogManager.readLogs reads only the active log; archived logs must come first.
-        return wal.readLogs(null);
+        return wal.readHistory();
     }
 
     @Override
-    public void separateHistory() {
-        // TODO(FR2): archiveActiveLog + startNewLog must keep LSNs continuing after the last one.
+    public void separateHistory(String snapshotId, long targetLSN) {
         wal.archiveActiveLog();
-        wal.startNewLog();
+        wal.startNewLog(snapshotId, targetLSN);
     }
 }
