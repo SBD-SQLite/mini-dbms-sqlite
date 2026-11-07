@@ -1,8 +1,11 @@
 package sqlike.ccm;
 
+import java.util.EnumMap;
+import java.util.EnumSet;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 import sqlike.shared.TransactionStatus;
@@ -14,6 +17,19 @@ import sqlike.shared.TransactionStatus;
  * maintenance gate are not enforced yet.
  */
 public class TransactionManager {
+
+    private static final Map<TransactionStatus, Set<TransactionStatus>> TRANSITIONS =
+            new EnumMap<>(TransactionStatus.class);
+
+    static {
+        TRANSITIONS.put(TransactionStatus.ACTIVE,
+                EnumSet.of(TransactionStatus.PARTIALLY_COMMITTED, TransactionStatus.FAILED));
+        TRANSITIONS.put(TransactionStatus.PARTIALLY_COMMITTED,
+                EnumSet.of(TransactionStatus.COMMITTED, TransactionStatus.FAILED));
+        TRANSITIONS.put(TransactionStatus.FAILED, EnumSet.of(TransactionStatus.ABORTED));
+        TRANSITIONS.put(TransactionStatus.COMMITTED, EnumSet.noneOf(TransactionStatus.class));
+        TRANSITIONS.put(TransactionStatus.ABORTED, EnumSet.noneOf(TransactionStatus.class));
+    }
 
     private final Map<Long, Transaction> transactions = new ConcurrentHashMap<>();
     private long nextTxId = 1;
@@ -38,8 +54,14 @@ public class TransactionManager {
         if (tx == null) {
             throw new IllegalArgumentException("Unknown transaction " + txId);
         }
-        // TODO(CC1): allow only valid transitions; COMMITTED and ABORTED are final.
-        tx.setStatus(status);
+        synchronized (tx) {
+            TransactionStatus current = tx.getStatus();
+            if (!TRANSITIONS.get(current).contains(status)) {
+                throw new IllegalStateException(
+                        "Invalid transition " + current + " -> " + status + " for transaction " + txId);
+            }
+            tx.setStatus(status);
+        }
     }
 
     /** Returns whether any transaction has not finished yet (neither COMMITTED nor ABORTED). */
