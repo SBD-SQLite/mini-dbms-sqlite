@@ -44,8 +44,10 @@ public class QueryOptimizer implements IQueryOptimizer {
         PlanNode bound = binder.bind(query);
         if (isPassThrough(bound)) return new QueryPlan(bound, 0.0);
         PlanNode rewritten = selectionProjectionRewriter.rewrite(bound);
-        PlanNode best = optimizer.optimize(rewritten);
-        return new QueryPlan(best, costModel.getCost(best));
+        return costModel.withCatalogCache(() -> {
+            PlanNode best = optimizer.optimize(rewritten);
+            return new QueryPlan(best, costModel.getCost(best));
+        });
     }
 
     @Override

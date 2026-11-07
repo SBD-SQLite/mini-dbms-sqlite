@@ -4,6 +4,7 @@ import sqlike.contract.IStorageManager;
 import sqlike.shared.IndexMetadata;
 import sqlike.shared.PlanNode;
 
+import java.util.function.Supplier;
 import sqlike.shared.TableStatistics;
 
 /** Estimates disk I/O time in milliseconds using seek and block-transfer costs. */
@@ -25,7 +26,11 @@ public final class CostModel {
     /** Returns the sum of each node's local I/O cost and its child-plan costs. */
     public double getCost(PlanNode root) {
         if (root == null) throw QoErrors.invalidValue("plan root is null", 0);
-        return costNode(root);
+        return withCatalogCache(() -> costNode(root));
+    }
+
+    <T> T withCatalogCache(Supplier<T> action) {
+        return estimator.withCatalogCache(action);
     }
 
     private double costNode(PlanNode node) {
@@ -81,11 +86,16 @@ public final class CostModel {
         long batches = ceilDiv(outerBlocks, outerCapacity);
         long innerRescans = Math.max(0, batches - 1);
 
-        // The child costs already include producing/reading each input once. Charge
-        // only the additional inner scans here, avoiding double-counting the first pass.
-        // This assumes child results can be replayed as materialized relations; temp-file
-        // writes are not represented separately in the current plan model.
-        return innerRescans * (SEEK_TIME_MS + innerBlocks * TRANSFER_TIME_MS);
+        // Classic BNLJ charges two seeks per outer batch: one to read that batch,
+        // one to rescan the inner relation. Child costs already include the first
+        // seek and transfer pass for each input, so add both seeks and the inner
+        // transfers only for subsequent batches. Temporary-result writes remain
+        // outside this model.
+        // QP's BlockNestedLoopJoinOperator is still an M1 mock (batch filling,
+        // inner reopening, and matching are stubs), so it does not yet establish
+        // whether join inputs are spooled/materialized. This estimate assumes
+        // re-readable inputs; revisit it when the QP BNLJ execution is implemented.
+        return innerRescans * (2.0 * SEEK_TIME_MS + innerBlocks * TRANSFER_TIME_MS);
     }
 
     private double costSort(PlanNode node) {

@@ -13,7 +13,11 @@ final class PlanAnnotator {
     }
 
     PlanNode annotate(PlanNode n) {
-        List<PlanNode> children = n.children().stream().map(this::annotate).toList();
+        return estimator.withCatalogCache(() -> annotateCached(n));
+    }
+
+    private PlanNode annotateCached(PlanNode n) {
+        List<PlanNode> children = n.children().stream().map(this::annotateCached).toList();
         return new PlanNode(n.kind(), children, n.outputColumns(), rows(n),
                 n.scan(), n.predicate(), n.projection(), n.join(), n.sort(), n.mutation(), n.createIndex(),
                 n.limit(), n.createTable(), n.dropTable());

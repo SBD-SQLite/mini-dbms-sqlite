@@ -42,15 +42,19 @@ public final class Binder {
     private PlanNode bindScan(PlanNode node) {
         ScanSpec scan = node.scan().orElseThrow();
         TableSchema schema = table(scan.tableName());
+        Optional<String> indexName = scan.indexName();
         if (node.kind() == PlanNodeKind.INDEX_SCAN) {
-            boolean found = storage.getIndexes(schema.tableName()).stream()
-                    .anyMatch(i -> i.indexName().equalsIgnoreCase(scan.indexName().orElseThrow()));
-            if (!found) throw QoErrors.semantic("unknown index '" + scan.indexName().orElseThrow() + "'");
+            IndexMetadata index = storage.getIndexes(schema.tableName()).stream()
+                    .filter(i -> i.indexName().equalsIgnoreCase(scan.indexName().orElseThrow()))
+                    .findFirst()
+                    .orElseThrow(() -> QoErrors.semantic("unknown index '" + scan.indexName().orElseThrow() + "'"));
+            indexName = Optional.of(index.indexName());
         }
+        ScanSpec boundScan = new ScanSpec(schema.tableName(), indexName, scan.condition(), scan.alias());
         List<ResultColumn> outputs = schema.columns().stream()
                 .map(c -> new ResultColumn(c.name(), Optional.of(Refs.column(schema.tableName(), c.name())), c.dataType()))
                 .toList();
-        return copy(node, List.of(), outputs, Optional.of(scan), node.predicate(), node.projection(), node.join(), node.sort(), node.mutation(), node.createIndex());
+        return copy(node, List.of(), outputs, Optional.of(boundScan), node.predicate(), node.projection(), node.join(), node.sort(), node.mutation(), node.createIndex());
     }
 
     private PlanNode bindFilter(PlanNode node) {
@@ -141,6 +145,7 @@ public final class Binder {
             for (int i = 0; i < schema.columns().size(); i++)
                 if (!compatible(schema.columns().get(i).dataType(), mutation.insertValues().get(i).type()))
                     throw QoErrors.semantic("INSERT value type does not match column '" + schema.tableName() + "." + schema.columns().get(i).name() + "'");
+            mutation = new MutationSpec(schema.tableName(), mutation.insertValues(), mutation.updateColumn(), mutation.updateExpression());
             return copy(node, List.of(), List.of(), node.scan(), node.predicate(), node.projection(), node.join(), node.sort(), Optional.of(mutation), node.createIndex());
         }
         PlanNode child = bindNode(node.children().get(0));
@@ -150,6 +155,8 @@ public final class Binder {
             if (!compatible(columnSchema(target).dataType(), expressionType(value)))
                 throw QoErrors.semantic("UPDATE expression type does not match column '" + render(target) + "'");
             mutation = new MutationSpec(schema.tableName(), mutation.insertValues(), Optional.of(target), Optional.of(value));
+        } else {
+            mutation = new MutationSpec(schema.tableName(), mutation.insertValues(), mutation.updateColumn(), mutation.updateExpression());
         }
         return copy(node, List.of(child), child.outputColumns(), node.scan(), node.predicate(), node.projection(), node.join(), node.sort(), Optional.of(mutation), node.createIndex());
     }
@@ -157,8 +164,9 @@ public final class Binder {
     private PlanNode bindCreateIndex(PlanNode node) {
         IndexMetadata index = node.createIndex().orElseThrow();
         TableSchema schema = table(index.tableName());
-        column(schema, index.columnName());
-        return node;
+        ColumnSchema column = column(schema, index.columnName());
+        IndexMetadata boundIndex = new IndexMetadata(index.indexName(), schema.tableName(), column.name(), index.indexType());
+        return copy(node, node.children(), node.outputColumns(), node.scan(), node.predicate(), node.projection(), node.join(), node.sort(), node.mutation(), Optional.of(boundIndex));
     }
 
     private Expression bindExpression(Expression expression, List<TableSchema> tables) {
