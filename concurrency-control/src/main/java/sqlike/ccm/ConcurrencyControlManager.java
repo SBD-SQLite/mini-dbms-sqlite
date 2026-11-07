@@ -2,6 +2,7 @@ package sqlike.ccm;
 
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Function;
 
 import sqlike.contract.IConcurrencyControlManager;
 import sqlike.contract.IFailureRecoveryManager;
@@ -67,50 +68,34 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
     @Override
     public AccessResponse requestRead(long txId, ResourceId resource) {
         Objects.requireNonNull(resource, "resource");
-        Optional<Transaction> found = transactions.get(txId);
-        if (found.isEmpty()) {
-            return accessError(error(ErrorCode.NOT_FOUND, "Unknown transaction " + txId));
-        }
-        Transaction tx = found.get();
-        if (!tx.isActive()) {
-            return accessError(error(ErrorCode.INVALID_STATE, "Transaction " + txId + " is " + tx.getStatus()));
-        }
-
-        AccessStatus status = protocol.checkRead(tx, resource);
-        return switch (status) {
+        return withActiveTransaction(txId, tx -> switch (protocol.checkRead(tx, resource)) {
             case GRANTED -> {
                 recorder.record(new ScheduleOperation(txId, resource, false));
-                yield new AccessResponse(AccessStatus.GRANTED, Optional.empty(), Optional.empty(), Optional.empty());
+                yield granted(Optional.empty());
             }
-            case WAIT -> new AccessResponse(AccessStatus.WAIT, Optional.empty(), Optional.empty(), Optional.empty());
-            case ABORTED -> abortedAccess(tx, "Read on " + resource.tableName() + " violates the protocol");
-        };
+            case WAIT -> waiting();
+            case ABORTED -> abortedAccess(tx, ErrorCode.TRANSACTION_ABORTED,
+                    "Read on " + resource.tableName() + " violates the protocol");
+        });
     }
 
     @Override
     public AccessResponse requestWrite(long txId, DataChange change) {
         Objects.requireNonNull(change, "change");
-        Optional<Transaction> found = transactions.get(txId);
-        if (found.isEmpty()) {
-            return accessError(error(ErrorCode.NOT_FOUND, "Unknown transaction " + txId));
-        }
-        Transaction tx = found.get();
-        if (!tx.isActive()) {
-            return accessError(error(ErrorCode.INVALID_STATE, "Transaction " + txId + " is " + tx.getStatus()));
-        }
-
-        ResourceId resource = ResourceId.ofRecord(change.tableName(), change.rid());
-        AccessStatus status = protocol.checkWrite(tx, resource);
-        return switch (status) {
-            case GRANTED -> {
-                // TODO(CC3): if logging the change fails, the write must not be applied; abort instead.
-                long lsn = frmBridge.logWrite(txId, change);
-                recorder.record(new ScheduleOperation(txId, resource, true));
-                yield new AccessResponse(AccessStatus.GRANTED, Optional.of(lsn), Optional.empty(), Optional.empty());
-            }
-            case WAIT -> new AccessResponse(AccessStatus.WAIT, Optional.empty(), Optional.empty(), Optional.empty());
-            case ABORTED -> abortedAccess(tx, "Write on " + change.tableName() + " violates the protocol");
-        };
+        return withActiveTransaction(txId, tx -> {
+            ResourceId resource = ResourceId.ofRecord(change.tableName(), change.rid());
+            return switch (protocol.checkWrite(tx, resource)) {
+                case GRANTED -> {
+                    // TODO(CC3): if logging the change fails, the write must not be applied; abort instead.
+                    long lsn = frmBridge.logWrite(txId, change);
+                    recorder.record(new ScheduleOperation(txId, resource, true));
+                    yield granted(Optional.of(lsn));
+                }
+                case WAIT -> waiting();
+                case ABORTED -> abortedAccess(tx, ErrorCode.TRANSACTION_ABORTED,
+                        "Write on " + change.tableName() + " violates the protocol");
+            };
+        });
     }
 
     @Override
@@ -122,7 +107,7 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
         Transaction tx = found.get();
         synchronized (tx) {
             if (!tx.isActive()) {
-                return withError(tx, error(ErrorCode.INVALID_STATE, "Transaction " + txId + " is " + tx.getStatus()));
+                return withError(tx, inactiveError(tx));
             }
 
             transactions.setStatus(txId, TransactionStatus.PARTIALLY_COMMITTED);
@@ -217,10 +202,39 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
         }
     }
 
-    private AccessResponse abortedAccess(Transaction tx, String message) {
-        ErrorInfo reason = error(ErrorCode.TRANSACTION_ABORTED, message);
+    private AccessResponse abortedAccess(Transaction tx, ErrorCode code, String message) {
+        ErrorInfo reason = error(code, message);
         handleAbort(tx, reason);
         return new AccessResponse(AccessStatus.ABORTED, Optional.empty(), Optional.empty(), Optional.of(reason));
+    }
+
+    private AccessResponse withActiveTransaction(long txId, Function<Transaction, AccessResponse> action) {
+        Optional<Transaction> found = transactions.get(txId);
+        if (found.isEmpty()) {
+            return accessError(error(ErrorCode.NOT_FOUND, "Unknown transaction " + txId));
+        }
+        Transaction tx = found.get();
+        if (!tx.isActive()) {
+            return accessError(inactiveError(tx));
+        }
+        return action.apply(tx);
+    }
+
+    private static ErrorInfo inactiveError(Transaction tx) {
+        TransactionStatus status = tx.getStatus();
+        if (status == TransactionStatus.FAILED || status == TransactionStatus.ABORTED) {
+            return error(ErrorCode.TRANSACTION_ABORTED,
+                    "Transaction " + tx.getTxId() + " has been aborted (status " + status + ")");
+        }
+        return error(ErrorCode.INVALID_STATE, "Transaction " + tx.getTxId() + " is " + status);
+    }
+
+    private static AccessResponse granted(Optional<Long> lsn) {
+        return new AccessResponse(AccessStatus.GRANTED, lsn, Optional.empty(), Optional.empty());
+    }
+
+    private static AccessResponse waiting() {
+        return new AccessResponse(AccessStatus.WAIT, Optional.empty(), Optional.empty(), Optional.empty());
     }
 
     private void abortDeadlockVictim(long txId) {

@@ -427,7 +427,7 @@ public class CCMDriver {
      * Verifies concurrency invariants required by Milestone 2 (CC-01, CC-02, CC-04, CC-05):
      * 1. Concurrent multi-threaded {@code beginTransaction()} produces unique, monotonically increasing IDs/timestamps.
      * 2. Calling {@code setProtocol()} while a transaction is active throws {@code IllegalStateException}.
-     * 3. Calling {@code requestRead}, {@code requestWrite}, or {@code commit} after {@code ABORTED} is rejected with {@code INVALID_STATE}.
+     * 3. Calling {@code requestRead}, {@code requestWrite}, or {@code commit} after {@code ABORTED} is rejected with {@code TRANSACTION_ABORTED}.
      */
     private boolean runInvariantVerificationScenario(Scenario scenario) {
         List<String> stepLogs = new ArrayList<>();
@@ -495,16 +495,16 @@ public class CCMDriver {
             TransactionResponse commitAfterAbort = ccm.commit(abortedTxId);
 
             boolean postAbortRejected = readAfterAbort.status() == AccessStatus.ABORTED
-                    && readAfterAbort.error().map(ErrorInfo::code).orElse(null) == ErrorCode.INVALID_STATE
+                    && readAfterAbort.error().map(ErrorInfo::code).orElse(null) == ErrorCode.TRANSACTION_ABORTED
                     && writeAfterAbort.status() == AccessStatus.ABORTED
-                    && writeAfterAbort.error().map(ErrorInfo::code).orElse(null) == ErrorCode.INVALID_STATE
-                    && commitAfterAbort.error().map(ErrorInfo::code).orElse(null) == ErrorCode.INVALID_STATE;
+                    && writeAfterAbort.error().map(ErrorInfo::code).orElse(null) == ErrorCode.TRANSACTION_ABORTED
+                    && commitAfterAbort.error().map(ErrorInfo::code).orElse(null) == ErrorCode.TRANSACTION_ABORTED;
 
             if (!postAbortRejected) {
                 passed = false;
-                stepLogs.add("GAGAL: Operasi setelah ABORTED tidak ditolak dengan INVALID_STATE");
+                stepLogs.add("GAGAL: Operasi setelah ABORTED tidak ditolak dengan TRANSACTION_ABORTED");
             } else {
-                stepLogs.add("requestRead/requestWrite/commit setelah ABORTED -> ditolak (INVALID_STATE)");
+                stepLogs.add("requestRead/requestWrite/commit setelah ABORTED -> ditolak (TRANSACTION_ABORTED)");
             }
         } catch (Exception e) {
             passed = false;

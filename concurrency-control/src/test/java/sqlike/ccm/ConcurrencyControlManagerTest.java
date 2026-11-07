@@ -32,6 +32,7 @@ public final class ConcurrencyControlManagerTest {
         Check check = new Check("CCM facade");
         check.test("begin is rejected until recovery finished", ConcurrencyControlManagerTest::beginBeforeReady);
         check.test("a failed logBegin aborts the transaction", ConcurrencyControlManagerTest::logBeginFails);
+        check.test("finished transactions report that they were aborted", ConcurrencyControlManagerTest::abortedMessages);
         check.done();
     }
 
@@ -83,5 +84,24 @@ public final class ConcurrencyControlManagerTest {
         require(!r.frm().wasRolledBack(failed.txId()), "nothing was logged, so nothing is undone");
         TransactionResponse next = r.ccm().beginTransaction();
         require(next.status() == TransactionStatus.ACTIVE && next.txId() > failed.txId(), "ids are not reused");
+    }
+
+    private static void abortedMessages() {
+        Rig r = rig();
+        long tx = begin(r);
+        r.ccm().abort(tx);
+        AccessResponse read = r.ccm().requestRead(tx, record("a", 0));
+        AccessResponse write = r.ccm().requestWrite(tx, change("a", 0));
+        TransactionResponse commit = r.ccm().commit(tx);
+        for (Optional<ErrorInfo> error : java.util.List.of(read.error(), write.error(), commit.error())) {
+            require(code(error) == ErrorCode.TRANSACTION_ABORTED, "expected TRANSACTION_ABORTED");
+            require(error.get().message().contains("has been aborted"), "message must say the transaction was aborted");
+        }
+        require(read.status() == AccessStatus.ABORTED && write.status() == AccessStatus.ABORTED, "access is refused");
+
+        long done = begin(r);
+        r.ccm().commit(done);
+        require(code(r.ccm().requestRead(done, record("a", 0)).error()) == ErrorCode.INVALID_STATE,
+                "a committed transaction is INVALID_STATE, not aborted");
     }
 }
