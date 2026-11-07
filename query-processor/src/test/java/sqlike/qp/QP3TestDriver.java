@@ -1,12 +1,22 @@
 package sqlike.qp;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicLong;
 import sqlike.contract.IStorageManager;
+import sqlike.qp.port.QpContracts.AccessGrant;
+import sqlike.qp.port.QpContracts.AccessMode;
+import sqlike.qp.port.QpContracts.CancellationToken;
+import sqlike.qp.port.QpContracts.ResourceKey;
+import sqlike.qp.port.QpContracts.TableId;
+import sqlike.qp.port.QpContracts.TxId;
+import sqlike.qp.port.StorageAdapter;
 import sqlike.shared.ColumnRef;
 import sqlike.shared.ColumnSchema;
 import sqlike.shared.DataType;
@@ -27,6 +37,8 @@ import sqlike.shared.ScanSpec;
 import sqlike.shared.TableSchema;
 import sqlike.shared.TableStatistics;
 import sqlike.shared.Value;
+import sqlike.storage.StorageErrorCode;
+import sqlike.storage.StorageException;
 
 public class QP3TestDriver {
 
@@ -34,7 +46,10 @@ public class QP3TestDriver {
     private static int testsPassed = 0;
 
     public static void main(String[] args) {
-        System.out.println("SQLike QP3 (Row Operators & Delete) Tests      ");
+        System.out.println("==================================================");
+        System.out.println("   SQLike QP3 (Row Operators & Delete) Tests      ");
+        System.out.println("   Milestone 2 & PRD v1.0 Verification            ");
+        System.out.println("==================================================");
 
         try {
             testTableScanOperator();
@@ -44,7 +59,9 @@ public class QP3TestDriver {
             testLimitOperator();
             testMutationTargetCollector();
             testDeleteExecutor();
+            System.out.println("\n--------------------------------------------------");
             System.out.println("RESULT: All " + testsPassed + " / " + testsRun + " tests PASSED successfully!");
+            System.out.println("--------------------------------------------------");
         } catch (Throwable t) {
             System.err.println("\nTEST SUITE FAILED: " + t.getMessage());
             t.printStackTrace();
@@ -109,11 +126,12 @@ public class QP3TestDriver {
 
     // 1. TableScanOperator Tests
     private static void testTableScanOperator() {
-        System.out.println("[TEST] TableScanOperator (scan, rescan, empty, lifecycle)...");
+        System.out.println("[TEST] TableScanOperator (scan, rescan, empty, PRD error & cursor rules)...");
         InMemoryMockStorage storage = seedStudentStorage();
         Schema schema = studentSchema();
-        ScanSpec spec = new ScanSpec("students", Optional.empty(), Optional.empty());
+        ScanSpec spec = new ScanSpec("students", Optional.empty(), Optional.empty(), Optional.of("s"));
         TableScanOperator scanOp = new TableScanOperator(storage, spec, schema);
+        assertEquals("s", scanOp.getRelationId(), "TableScanOperator must expose alias as relationId when present");
         ExecutionContext ctx = ExecutionContext.of(101L);
 
         boolean threwBeforeOpen = false;
@@ -153,11 +171,42 @@ public class QP3TestDriver {
         emptyScan.open(ctx);
         assertTrue(emptyScan.next().isEmpty(), "Empty table scan must return Optional.empty()");
         emptyScan.close();
+
+        // PRD §8: StorageException(TABLE_NOT_FOUND) maps to ErrorCode.NOT_FOUND
+        storage.setMissingTableError("missing_tbl");
+        TableScanOperator missingTblScan = new TableScanOperator(
+                storage,
+                new ScanSpec("missing_tbl", Optional.empty(), Optional.empty()),
+                schema);
+        boolean threwTableNotFound = false;
+        try {
+            missingTblScan.open(ctx);
+        } catch (QpException e) {
+            threwTableNotFound = (e.getErrorInfo().code() == ErrorCode.NOT_FOUND);
+        }
+        assertTrue(threwTableNotFound, "StorageException(TABLE_NOT_FOUND) must map to ErrorCode.NOT_FOUND");
+
+        // PRD §2 & §8: UncheckedIOException during cursor read maps to ErrorCode.IO_ERROR and closes cursor
+        storage.setFailCursorOnTable("io_fail_tbl");
+        TableScanOperator ioFailScan = new TableScanOperator(
+                storage,
+                new ScanSpec("io_fail_tbl", Optional.empty(), Optional.empty()),
+                schema);
+        ioFailScan.open(ctx);
+        boolean threwIoError = false;
+        try {
+            ioFailScan.next();
+        } catch (QpException e) {
+            threwIoError = (e.getErrorInfo().code() == ErrorCode.IO_ERROR);
+        }
+        assertTrue(threwIoError, "UncheckedIOException on cursor must map to ErrorCode.IO_ERROR");
+        assertTrue(storage.wasLastFailingCursorClosed(), "Failing cursor must be closed automatically on failure");
+        ioFailScan.close();
     }
 
     // 2. IndexScanOperator Tests
     private static void testIndexScanOperator() {
-        System.out.println("[TEST] IndexScanOperator (lookupIndex, fetchRecord, missing RID)...");
+        System.out.println("[TEST] IndexScanOperator (lookupIndex, fetchRecord, missing/invalid RID)...");
         InMemoryMockStorage storage = seedStudentStorage();
         Schema schema = studentSchema();
         IndexCondition cond = new IndexCondition(
@@ -195,11 +244,43 @@ public class QP3TestDriver {
             brokenIndexOp.close();
         }
         assertTrue(threwNotFound, "IndexScan with dangling RID must throw QpException(NOT_FOUND)");
+
+        // PRD §8: Negative RID or wrong-table RID must throw ErrorCode.INVALID_VALUE
+        RID negativeRid = new RID(new PageId("students", -1L), 0);
+        storage.putIndexResults("idx_neg_rid", List.of(negativeRid));
+        IndexScanOperator negRidOp = new IndexScanOperator(
+                storage,
+                new IndexScanSpec("students", "idx_neg_rid", Optional.empty()),
+                schema);
+        negRidOp.open(ctx);
+        boolean threwInvalidRid = false;
+        try {
+            negRidOp.next();
+        } catch (QpException e) {
+            threwInvalidRid = (e.getErrorInfo().code() == ErrorCode.INVALID_VALUE);
+        } finally {
+            negRidOp.close();
+        }
+        assertTrue(threwInvalidRid, "Negative RID in IndexScan must throw QpException(INVALID_VALUE)");
+
+        // PRD §8: StorageException(INDEX_NOT_FOUND) maps to ErrorCode.NOT_FOUND
+        storage.setMissingIndexError("idx_nonexistent");
+        IndexScanOperator missingIdxOp = new IndexScanOperator(
+                storage,
+                new IndexScanSpec("students", "idx_nonexistent", Optional.empty()),
+                schema);
+        boolean threwIdxNotFound = false;
+        try {
+            missingIdxOp.open(ctx);
+        } catch (QpException e) {
+            threwIdxNotFound = (e.getErrorInfo().code() == ErrorCode.NOT_FOUND);
+        }
+        assertTrue(threwIdxNotFound, "StorageException(INDEX_NOT_FOUND) must map to ErrorCode.NOT_FOUND");
     }
 
     // 3. FilterOperator Tests
     private static void testFilterOperator() {
-        System.out.println("[TEST] FilterOperator (predicate filtering & RID preservation)...");
+        System.out.println("[TEST] FilterOperator (predicate filtering, no-match, cancellation)...");
         InMemoryMockStorage storage = seedStudentStorage();
         Schema schema = studentSchema();
         TableScanOperator scanOp = new TableScanOperator(
@@ -225,7 +306,7 @@ public class QP3TestDriver {
                 List.of(colAge, lit21));
 
         IExpressionEvaluator evaluator = new ExpressionEvaluator(new ValueComparator());
-        FilterOperator filterOp = new FilterOperator(scanOp, new FilterSpec(predicate), evaluator, schema);
+        FilterOperator filterOp = new FilterOperator(scanOp, new FilterSpec(predicate), evaluator);
         ExecutionContext ctx = ExecutionContext.of(103L);
 
         filterOp.open(ctx);
@@ -243,11 +324,44 @@ public class QP3TestDriver {
         assertEquals(strVal("Alice"), filtered.get(0).row().getValue(1), "First filtered row should be Alice");
         assertEquals(strVal("Charlie"), filtered.get(1).row().getValue(1), "Second filtered row should be Charlie");
         assertTrue(filtered.get(0).rid().isPresent(), "FilterOperator must preserve RID on RowEnvelope");
+
+        // No-match filter returns empty result without error (QP-06)
+        Expression lit99 = new Expression(
+                ExpressionKind.LITERAL,
+                Optional.of(intVal(99)),
+                Optional.empty(),
+                Optional.empty(),
+                List.of());
+        Expression impossiblePred = new Expression(
+                ExpressionKind.BINARY,
+                Optional.empty(),
+                Optional.empty(),
+                Optional.of(ExpressionOperator.GT),
+                List.of(colAge, lit99));
+        FilterOperator noMatchOp = new FilterOperator(scanOp, new FilterSpec(impossiblePred), evaluator);
+        noMatchOp.open(ctx);
+        assertTrue(noMatchOp.next().isEmpty(), "No-match WHERE predicate must return empty without error");
+        noMatchOp.close();
+
+        // Cancellation token during filter iteration throws TRANSACTION_ABORTED
+        CancellationToken cancelToken = new CancellationToken();
+        ExecutionContext cancelCtx = new ExecutionContext(1031L, Optional.empty(), true, new AtomicLong(), cancelToken);
+        filterOp.open(cancelCtx);
+        cancelToken.cancel();
+        boolean threwAborted = false;
+        try {
+            filterOp.next();
+        } catch (QpException e) {
+            threwAborted = (e.getErrorInfo().code() == ErrorCode.TRANSACTION_ABORTED);
+        } finally {
+            filterOp.close();
+        }
+        assertTrue(threwAborted, "Cancelled ExecutionContext in FilterOperator must throw TRANSACTION_ABORTED");
     }
 
     // 4. ProjectOperator Tests
     private static void testProjectOperator() {
-        System.out.println("[TEST] ProjectOperator (column projection & RID preservation)...");
+        System.out.println("[TEST] ProjectOperator (column projection, wildcard *, prefix t.*, RID)...");
         InMemoryMockStorage storage = seedStudentStorage();
         Schema baseSchema = studentSchema();
         TableScanOperator scanOp = new TableScanOperator(
@@ -271,6 +385,32 @@ public class QP3TestDriver {
         assertEquals(intVal(1), first.get().row().getValue(1), "Column 1 must be projected 'id'");
         assertTrue(first.get().rid().isPresent(), "ProjectOperator must preserve source RID");
         projectOp.close();
+
+        // Direct wildcard '*' expansion in ProjectOperator
+        ProjectSpec wildcardSpec = new ProjectSpec(List.of(new ColumnRef(Optional.empty(), "*")));
+        ProjectOperator wildcardOp = new ProjectOperator(scanOp, wildcardSpec);
+        assertEquals(4, wildcardOp.schema().columnCount(), "Wildcard '*' must expand to all 4 columns");
+        wildcardOp.open(ctx);
+        Optional<RowEnvelope> wildFirst = wildcardOp.next();
+        assertTrue(wildFirst.isPresent() && wildFirst.get().row().size() == 4, "Wildcard '*' row has 4 values");
+        wildcardOp.close();
+
+        // Prefixed wildcard 'students.*' expansion in ProjectOperator
+        ProjectSpec prefixedWildcardSpec = new ProjectSpec(List.of(new ColumnRef(Optional.of("students"), "*")));
+        ProjectOperator prefixedOp = new ProjectOperator(scanOp, prefixedWildcardSpec);
+        assertEquals(4, prefixedOp.schema().columnCount(), "Prefixed wildcard 'students.*' must expand to 4 columns");
+        prefixedOp.open(ctx);
+        assertTrue(prefixedOp.next().isPresent(), "Prefixed wildcard projection yields row");
+        prefixedOp.close();
+
+        // Unknown table prefix 'unknown.*' must fail with IllegalArgumentException
+        boolean threwUnknownPrefix = false;
+        try {
+            new ProjectOperator(scanOp, new ProjectSpec(List.of(new ColumnRef(Optional.of("unknown"), "*"))));
+        } catch (IllegalArgumentException e) {
+            threwUnknownPrefix = true;
+        }
+        assertTrue(threwUnknownPrefix, "Unknown prefix in 'unknown.*' must throw IllegalArgumentException");
     }
 
     // 4b. LimitOperator Tests (QP-16* Bonus)
@@ -301,7 +441,7 @@ public class QP3TestDriver {
 
     // 5. MutationTargetCollector Tests
     private static void testMutationTargetCollector() {
-        System.out.println("[TEST] MutationTargetCollector (materialization & missing RID error)...");
+        System.out.println("[TEST] MutationTargetCollector (materialization, deduplication, RID validation)...");
         InMemoryMockStorage storage = seedStudentStorage();
         Schema schema = studentSchema();
         TableScanOperator scanOp = new TableScanOperator(
@@ -314,6 +454,35 @@ public class QP3TestDriver {
         assertEquals(3, collected.size(), "Collector must materialize all 3 records from scan");
         assertEquals(OperatorState.CLOSED, scanOp.getState(), "Collector must close source operator in finally block");
 
+        // Duplicate RID deduplication check
+        RID dupRid = new RID(new PageId("students", 1L), 0);
+        Operator duplicateSource = new AbstractOperator(schema) {
+            private int idx = 0;
+
+            @Override
+            protected void doOpen() {
+                idx = 0;
+            }
+
+            @Override
+            protected Optional<RowEnvelope> doNext() {
+                if (idx >= 2) {
+                    return Optional.empty();
+                }
+                idx++;
+                return Optional.of(RowEnvelope.of(
+                        Row.of(List.of(intVal(1), strVal("Alice"), intVal(22), floatVal(3.8))),
+                        dupRid));
+            }
+
+            @Override
+            protected void doClose() {
+            }
+        };
+        List<StoredRecord> deduplicated = collector.collect(duplicateSource, "students", ctx);
+        assertEquals(1, deduplicated.size(), "MutationTargetCollector must deduplicate identical RIDs");
+
+        // Missing RID must trigger INVALID_STATE
         Operator ridlessSource = new AbstractOperator(schema) {
             private boolean emitted = false;
 
@@ -343,11 +512,48 @@ public class QP3TestDriver {
             threwMissingRid = (e.getErrorInfo().code() == ErrorCode.INVALID_STATE);
         }
         assertTrue(threwMissingRid, "MutationTargetCollector must throw QpException(INVALID_STATE) when RID is missing");
+
+        // Wrong-table RID must trigger INVALID_VALUE (PRD §8)
+        Operator wrongTableRidSource = new AbstractOperator(schema) {
+            private boolean emitted = false;
+
+            @Override
+            protected void doOpen() {
+                emitted = false;
+            }
+
+            @Override
+            protected Optional<RowEnvelope> doNext() {
+                if (emitted) {
+                    return Optional.empty();
+                }
+                emitted = true;
+                return Optional.of(RowEnvelope.of(
+                        Row.of(List.of(intVal(1), strVal("Wrong"), intVal(20), floatVal(3.0))),
+                        new RID(new PageId("other_table", 1L), 0)));
+            }
+
+            @Override
+            protected void doClose() {
+            }
+        };
+        boolean threwWrongTableRid = false;
+        try {
+            collector.collect(wrongTableRidSource, "students", ctx);
+        } catch (QpException e) {
+            threwWrongTableRid = (e.getErrorInfo().code() == ErrorCode.INVALID_VALUE);
+        }
+        assertTrue(threwWrongTableRid, "MutationTargetCollector must throw QpException(INVALID_VALUE) for foreign table RID");
+
+        // Verify withQpStorage factory works seamlessly with StorageAdapter
+        MutationTargetCollector qpCollector = MutationTargetCollector.withQpStorage(new StorageAdapter(storage));
+        List<StoredRecord> viaAdapter = qpCollector.collect(scanOp, new TableId("students"), ExecutionContext.of(1051L));
+        assertEquals(3, viaAdapter.size(), "MutationTargetCollector.withQpStorage must collect all 3 records");
     }
 
     // 6. DeleteExecutor Tests
     private static void testDeleteExecutor() {
-        System.out.println("[TEST] DeleteExecutor (filtered delete & one-shot execution)...");
+        System.out.println("[TEST] DeleteExecutor (filtered delete, unfiltered delete, WRITE grant, one-shot)...");
         InMemoryMockStorage storage = seedStudentStorage();
         Schema schema = studentSchema();
         TableScanOperator scanOp = new TableScanOperator(
@@ -399,12 +605,48 @@ public class QP3TestDriver {
         }
         assertTrue(threwReExecute, "Re-executing DeleteExecutor must throw QpException(INVALID_STATE)");
         deleteExec.close();
+
+        // PRD §10 step 2: DeleteExecutor must reject execution if context holds only READ grant
+        ExecutionContext readOnlyCtx = ExecutionContext.of(1061L);
+        readOnlyCtx.addGrant(new AccessGrant(
+                new TxId(1061L),
+                ResourceKey.table(new TableId("students")),
+                AccessMode.READ));
+        DeleteExecutor deniedDelete = new DeleteExecutor(
+                scanOp,
+                new DeleteSpec("students"),
+                collector,
+                mutations);
+        boolean threwMissingWriteGrant = false;
+        try {
+            deniedDelete.execute(readOnlyCtx);
+        } catch (QpException e) {
+            threwMissingWriteGrant = (e.getErrorInfo().code() == ErrorCode.INVALID_STATE);
+        } finally {
+            deniedDelete.close();
+        }
+        assertTrue(threwMissingWriteGrant, "DeleteExecutor must reject READ-only context with ErrorCode.INVALID_STATE");
+
+        // Unfiltered DELETE (without WHERE) deletes remaining 2 rows via logged delete per RID
+        DeleteExecutor deleteAllExec = new DeleteExecutor(
+                scanOp,
+                new DeleteSpec("students"),
+                collector,
+                mutations);
+        long deletedAll = deleteAllExec.execute(ExecutionContext.of(1062L));
+        assertEquals(2L, deletedAll, "Unfiltered DELETE must delete all remaining 2 rows");
+        assertEquals(0, storage.recordCount("students"), "Table must have 0 rows after unfiltered DELETE");
+        deleteAllExec.close();
     }
 
     // Mock In-Memory IStorageManager for QP3 Standalone Testing
     private static final class InMemoryMockStorage implements IStorageManager {
         private final Map<String, Map<RID, Record>> tables = new LinkedHashMap<>();
         private final Map<String, List<RID>> indexLookupResults = new LinkedHashMap<>();
+        private String missingTableErrorName;
+        private String missingIndexErrorName;
+        private String failCursorTableName;
+        private boolean lastFailingCursorClosed;
 
         void putRecord(String table, Record record) {
             tables.computeIfAbsent(table, k -> new LinkedHashMap<>()).put(record.rid(), record);
@@ -414,12 +656,50 @@ public class QP3TestDriver {
             indexLookupResults.put(indexName, List.copyOf(rids));
         }
 
+        void setMissingTableError(String tableName) {
+            this.missingTableErrorName = tableName;
+        }
+
+        void setMissingIndexError(String indexName) {
+            this.missingIndexErrorName = indexName;
+        }
+
+        void setFailCursorOnTable(String tableName) {
+            this.failCursorTableName = tableName;
+            this.lastFailingCursorClosed = false;
+        }
+
+        boolean wasLastFailingCursorClosed() {
+            return lastFailingCursorClosed;
+        }
+
         int recordCount(String table) {
             return tables.getOrDefault(table, Map.of()).size();
         }
 
         @Override
         public RecordCursor scan(String table) {
+            if (table.equals(missingTableErrorName)) {
+                throw new StorageException(StorageErrorCode.TABLE_NOT_FOUND, "Table not found: " + table);
+            }
+            if (table.equals(failCursorTableName)) {
+                return new RecordCursor() {
+                    @Override
+                    public boolean hasNext() {
+                        return true;
+                    }
+
+                    @Override
+                    public Record next() {
+                        throw new UncheckedIOException("Simulated disk read error", new IOException("corrupt page"));
+                    }
+
+                    @Override
+                    public void close() {
+                        lastFailingCursorClosed = true;
+                    }
+                };
+            }
             List<Record> snapshot = List.copyOf(tables.getOrDefault(table, Map.of()).values());
             Iterator<Record> it = snapshot.iterator();
             return new RecordCursor() {
@@ -461,6 +741,9 @@ public class QP3TestDriver {
 
         @Override
         public List<RID> lookupIndex(String name, IndexCondition condition) {
+            if (name.equals(missingIndexErrorName)) {
+                throw new StorageException(StorageErrorCode.INDEX_NOT_FOUND, "Index not found: " + name);
+            }
             return indexLookupResults.getOrDefault(name, List.of());
         }
 
