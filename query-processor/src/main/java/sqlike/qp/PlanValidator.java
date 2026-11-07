@@ -3,22 +3,26 @@ package sqlike.qp;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.Set;
+import sqlike.shared.Expression;
+import sqlike.shared.ExpressionKind;
+import sqlike.shared.JoinSpec;
+import sqlike.shared.JoinType;
+import sqlike.shared.MutationSpec;
 import sqlike.shared.PlanNode;
 import sqlike.shared.PlanNodeKind;
 import sqlike.shared.QueryPlan;
+import sqlike.shared.SubqueryType;
 
 /**
- * PlanValidator validates query plan trees for structural integrity, arity, parameters,
- * and column references matching CLASS DIAGRAM FIX.
+ * PlanValidator validates query plan trees for structural integrity, cycle freedom, child arity,
+ * node parameters, expression structure, and column references matching CLASS DIAGRAM FIX and PRD §7.
  */
 public class PlanValidator {
 
     public PlanValidator() {
-        // TODO(M1-MOCK): Default constructor
     }
 
     public void validate(PreparedStatement statement) {
-        // TODO(M1-MOCK): Validate query plan inside prepared statement
         if (statement == null) {
             throw new IllegalArgumentException("PreparedStatement cannot be null");
         }
@@ -26,7 +30,6 @@ public class PlanValidator {
     }
 
     public void validate(QueryPlan plan) {
-        // TODO(M1-MOCK): Validate QueryPlan root node
         if (plan == null) {
             throw new IllegalArgumentException("QueryPlan cannot be null");
         }
@@ -34,7 +37,6 @@ public class PlanValidator {
     }
 
     public void validate(PlanNode root) {
-        // TODO(M1-MOCK): Validate node tree from root
         if (root == null) {
             throw new IllegalArgumentException("PlanNode root cannot be null");
         }
@@ -43,7 +45,6 @@ public class PlanValidator {
     }
 
     private void validateNode(PlanNode node, Set<PlanNode> path) {
-        // TODO(M1-MOCK): Validate single node and cycle detection
         if (node == null) {
             throw new IllegalArgumentException("PlanNode child cannot be null");
         }
@@ -58,7 +59,7 @@ public class PlanValidator {
                     "Invalid child count for " + node.kind() + ": expected " + expected + ", but found " + node.children().size());
         }
 
-        validateParameters(node);
+        validateParameters(node, path);
         validateColumnReferences(node);
 
         for (PlanNode child : node.children()) {
@@ -69,16 +70,25 @@ public class PlanValidator {
     }
 
     private void validateParameters(PlanNode node) {
-        // TODO(M1-MOCK): Validate node parameters matching PlanNodeKind
+        validateParameters(node, Collections.newSetFromMap(new IdentityHashMap<>()));
+    }
+
+    private void validateParameters(PlanNode node, Set<PlanNode> path) {
         switch (node.kind()) {
             case SCAN -> {
-                if (node.scan().isEmpty()) {
-                    throw new IllegalArgumentException("SCAN node must contain ScanSpec parameters");
+                if (node.scan().isEmpty()
+                        || node.scan().get().tableName() == null
+                        || node.scan().get().tableName().isBlank()) {
+                    throw new IllegalArgumentException("SCAN node must contain ScanSpec with non-blank tableName");
                 }
             }
             case INDEX_SCAN -> {
-                if (node.scan().isEmpty() || node.scan().get().indexName().isEmpty()) {
-                    throw new IllegalArgumentException("INDEX_SCAN node must contain ScanSpec with indexName");
+                if (node.scan().isEmpty()
+                        || node.scan().get().tableName() == null
+                        || node.scan().get().tableName().isBlank()
+                        || node.scan().get().indexName().isEmpty()
+                        || node.scan().get().indexName().get().isBlank()) {
+                    throw new IllegalArgumentException("INDEX_SCAN node must contain ScanSpec with tableName and indexName");
                 }
             }
             case FILTER -> {
@@ -95,9 +105,18 @@ public class PlanValidator {
                 if (node.join().isEmpty()) {
                     throw new IllegalArgumentException("JOIN node must contain JoinSpec parameters");
                 }
+                JoinSpec joinSpec = node.join().get();
+                if (joinSpec.joinType() == JoinType.THETA && joinSpec.condition().isEmpty()) {
+                    throw new IllegalArgumentException("THETA JOIN node must contain a join condition");
+                }
+                if (joinSpec.joinType() == JoinType.CARTESIAN && joinSpec.condition().isPresent()) {
+                    throw new IllegalArgumentException("CARTESIAN JOIN node must not contain a join condition");
+                }
             }
             case CARTESIAN -> {
-                // CARTESIAN can carry JoinSpec with CARTESIAN JoinType or empty if implied
+                if (node.join().isPresent() && node.join().get().condition().isPresent()) {
+                    throw new IllegalArgumentException("CARTESIAN node must not contain a join condition");
+                }
             }
             case SORT -> {
                 if (node.sort().isEmpty()) {
@@ -105,23 +124,41 @@ public class PlanValidator {
                 }
             }
             case INSERT -> {
-                if (node.mutation().isEmpty() || node.mutation().get().insertValues().isEmpty()) {
-                    throw new IllegalArgumentException("INSERT node must contain MutationSpec with insert values");
+                if (node.mutation().isEmpty()
+                        || node.mutation().get().tableName() == null
+                        || node.mutation().get().tableName().isBlank()
+                        || node.mutation().get().insertValues().isEmpty()) {
+                    throw new IllegalArgumentException("INSERT node must contain MutationSpec with tableName and insert values");
                 }
             }
             case UPDATE -> {
-                if (node.mutation().isEmpty() || node.mutation().get().updateColumn().isEmpty() || node.mutation().get().updateExpression().isEmpty()) {
-                    throw new IllegalArgumentException("UPDATE node must contain MutationSpec with updateColumn and updateExpression");
+                if (node.mutation().isEmpty()
+                        || node.mutation().get().tableName() == null
+                        || node.mutation().get().tableName().isBlank()
+                        || node.mutation().get().updateColumn().isEmpty()
+                        || node.mutation().get().updateExpression().isEmpty()) {
+                    throw new IllegalArgumentException("UPDATE node must contain MutationSpec with tableName, updateColumn, and updateExpression");
                 }
             }
             case DELETE -> {
                 if (node.mutation().isEmpty() && node.scan().isEmpty()) {
                     throw new IllegalArgumentException("DELETE node must specify target table");
                 }
+                String targetTable = node.mutation().map(MutationSpec::tableName)
+                        .orElseGet(() -> node.scan().map(sqlike.shared.ScanSpec::tableName).orElse(""));
+                if (targetTable == null || targetTable.isBlank()) {
+                    throw new IllegalArgumentException("DELETE node must specify a non-blank target tableName");
+                }
             }
             case CREATE_INDEX -> {
-                if (node.createIndex().isEmpty()) {
-                    throw new IllegalArgumentException("CREATE_INDEX node must contain IndexMetadata parameters");
+                if (node.createIndex().isEmpty()
+                        || node.createIndex().get().indexName() == null
+                        || node.createIndex().get().indexName().isBlank()
+                        || node.createIndex().get().tableName() == null
+                        || node.createIndex().get().tableName().isBlank()
+                        || node.createIndex().get().columnName() == null
+                        || node.createIndex().get().columnName().isBlank()) {
+                    throw new IllegalArgumentException("CREATE_INDEX node must contain valid IndexMetadata parameters");
                 }
             }
             case LIMIT -> {
@@ -130,36 +167,75 @@ public class PlanValidator {
                 }
             }
             case CREATE_TABLE -> {
-                if (node.createTable().isEmpty()) {
-                    throw new IllegalArgumentException("CREATE_TABLE node must contain CreateTableSpec parameters");
+                if (node.createTable().isEmpty()
+                        || node.createTable().get().tableName() == null
+                        || node.createTable().get().tableName().isBlank()
+                        || node.createTable().get().columns() == null
+                        || node.createTable().get().columns().isEmpty()) {
+                    throw new IllegalArgumentException("CREATE_TABLE node must contain valid CreateTableSpec parameters");
                 }
             }
             case DROP_TABLE -> {
-                if (node.dropTable().isEmpty()) {
-                    throw new IllegalArgumentException("DROP_TABLE node must contain DropTableSpec parameters");
+                if (node.dropTable().isEmpty()
+                        || node.dropTable().get().tableName() == null
+                        || node.dropTable().get().tableName().isBlank()) {
+                    throw new IllegalArgumentException("DROP_TABLE node must contain valid DropTableSpec parameters");
                 }
             }
         }
-        node.predicate().ifPresent(expr -> validateExpression(expr, Collections.newSetFromMap(new IdentityHashMap<>())));
-        node.join().flatMap(sqlike.shared.JoinSpec::condition)
-                .ifPresent(expr -> validateExpression(expr, Collections.newSetFromMap(new IdentityHashMap<>())));
-        node.mutation().flatMap(sqlike.shared.MutationSpec::updateExpression)
-                .ifPresent(expr -> validateExpression(expr, Collections.newSetFromMap(new IdentityHashMap<>())));
+        node.predicate().ifPresent(expr -> validateExpression(expr, path));
+        node.join().flatMap(JoinSpec::condition)
+                .ifPresent(expr -> validateExpression(expr, path));
+        node.mutation().flatMap(MutationSpec::updateExpression)
+                .ifPresent(expr -> validateExpression(expr, path));
     }
 
-    private void validateExpression(sqlike.shared.Expression expr, Set<PlanNode> path) {
+    private void validateExpression(Expression expr, Set<PlanNode> path) {
         if (expr == null) {
-            return;
+            throw new IllegalArgumentException("Expression cannot be null");
         }
-        if (expr.kind() == sqlike.shared.ExpressionKind.SUBQUERY) {
-            var sub = expr.subquery().orElseThrow(
-                    () -> new IllegalArgumentException("SUBQUERY expression must contain SubquerySpec"));
-            int expectedOperands = sub.type() == sqlike.shared.SubqueryType.IN ? 1 : 0;
-            if (expr.operands().size() != expectedOperands) {
-                throw new IllegalArgumentException(
-                        "SUBQUERY " + sub.type() + " expects " + expectedOperands + " operand(s)");
+        if (expr.kind() == null) {
+            throw new IllegalArgumentException("ExpressionKind cannot be null");
+        }
+        switch (expr.kind()) {
+            case LITERAL -> {
+                if (expr.literal().isEmpty()) {
+                    throw new IllegalArgumentException("LITERAL expression must contain a Value");
+                }
             }
-            validateNode(sub.root(), path);
+            case COLUMN -> {
+                var col = expr.column().orElseThrow(
+                        () -> new IllegalArgumentException("COLUMN expression must contain a ColumnRef"));
+                if (col.columnName() == null || col.columnName().isBlank()) {
+                    throw new IllegalArgumentException("COLUMN expression columnName cannot be blank");
+                }
+            }
+            case UNARY -> {
+                if (expr.operator().isEmpty()) {
+                    throw new IllegalArgumentException("UNARY expression must contain an operator");
+                }
+                if (expr.operands().size() != 1 || expr.operands().get(0) == null) {
+                    throw new IllegalArgumentException("UNARY expression must contain 1 non-null operand");
+                }
+            }
+            case BINARY -> {
+                if (expr.operator().isEmpty()) {
+                    throw new IllegalArgumentException("BINARY expression must contain an operator");
+                }
+                if (expr.operands().size() != 2 || expr.operands().get(0) == null || expr.operands().get(1) == null) {
+                    throw new IllegalArgumentException("BINARY expression must contain 2 non-null operands");
+                }
+            }
+            case SUBQUERY -> {
+                var sub = expr.subquery().orElseThrow(
+                        () -> new IllegalArgumentException("SUBQUERY expression must contain SubquerySpec"));
+                int expectedOperands = sub.type() == SubqueryType.IN ? 1 : 0;
+                if (expr.operands().size() != expectedOperands) {
+                    throw new IllegalArgumentException(
+                            "SUBQUERY " + sub.type() + " expects " + expectedOperands + " operand(s)");
+                }
+                validateNode(sub.root(), path);
+            }
         }
         for (var operand : expr.operands()) {
             validateExpression(operand, path);
@@ -167,7 +243,6 @@ public class PlanValidator {
     }
 
     private int expectedArity(PlanNodeKind kind) {
-        // TODO(M1-MOCK): Child arity per node kind from CLASS DIAGRAM FIX invariants
         if (kind == null) {
             throw new IllegalArgumentException("PlanNodeKind cannot be null");
         }
@@ -179,7 +254,6 @@ public class PlanValidator {
     }
 
     private void validateColumnReferences(PlanNode node) {
-        // TODO(M1-MOCK): Validate column reference syntax
         if (node.projection() != null) {
             for (var ref : node.projection()) {
                 if (ref == null || ref.columnName() == null || ref.columnName().isBlank()) {
@@ -191,6 +265,12 @@ public class PlanValidator {
             var col = node.sort().get().column();
             if (col == null || col.columnName() == null || col.columnName().isBlank()) {
                 throw new IllegalArgumentException("Sort column reference cannot be empty");
+            }
+        }
+        if (node.mutation().isPresent() && node.mutation().get().updateColumn().isPresent()) {
+            var col = node.mutation().get().updateColumn().get();
+            if (col.columnName() == null || col.columnName().isBlank()) {
+                throw new IllegalArgumentException("Update column reference cannot be empty");
             }
         }
     }

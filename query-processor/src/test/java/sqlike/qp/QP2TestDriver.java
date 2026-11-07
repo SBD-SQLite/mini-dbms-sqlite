@@ -25,7 +25,7 @@ import sqlike.shared.SortSpec;
 import sqlike.shared.Value;
 
 /**
- * Standalone test suite and verification driver for QP2 Milestone 1 mock implementations.
+ * Standalone test suite and verification driver for QP2 Milestone 2 & PRD v1.0 implementations.
  * Tests PlanTranslator, PlanValidator, ExpressionEvaluator, and ValueComparator.
  */
 public class QP2TestDriver {
@@ -36,7 +36,7 @@ public class QP2TestDriver {
     public static void main(String[] args) {
         System.out.println("==================================================");
         System.out.println("   SQLike QP2 (Plan Translator & Evaluator) Tests");
-        System.out.println("   Milestone 1 Mock Implementation Verification  ");
+        System.out.println("   Milestone 2 & PRD v1.0 Verification           ");
         System.out.println("==================================================");
 
         try {
@@ -116,6 +116,22 @@ public class QP2TestDriver {
         assertTrue(comparator.compare(textA, textB) < 0, "Apple < Banana");
         assertTrue(comparator.equal(textA, textA), "Apple == Apple");
 
+        // CHAR vs VARCHAR and Unicode code-point comparison (supplementary emoji U+1F600 > BMP U+FFFD)
+        Value charVal = new Value(DataType.CHAR, Optional.empty(), Optional.empty(), Optional.of("Apple"));
+        assertTrue(comparator.equal(textA, charVal), "VARCHAR 'Apple' == CHAR 'Apple'");
+        Value bmpHigh = new Value(DataType.VARCHAR, Optional.empty(), Optional.empty(), Optional.of("\uFFFD"));
+        Value suppEmoji = new Value(DataType.VARCHAR, Optional.empty(), Optional.empty(), Optional.of("\uD83D\uDE00"));
+        assertTrue(comparator.compare(bmpHigh, suppEmoji) < 0, "Unicode code-point U+FFFD < U+1F600");
+
+        // NaN float comparison rejected with INVALID_VALUE
+        Value nanVal = new Value(DataType.FLOAT, Optional.empty(), Optional.of(Double.NaN), Optional.empty());
+        try {
+            comparator.compare(float10, nanVal);
+            throw new AssertionError("Comparing with NaN should fail");
+        } catch (QpException e) {
+            assertEquals(sqlike.shared.ErrorCode.INVALID_VALUE, e.getErrorInfo().code(), "NaN comparison throws INVALID_VALUE");
+        }
+
         // Incompatible types check
         try {
             comparator.compare(int10, textA);
@@ -130,7 +146,7 @@ public class QP2TestDriver {
     // 2. ExpressionEvaluator Arithmetic Tests
     // =========================================================================
     private static void testExpressionEvaluatorArithmetic() {
-        System.out.println("[TEST] ExpressionEvaluator Arithmetic (+, -, *, /)...");
+        System.out.println("[TEST] ExpressionEvaluator Arithmetic (+, -, *, /, unary -)...");
         ValueComparator comparator = new ValueComparator();
         ExpressionEvaluator evaluator = new ExpressionEvaluator(comparator);
 
@@ -159,13 +175,47 @@ public class QP2TestDriver {
         Value mixed = evaluator.arithmetic(ExpressionOperator.ADD, v15, v2_5);
         assertEquals(17.5, mixed.floatValue().orElse(0.0), "15 + 2.5 = 17.5");
 
-        // Division by zero check
+        // Unary negation (-15)
+        Expression negExpr = new Expression(ExpressionKind.UNARY, Optional.empty(), Optional.empty(),
+                Optional.of(ExpressionOperator.NEGATE),
+                List.of(new Expression(ExpressionKind.LITERAL, Optional.of(v15), Optional.empty(), Optional.empty(), List.of())));
+        assertEquals(-15, evaluator.evaluate(negExpr, null, null).value().integerValue().orElse(0), "-15 = -15");
+
+        // Division by zero check (direct arithmetic call)
         try {
             evaluator.arithmetic(ExpressionOperator.DIVIDE, v15, vZero);
             throw new AssertionError("Division by zero should fail");
         } catch (ArithmeticException e) {
             testsRun++;
             testsPassed++;
+        }
+
+        // Division by zero and integer overflow via evaluate() map to INVALID_VALUE (PRD §8)
+        Expression divZeroExpr = new Expression(ExpressionKind.BINARY, Optional.empty(), Optional.empty(),
+                Optional.of(ExpressionOperator.DIVIDE),
+                List.of(
+                        new Expression(ExpressionKind.LITERAL, Optional.of(v15), Optional.empty(), Optional.empty(), List.of()),
+                        new Expression(ExpressionKind.LITERAL, Optional.of(vZero), Optional.empty(), Optional.empty(), List.of())
+                ));
+        try {
+            evaluator.evaluate(divZeroExpr, null, null);
+            throw new AssertionError("Division by zero in evaluate() should throw QpException(INVALID_VALUE)");
+        } catch (QpException e) {
+            assertEquals(sqlike.shared.ErrorCode.INVALID_VALUE, e.getErrorInfo().code(), "Division by zero maps to INVALID_VALUE");
+        }
+
+        Value vMax = new Value(DataType.INTEGER, Optional.of(Integer.MAX_VALUE), Optional.empty(), Optional.empty());
+        Expression overflowExpr = new Expression(ExpressionKind.BINARY, Optional.empty(), Optional.empty(),
+                Optional.of(ExpressionOperator.ADD),
+                List.of(
+                        new Expression(ExpressionKind.LITERAL, Optional.of(vMax), Optional.empty(), Optional.empty(), List.of()),
+                        new Expression(ExpressionKind.LITERAL, Optional.of(v5), Optional.empty(), Optional.empty(), List.of())
+                ));
+        try {
+            evaluator.evaluate(overflowExpr, null, null);
+            throw new AssertionError("Integer overflow in evaluate() should throw QpException(INVALID_VALUE)");
+        } catch (QpException e) {
+            assertEquals(sqlike.shared.ErrorCode.INVALID_VALUE, e.getErrorInfo().code(), "Integer overflow maps to INVALID_VALUE");
         }
     }
 
@@ -271,6 +321,36 @@ public class QP2TestDriver {
             testsRun++;
             testsPassed++;
         }
+
+        // Invalid JOIN with 1 child (expected 2)
+        PlanNode invalidJoinArity = new PlanNode(PlanNodeKind.JOIN, List.of(scanNode), List.of(), Optional.empty(),
+                Optional.empty(), Optional.empty(), List.of(),
+                Optional.of(new JoinSpec(JoinType.NATURAL, Optional.empty(), JoinAlgorithm.BLOCK_NESTED_LOOP, List.of("id"))),
+                Optional.empty(), Optional.empty(), Optional.empty());
+        try {
+            validator.validate(invalidJoinArity);
+            throw new AssertionError("JOIN with 1 child should fail arity check");
+        } catch (IllegalArgumentException e) {
+            testsRun++;
+            testsPassed++;
+        }
+
+        // Cycle detection in validateNode when an ancestor node is revisited on the active path
+        try {
+            java.util.Set<PlanNode> activePath = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+            activePath.add(scanNode);
+            java.lang.reflect.Method validateNodeMethod =
+                    PlanValidator.class.getDeclaredMethod("validateNode", PlanNode.class, java.util.Set.class);
+            validateNodeMethod.setAccessible(true);
+            validateNodeMethod.invoke(validator, scanNode, activePath);
+            throw new AssertionError("Cyclic PlanNode reference should fail cycle detection");
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            assertTrue(cause instanceof IllegalArgumentException && cause.getMessage().contains("Cyclic"),
+                    "Cycle error message mentions Cyclic");
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError("Reflection failed: " + e.getMessage());
+        }
     }
 
     // =========================================================================
@@ -287,6 +367,37 @@ public class QP2TestDriver {
         try {
             validator.validate(scanNoSpec);
             throw new AssertionError("SCAN without ScanSpec should fail");
+        } catch (IllegalArgumentException e) {
+            testsRun++;
+            testsPassed++;
+        }
+
+        // THETA JOIN missing condition should fail
+        PlanNode validScan = new PlanNode(PlanNodeKind.SCAN, List.of(), List.of(), Optional.empty(),
+                Optional.of(new ScanSpec("employee", Optional.empty(), Optional.empty())),
+                Optional.empty(), List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
+        PlanNode thetaNoCond = new PlanNode(PlanNodeKind.JOIN, List.of(validScan, validScan), List.of(), Optional.empty(),
+                Optional.empty(), Optional.empty(), List.of(),
+                Optional.of(new JoinSpec(JoinType.THETA, Optional.empty(), JoinAlgorithm.BLOCK_NESTED_LOOP, List.of())),
+                Optional.empty(), Optional.empty(), Optional.empty());
+        try {
+            validator.validate(thetaNoCond);
+            throw new AssertionError("THETA JOIN without condition should fail");
+        } catch (IllegalArgumentException e) {
+            testsRun++;
+            testsPassed++;
+        }
+
+        // FILTER with malformed BINARY expression (only 1 operand) should fail
+        Value v1 = new Value(DataType.INTEGER, Optional.of(1), Optional.empty(), Optional.empty());
+        Expression badBinary = new Expression(ExpressionKind.BINARY, Optional.empty(), Optional.empty(),
+                Optional.of(ExpressionOperator.EQ),
+                List.of(new Expression(ExpressionKind.LITERAL, Optional.of(v1), Optional.empty(), Optional.empty(), List.of())));
+        PlanNode filterBadExpr = new PlanNode(PlanNodeKind.FILTER, List.of(validScan), List.of(), Optional.empty(),
+                Optional.empty(), Optional.of(badBinary), List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
+        try {
+            validator.validate(filterBadExpr);
+            throw new AssertionError("FILTER with 1-operand BINARY expression should fail");
         } catch (IllegalArgumentException e) {
             testsRun++;
             testsPassed++;
@@ -416,11 +527,49 @@ public class QP2TestDriver {
                 Optional.empty(), List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
         assertTrue(translator.translateSelect(scanNode) instanceof TableScanOperator, "Real TableScanOperator created");
 
-        PlanNode joinNode = new PlanNode(PlanNodeKind.JOIN, List.of(scanNode, scanNode), List.of(), Optional.empty(),
+        // INDEX_SCAN operator translation
+        Value vKey1 = new Value(DataType.INTEGER, Optional.of(1), Optional.empty(), Optional.empty());
+        PlanNode indexScanNode = new PlanNode(PlanNodeKind.INDEX_SCAN, List.of(), List.of(), Optional.empty(),
+                Optional.of(new ScanSpec("employee", Optional.of("idx_emp_id"),
+                        Optional.of(new sqlike.shared.IndexCondition(sqlike.shared.IndexOperator.EQ, vKey1, Optional.empty(), true, true)))),
+                Optional.empty(), List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
+        assertTrue(translator.translateSelect(indexScanNode) instanceof IndexScanOperator, "Real IndexScanOperator created");
+
+        // FILTER and PROJECT operator translation
+        Value v5000 = new Value(DataType.INTEGER, Optional.of(5000), Optional.empty(), Optional.empty());
+        Expression filterPred = new Expression(ExpressionKind.BINARY, Optional.empty(), Optional.empty(),
+                Optional.of(ExpressionOperator.GT), List.of(
+                        new Expression(ExpressionKind.COLUMN, Optional.empty(), Optional.of(ColumnRef.of("employee", "salary")), Optional.empty(), List.of()),
+                        new Expression(ExpressionKind.LITERAL, Optional.of(v5000), Optional.empty(), Optional.empty(), List.of())
+                ));
+        PlanNode filterNode = new PlanNode(PlanNodeKind.FILTER, List.of(scanNode), List.of(), Optional.empty(),
+                Optional.empty(), Optional.of(filterPred), List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
+        assertTrue(translator.translateSelect(filterNode) instanceof FilterOperator, "Real FilterOperator created");
+
+        PlanNode projectNode = new PlanNode(PlanNodeKind.PROJECT, List.of(filterNode), List.of(), Optional.empty(),
+                Optional.empty(), Optional.empty(), List.of(ColumnRef.of("employee", "name"), ColumnRef.of("employee", "salary")),
+                Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
+        assertTrue(translator.translateSelect(projectNode) instanceof ProjectOperator, "Real ProjectOperator created");
+
+        // NATURAL JOIN deduplicating common columns & prefixed column resolution
+        stubSm.define(new sqlike.shared.TableSchema("2", "department", List.of(
+                new ColumnSchema("id", DataType.INTEGER, Optional.empty()),
+                new ColumnSchema("dept_name", DataType.VARCHAR, Optional.of(50))
+        )));
+        PlanNode deptScan = new PlanNode(PlanNodeKind.SCAN, List.of(), List.of(), Optional.empty(),
+                Optional.of(new ScanSpec("department", Optional.empty(), Optional.empty())),
+                Optional.empty(), List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
+
+        PlanNode naturalJoinNode = new PlanNode(PlanNodeKind.JOIN, List.of(scanNode, deptScan), List.of(), Optional.empty(),
                 Optional.empty(), Optional.empty(), List.of(),
-                Optional.of(new JoinSpec(JoinType.NATURAL, Optional.empty(), JoinAlgorithm.BLOCK_NESTED_LOOP, List.of("id"))),
+                Optional.of(new JoinSpec(JoinType.NATURAL, Optional.empty(), JoinAlgorithm.BLOCK_NESTED_LOOP, List.of())),
                 Optional.empty(), Optional.empty(), Optional.empty());
-        assertTrue(translator.translateSelect(joinNode) instanceof BlockNestedLoopJoinOperator, "Real BlockNestedLoopJoinOperator created");
+        Operator naturalJoinOp = translator.translateSelect(naturalJoinNode);
+        assertTrue(naturalJoinOp instanceof BlockNestedLoopJoinOperator, "Real BlockNestedLoopJoinOperator created");
+        assertEquals(4, naturalJoinOp.schema().columnCount(), "NATURAL JOIN deduplicates common column 'id' (3 + 2 - 1 = 4)");
+        assertEquals(0, naturalJoinOp.schema().findColumnOffset("employee", "id"), "employee.id resolves to offset 0");
+        assertEquals(0, naturalJoinOp.schema().findColumnOffset("department", "id"), "department.id also resolves to shared offset 0");
+        assertEquals(3, naturalJoinOp.schema().findColumnOffset("department", "dept_name"), "department.dept_name resolves to offset 3");
 
         PlanNode sortNode = new PlanNode(PlanNodeKind.SORT, List.of(scanNode), List.of(), Optional.empty(),
                 Optional.empty(), Optional.empty(), List.of(), Optional.empty(),
@@ -433,6 +582,24 @@ public class QP2TestDriver {
                 Optional.empty(), Optional.empty(), List.of(), Optional.empty(), Optional.empty(),
                 Optional.of(new MutationSpec("employee", List.of(v1), Optional.empty(), Optional.empty())), Optional.empty());
         assertTrue(translator.translateCommand(insertNode) instanceof InsertExecutor, "Real InsertExecutor created");
+
+        // UPDATE and CREATE_INDEX real executors
+        Expression addSalary = new Expression(ExpressionKind.BINARY, Optional.empty(), Optional.empty(),
+                Optional.of(ExpressionOperator.ADD), List.of(
+                        new Expression(ExpressionKind.COLUMN, Optional.empty(), Optional.of(ColumnRef.of("employee", "salary")), Optional.empty(), List.of()),
+                        new Expression(ExpressionKind.LITERAL, Optional.of(vKey1), Optional.empty(), Optional.empty(), List.of())
+                ));
+        PlanNode updateNode = new PlanNode(PlanNodeKind.UPDATE, List.of(scanNode), List.of(), Optional.empty(),
+                Optional.empty(), Optional.empty(), List.of(), Optional.empty(), Optional.empty(),
+                Optional.of(new MutationSpec("employee", List.of(), Optional.of(ColumnRef.of("employee", "salary")), Optional.of(addSalary))),
+                Optional.empty());
+        assertTrue(translator.translateCommand(updateNode) instanceof UpdateExecutor, "Real UpdateExecutor created");
+
+        IndexMetadata realIdxMeta = new IndexMetadata("idx_emp_id", "employee", "id", IndexType.BPLUS_TREE);
+        PlanNode createIdxNode = new PlanNode(PlanNodeKind.CREATE_INDEX, List.of(), List.of(), Optional.empty(),
+                Optional.empty(), Optional.empty(), List.of(), Optional.empty(), Optional.empty(),
+                Optional.empty(), Optional.of(realIdxMeta));
+        assertTrue(translator.translateCommand(createIdxNode) instanceof CreateIndexExecutor, "Real CreateIndexExecutor created");
 
         PlanNode deleteNode = new PlanNode(PlanNodeKind.DELETE, List.of(scanNode), List.of(), Optional.empty(),
                 Optional.empty(), Optional.empty(), List.of(), Optional.empty(), Optional.empty(),
@@ -492,6 +659,119 @@ public class QP2TestDriver {
                 Optional.empty(), Optional.empty(), List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),
                 Optional.empty(), Optional.empty(), Optional.of(dropSpec));
         assertTrue(translator.translateCommand(dropTableNode) instanceof DropTableExecutor, "Real DropTableExecutor created");
+
+        // 3. WHERE Subqueries (SCALAR 1-row, SCALAR 0-row SQL NULL, IN, EXISTS)
+        stubSm.useTransaction(new sqlike.qp.port.QpContracts.TxId(1L));
+        stubSm.insert(stubSm.reserveInsert("employee", List.of(
+                new Value(DataType.INTEGER, Optional.of(1), Optional.empty(), Optional.empty()),
+                new Value(DataType.VARCHAR, Optional.empty(), Optional.empty(), Optional.of("Alice")),
+                new Value(DataType.INTEGER, Optional.of(7000), Optional.empty(), Optional.empty())
+        )), 1L);
+        stubSm.insert(stubSm.reserveInsert("employee", List.of(
+                new Value(DataType.INTEGER, Optional.of(2), Optional.empty(), Optional.empty()),
+                new Value(DataType.VARCHAR, Optional.empty(), Optional.empty(), Optional.of("Bob")),
+                new Value(DataType.INTEGER, Optional.of(4000), Optional.empty(), Optional.empty())
+        )), 2L);
+
+        PlanNode baseScan = new PlanNode(PlanNodeKind.SCAN, List.of(), List.of(), Optional.empty(),
+                Optional.of(new ScanSpec("employee", Optional.empty(), Optional.empty())),
+                Optional.empty(), List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
+        Value vId1 = new Value(DataType.INTEGER, Optional.of(1), Optional.empty(), Optional.empty());
+        Expression idEq1 = new Expression(ExpressionKind.BINARY, Optional.empty(), Optional.empty(),
+                Optional.of(ExpressionOperator.EQ), List.of(
+                        new Expression(ExpressionKind.COLUMN, Optional.empty(), Optional.of(ColumnRef.of("employee", "id")), Optional.empty(), List.of()),
+                        new Expression(ExpressionKind.LITERAL, Optional.of(vId1), Optional.empty(), Optional.empty(), List.of())
+                ));
+        PlanNode filterId1 = new PlanNode(PlanNodeKind.FILTER, List.of(baseScan), List.of(), Optional.empty(),
+                Optional.empty(), Optional.of(idEq1), List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
+        PlanNode projSalary = new PlanNode(PlanNodeKind.PROJECT, List.of(filterId1), List.of(), Optional.empty(),
+                Optional.empty(), Optional.empty(), List.of(ColumnRef.of("employee", "salary")),
+                Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
+
+        Expression scalarSubExpr = new Expression(
+                ExpressionKind.SUBQUERY,
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                List.of(),
+                Optional.of(new sqlike.shared.SubquerySpec(sqlike.shared.SubqueryType.SCALAR, projSalary, false)));
+        ExpressionResult scalarRes = evaluator.evaluate(scalarSubExpr, null, null);
+        assertFalse(scalarRes.isSqlNull(), "1-row SCALAR subquery is not SQL NULL");
+        assertEquals(7000, scalarRes.value().integerValue().orElse(0), "1-row SCALAR subquery evaluates to 7000");
+
+        // 0-row SCALAR subquery returns SQL NULL and comparison yields false in WHERE
+        Value vId99 = new Value(DataType.INTEGER, Optional.of(99), Optional.empty(), Optional.empty());
+        Expression idEq99 = new Expression(ExpressionKind.BINARY, Optional.empty(), Optional.empty(),
+                Optional.of(ExpressionOperator.EQ), List.of(
+                        new Expression(ExpressionKind.COLUMN, Optional.empty(), Optional.of(ColumnRef.of("employee", "id")), Optional.empty(), List.of()),
+                        new Expression(ExpressionKind.LITERAL, Optional.of(vId99), Optional.empty(), Optional.empty(), List.of())
+                ));
+        PlanNode filterId99 = new PlanNode(PlanNodeKind.FILTER, List.of(baseScan), List.of(), Optional.empty(),
+                Optional.empty(), Optional.of(idEq99), List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
+        PlanNode projEmpty = new PlanNode(PlanNodeKind.PROJECT, List.of(filterId99), List.of(), Optional.empty(),
+                Optional.empty(), Optional.empty(), List.of(ColumnRef.of("employee", "salary")),
+                Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
+        Expression emptyScalarExpr = new Expression(
+                ExpressionKind.SUBQUERY,
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                List.of(),
+                Optional.of(new sqlike.shared.SubquerySpec(sqlike.shared.SubqueryType.SCALAR, projEmpty, false)));
+        assertTrue(evaluator.evaluate(emptyScalarExpr, null, null).isSqlNull(), "0-row SCALAR subquery returns SQL NULL");
+        Expression cmpWithNull = new Expression(ExpressionKind.BINARY, Optional.empty(), Optional.empty(),
+                Optional.of(ExpressionOperator.EQ), List.of(
+                        new Expression(ExpressionKind.LITERAL, Optional.of(vId1), Optional.empty(), Optional.empty(), List.of()),
+                        emptyScalarExpr
+                ));
+        assertFalse(evaluator.evaluateCondition(cmpWithNull, null, null), "Comparison with 0-row SCALAR SQL NULL evaluates to false");
+
+        // >1 row SCALAR subquery throws INVALID_VALUE
+        PlanNode projAllSalaries = new PlanNode(PlanNodeKind.PROJECT, List.of(baseScan), List.of(), Optional.empty(),
+                Optional.empty(), Optional.empty(), List.of(ColumnRef.of("employee", "salary")),
+                Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
+        Expression multiRowScalarExpr = new Expression(
+                ExpressionKind.SUBQUERY,
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                List.of(),
+                Optional.of(new sqlike.shared.SubquerySpec(sqlike.shared.SubqueryType.SCALAR, projAllSalaries, false)));
+        try {
+            evaluator.evaluate(multiRowScalarExpr, null, null);
+            throw new AssertionError("Multi-row SCALAR subquery should throw INVALID_VALUE");
+        } catch (QpException e) {
+            assertEquals(sqlike.shared.ErrorCode.INVALID_VALUE, e.getErrorInfo().code(), "Multi-row SCALAR subquery throws INVALID_VALUE");
+        }
+
+        // IN and EXISTS subqueries
+        Expression inExpr = new Expression(
+                ExpressionKind.SUBQUERY,
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                List.of(new Expression(ExpressionKind.LITERAL,
+                        Optional.of(new Value(DataType.INTEGER, Optional.of(4000), Optional.empty(), Optional.empty())),
+                        Optional.empty(), Optional.empty(), List.of())),
+                Optional.of(new sqlike.shared.SubquerySpec(sqlike.shared.SubqueryType.IN, projAllSalaries, false)));
+        assertTrue(evaluator.evaluateCondition(inExpr, null, null), "4000 IN (7000, 4000) is true");
+
+        Expression existsExpr = new Expression(
+                ExpressionKind.SUBQUERY,
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                List.of(),
+                Optional.of(new sqlike.shared.SubquerySpec(sqlike.shared.SubqueryType.EXISTS, filterId1, false)));
+        assertTrue(evaluator.evaluateCondition(existsExpr, null, null), "EXISTS non-empty subquery is true");
+        Expression notExistsExpr = new Expression(
+                ExpressionKind.SUBQUERY,
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                List.of(),
+                Optional.of(new sqlike.shared.SubquerySpec(sqlike.shared.SubqueryType.EXISTS, filterId99, false)));
+        assertFalse(evaluator.evaluateCondition(notExistsExpr, null, null), "EXISTS empty subquery is false");
     }
 
     // =========================================================================

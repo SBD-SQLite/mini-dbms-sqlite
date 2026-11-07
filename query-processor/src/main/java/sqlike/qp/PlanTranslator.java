@@ -77,7 +77,11 @@ public class PlanTranslator {
         this.evaluator = evaluator != null ? evaluator : new ExpressionEvaluator(comparator != null ? comparator : new ValueComparator());
         this.comparator = comparator != null ? comparator : new ValueComparator();
         this.mutations = mutations;
-        this.collector = collector != null ? collector : new MutationTargetCollector(storage);
+        this.collector = collector != null
+                ? collector
+                : (qpStorage != null
+                        ? MutationTargetCollector.withQpStorage(qpStorage)
+                        : new MutationTargetCollector(storage));
         this.estimator = estimator != null ? estimator : new RowSizeEstimator();
         this.validator = validator != null ? validator : new PlanValidator();
         this.joinBufferBytes = configuration.joinBufferBytes();
@@ -301,10 +305,19 @@ public class PlanTranslator {
                     }
                 } else {
                     String targetTable = ref.tableName().get().trim().toLowerCase(Locale.ROOT);
+                    int matched = 0;
                     for (int i = 0; i < childSchema.columnCount(); i++) {
-                        if (childSchema.columnTablesAt(i).contains(targetTable)) {
+                        if (childSchema.columnTablesAt(i).contains(targetTable)
+                                || childSchema.tableName()
+                                        .map(tn -> tn.trim().equalsIgnoreCase(targetTable))
+                                        .orElse(false)) {
                             expandedRefs.add(new ColumnRef(ref.tableName(), childSchema.getColumn(i).name()));
+                            matched++;
                         }
+                    }
+                    if (matched == 0) {
+                        throw new IllegalArgumentException(
+                                "Table or alias not found in schema for wildcard projection: " + ref.tableName().get() + ".*");
                     }
                 }
             } else {
@@ -460,7 +473,12 @@ public class PlanTranslator {
             return qpStorage.getSchema(new TableId(tableName));
         }
         if (storage != null) {
-            TableSchema ts = storage.getSchema(tableName);
+            TableSchema ts;
+            try {
+                ts = storage.getSchema(tableName);
+            } catch (sqlike.storage.StorageException e) {
+                throw TableScanOperator.mapStorageException("Failed to resolve schema for table '" + tableName + "'", e);
+            }
             if (ts != null) {
                 return Schema.fromTableSchema(ts);
             }
@@ -492,4 +510,5 @@ public class PlanTranslator {
     public MutationTargetCollector getCollector() { return collector; }
     public RowSizeEstimator getEstimator() { return estimator; }
     public PlanValidator getValidator() { return validator; }
+    public long getJoinBufferBytes() { return joinBufferBytes; }
 }
