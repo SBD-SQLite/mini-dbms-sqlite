@@ -46,3 +46,14 @@ char-column-compare  | OK | SELECT * FROM takes WHERE grade = 'E'
 or-unsupported       | UNSUPPORTED_OPERATION | SELECT * FROM students WHERE id = 1 OR id = 2
 subquery-unsupported | UNSUPPORTED_OPERATION | SELECT * FROM students WHERE id IN (SELECT id FROM takes)
 int-overflow         | INVALID_VALUE         | SELECT * FROM students WHERE id = 2147483648
+
+# --- explain with indexes: "@index <table> <column> <HASH|BPLUS_TREE>" applies to the scenarios below it ---
+@index students id HASH
+@index students gpa BPLUS_TREE
+explain-index-eq     | OK                    | SELECT name FROM students WHERE id = 5
+explain-index-range  | OK                    | SELECT name FROM students WHERE gpa > 3.9
+explain-index-join   | OK                    | SELECT students.name, dept.dname FROM students JOIN dept ON students.dept_id = dept.dept_id WHERE students.id = 5
+explain-no-index-col | OK                    | SELECT * FROM students WHERE dept_id = 2
+explain-update-index | OK                    | UPDATE students SET gpa = 4.0 WHERE id = 5
+explain-delete-index | OK                    | DELETE FROM students WHERE id = 5
+explain-create-index | OK                    | CREATE INDEX idx_dept ON students(dept_id)

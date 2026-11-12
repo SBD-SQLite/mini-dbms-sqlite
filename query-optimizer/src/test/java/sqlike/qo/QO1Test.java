@@ -60,7 +60,68 @@ public final class QO1Test {
         test("parsed plans validate", () -> PlanNodes.validate(QO.parseQuery("SELECT a.x FROM a JOIN b ON a.id = b.id WHERE a.x > 1").root().orElseThrow()));
         test("PlanPrinter prints an indented tree", () -> {
             String text = new PlanPrinter().print(QO.parseQuery("SELECT name FROM students WHERE id = 5").root().orElseThrow());
-            eq("PROJECT [name]\n  FILTER (id = 5)\n    SCAN students\n", text);
+            eq("PROJECT [name]\n  FILTER (id = 5)\n    SCAN students [full scan]\n", text);
+        });
+        test("PlanPrinter shows alias, join algorithm and cartesian algorithm", () -> {
+            PlanNode scan = PlanNodes.scan("students");
+            PlanNode aliased = new PlanNode(scan.kind(), scan.children(), scan.outputColumns(), scan.estimatedRows(),
+                    Optional.of(new ScanSpec("students", Optional.empty(), Optional.empty(), Optional.of("s"))),
+                    scan.predicate(), scan.projection(), scan.join(), scan.sort(), scan.mutation(), scan.createIndex(),
+                    scan.limit(), scan.createTable(), scan.dropTable());
+            eq("SCAN students AS s [full scan]\n", new PlanPrinter().print(aliased));
+            String join = new PlanPrinter().print(QO.parseQuery("SELECT * FROM students JOIN dept ON students.dept_id = dept.dept_id").root().orElseThrow());
+            check(join.contains("JOIN THETA algorithm=BLOCK_NESTED_LOOP ON"), join);
+            String cart = new PlanPrinter().print(QO.parseQuery("SELECT * FROM students, dept").root().orElseThrow());
+            check(cart.contains("CARTESIAN algorithm=BLOCK_NESTED_LOOP"), cart);
+        });
+        test("PlanPrinter shows IndexCondition for INDEX_SCAN", () -> {
+            Value five = new Value(DataType.INTEGER, Optional.of(5), Optional.empty(), Optional.empty());
+            Value nine = new Value(DataType.INTEGER, Optional.of(9), Optional.empty(), Optional.empty());
+            String eqText = new PlanPrinter().print(PlanNodes.indexScan("students", "idx_id", new IndexCondition(IndexOperator.EQ, five, Optional.empty(), true, true)));
+            eq("INDEX_SCAN students [index scan] using idx_id IndexCondition(EQ, key=5, lowerInclusive=true, upperInclusive=true)\n", eqText);
+            String between = new PlanPrinter().print(PlanNodes.indexScan("students", "idx_id", new IndexCondition(IndexOperator.BETWEEN, five, Optional.of(nine), true, false)));
+            eq("INDEX_SCAN students [index scan] using idx_id IndexCondition(BETWEEN, key=5, upper=9, lowerInclusive=true, upperInclusive=false)\n", between);
+        });
+        test("explainQuery before is the bound plan and costs are shown for both stages", () -> {
+            String text = QO.explainQuery("SELECT name FROM students WHERE id = 5");
+            String before = text.substring(text.indexOf("== Before =="), text.indexOf("== After =="));
+            check(before.contains("students.name") && before.contains("Estimated cost: "), text);
+            check(text.substring(text.indexOf("== After ==")).contains("Estimated cost: "), text);
+            check(before.contains("(rows~"), text);
+            double[] c = explainCosts(text);
+            check(c[1] <= c[0], "after " + c[1] + " must not exceed before " + c[0]);
+        });
+        test("explainQuery with an index shows INDEX_SCAN and IndexCondition; cost does not increase", () -> {
+            QueryOptimizer indexed = new QueryOptimizer(MockStorageManager.create(
+                    List.of(new IndexMetadata("idx_id", "students", "id", IndexType.HASH))));
+            String text = indexed.explainQuery("SELECT name FROM students WHERE id = 5");
+            String after = text.substring(text.indexOf("== After =="));
+            check(after.contains("INDEX_SCAN students [index scan] using idx_id IndexCondition(EQ, key=5"), text);
+            check(text.substring(0, text.indexOf("== After ==")).contains("[full scan]"), text);
+            double[] c = explainCosts(text);
+            check(c[1] <= c[0], "after " + c[1] + " must not exceed before " + c[0]);
+        });
+        test("explainQuery works for join, INSERT, UPDATE, DELETE and CREATE INDEX", () -> {
+            for (String sql : new String[] {
+                    "SELECT students.name, dept.dname FROM students JOIN dept ON students.dept_id = dept.dept_id",
+                    "INSERT INTO students VALUES (1, 'Ada', 3.5, 2)",
+                    "UPDATE students SET gpa = gpa + 0.1 WHERE id = 1",
+                    "DELETE FROM students WHERE id = 1",
+                    "CREATE INDEX idx_name ON students(name) USING BPLUS_TREE" }) {
+                String text = QO.explainQuery(sql);
+                double[] c = explainCosts(text);
+                check(c[0] >= 0 && c[1] >= 0, sql + "\n" + text);
+                if (sql.startsWith("SELECT")) check(c[1] <= c[0], sql + " after " + c[1] + " > before " + c[0]);
+            }
+        });
+        test("explainQuery does not change optimizeQuery or getCost", () -> {
+            ParsedQuery q = QO.parseQuery("SELECT students.name FROM students JOIN dept ON students.dept_id = dept.dept_id WHERE students.id = 5");
+            QueryPlan first = QO.optimizeQuery(q);
+            QO.explainQuery("SELECT students.name FROM students JOIN dept ON students.dept_id = dept.dept_id WHERE students.id = 5");
+            QueryPlan second = QO.optimizeQuery(q);
+            eq(first.estimatedCost(), second.estimatedCost());
+            eq(new PlanPrinter().print(first.root()), new PlanPrinter().print(second.root()));
+            eq(first.estimatedCost(), QO.getCost(first));
         });
         test("explainQuery shows before, after and cost", () -> {
             String text = QO.explainQuery("SELECT name FROM students WHERE id = 5");
@@ -120,15 +181,23 @@ public final class QO1Test {
         catch (IOException e) { System.out.println("Cannot read scenario file " + file + ": " + e.getMessage()); return 1; }
         int total = 0;
         List<String> failures = new ArrayList<>();
+        List<IndexMetadata> indexes = new ArrayList<>();
+        QueryOptimizer qo = QO;
         for (String line : lines) {
             if (line.isBlank() || line.strip().startsWith("#")) continue;
+            if (line.strip().startsWith("@index ")) {   // "@index <table> <column> <HASH|BPLUS_TREE>": applies to the scenarios below it
+                String[] d = line.strip().split("\s+");
+                indexes.add(new IndexMetadata("idx_" + d[1] + "_" + d[2], d[1], d[2], IndexType.valueOf(d[3].toUpperCase())));
+                qo = new QueryOptimizer(MockStorageManager.create(indexes));
+                continue;
+            }
             String[] parts = line.split("\\|", 3);
             if (parts.length < 3) { failures.add("malformed line: " + line); total++; continue; }
             String name = parts[0].strip(), expected = parts[1].strip(), sql = parts[2].strip();
             total++;
             String actual;
             String output = "";
-            try { output = QO.explainQuery(sql); actual = "OK"; }
+            try { output = qo.explainQuery(sql); actual = "OK"; }
             catch (QoException e) { actual = e.getInfo().code().name(); output = e.getInfo().code() + e.getInfo().position().map(p -> " at " + p).orElse("") + ": " + e.getMessage() + "\n"; }
             catch (RuntimeException e) { actual = e.getClass().getSimpleName(); output = e + "\n"; }
             boolean known = expected.startsWith("XFAIL ");
@@ -160,6 +229,17 @@ public final class QO1Test {
     private static void error(ErrorCode expected, Runnable action) {
         try { action.run(); } catch (QoException e) { eq(expected, e.getInfo().code()); return; }
         throw new AssertionError("expected " + expected);
+    }
+
+    /** {before, after} costs parsed from explainQuery output (the first two "Estimated cost:" lines). */
+    private static double[] explainCosts(String text) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("Estimated cost: (\\S+)").matcher(text);
+        double[] costs = new double[2];
+        for (int i = 0; i < 2; i++) {
+            if (!m.find()) throw new AssertionError("missing cost #" + (i + 1) + " in:\n" + text);
+            costs[i] = Double.parseDouble(m.group(1));
+        }
+        return costs;
     }
 
     private static void check(boolean ok, String detail) { if (!ok) throw new AssertionError(detail); }

@@ -71,7 +71,11 @@ public class QueryOptimizer implements IQueryOptimizer {
         if (parsed.transactionCommand().isPresent())
             return "TRANSACTION " + parsed.transactionCommand().get().action() + " (not optimized)\n";
         QueryPlan plan = optimizeQuery(parsed);
-        PlanNode after = isPassThrough(plan.root()) ? plan.root() : annotator.annotate(plan.root());
-        return printer.printBeforeAfter(parsed.root().get(), after, plan.estimatedCost());
+        PlanNode bound = binder.bind(parsed);
+        if (isPassThrough(plan.root())) return printer.printNotOptimized(plan.root(), plan.estimatedCost());
+        // "Before" is the Binder result (qualified, catalog-checked), not the raw parser tree.
+        double costBefore = costModel.getCost(bound);
+        return printer.printBeforeAfter(annotator.annotate(bound), costBefore,
+                annotator.annotate(plan.root()), plan.estimatedCost());
     }
 }

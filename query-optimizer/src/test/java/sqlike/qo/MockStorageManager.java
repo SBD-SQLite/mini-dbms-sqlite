@@ -12,8 +12,9 @@ import sqlike.shared.*;
 /** catalog & statistics jadi Query Optimizer bisa run tanpaa Storage Manager yg asli */
 final class MockStorageManager {
     private MockStorageManager() { }
+    static IStorageManager create() { return create(List.of()); }
 
-    static IStorageManager create() {
+    static IStorageManager create(List<IndexMetadata> indexes) {
         Map<String, TableSchema> schemas = new LinkedHashMap<>();
         Map<String, TableStatistics> stats = new LinkedHashMap<>();
         add(schemas, stats, "students", List.of(
@@ -32,7 +33,7 @@ final class MockStorageManager {
                     case "listTables" -> new ArrayList<>(schemas.keySet());
                     case "getSchema" -> schemas.get(((String) args[0]).toLowerCase());
                     case "getStatistics" -> stats.get(((String) args[0]).toLowerCase());
-                    case "getIndexes" -> List.<IndexMetadata>of();
+                    case "getIndexes" -> indexes.stream().filter(i -> i.tableName().equalsIgnoreCase((String) args[0])).toList();
                     default -> throw new UnsupportedOperationException(method.getName());
                 });
     }
