@@ -53,6 +53,7 @@ echo -e "\n${BOLD}[1/2] Compiling sources...${RESET}"
 
 # Collect source files
 SOURCE_DIRS=(
+    "${REPO_ROOT}/shared/src/main/java"
     "${REPO_ROOT}/query-processor/src/main/java"
     "${REPO_ROOT}/query-processor/src/test/java"
 )

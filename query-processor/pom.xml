@@ -14,11 +14,13 @@
 
     <artifactId>sqlike-query-processor</artifactId>
 
-    <!--
-        QP masih memakai salinan sqlike.shared miliknya sendiri (src/main/java/sqlike/shared),
-        yang belum sama dengan modul shared global. Karena itu QP belum bergantung pada
-        sqlike-shared. Tambahkan dependency tersebut setelah salinan lokal dihapus.
-    -->
+    <dependencies>
+        <dependency>
+            <groupId>sqlike</groupId>
+            <artifactId>sqlike-shared</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+    </dependencies>
 
     <build>
         <plugins>

@@ -6,3 +6,4 @@ public record SubquerySpec(
         boolean correlated
 ) {
 }
+
