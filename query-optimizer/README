@@ -10,7 +10,17 @@ mvn -pl query-optimizer -am test-compile   # kompilasi kode utama + test (src/te
 mvn test-compile                           # kompilasi seluruh komponen sekaligus
 ```
 
-Hasil kompilasi ada di `query-optimizer/target/classes` dan `query-optimizer/target/test-classes`. Test QO bukan JUnit, jadi `mvn test` hanya mengompilasi dan tidak menjalankannya. Jalankan `QODriver` langsung dengan `java` dari root repositori, karena `QO1Test` membaca `query-optimizer/src/test/resources/scenarios.txt` dengan path relatif:
+Hasil kompilasi ada di `query-optimizer/target/classes` dan `query-optimizer/target/test-classes`. Test QO bukan JUnit, jadi `mvn test` hanya mengompilasi dan tidak menjalankannya.
+
+## Menjalankan tes dan driver
+
+Cara tercepat: `query-optimizer/run-tests.sh` (bisa dipanggil dari direktori mana pun). Skrip ini mengompilasi `shared` + QO dengan Maven, lalu menjalankan `QODriver --test` dan `QODriver --scenarios`, dan keluar dengan kode non-nol jika build atau salah satu pemeriksaan gagal.
+
+```bash
+query-optimizer/run-tests.sh
+```
+
+Atau jalankan `QODriver` langsung dengan `java` dari **root repositori**, karena `QO1Test` membaca `query-optimizer/src/test/resources/scenarios.txt` dengan path relatif:
 
 ```bash
 # Linux / macOS
@@ -20,7 +30,67 @@ java -cp "query-optimizer/target/classes:query-optimizer/target/test-classes:sha
 java -cp "query-optimizer/target/classes;query-optimizer/target/test-classes;shared/target/classes" sqlike.qo.QODriver --test
 ```
 
-Opsi lain `QODriver`:
-- tanpa argumen: menu interaktif
-- `--scenarios [file]`: menjalankan file skenario
-- `--explain "<SQL>"`: mencetak rencana kueri untuk satu perintah SQL
+Opsi `QODriver`:
+- `--test`: menjalankan suite QO1..QO5 (exit 1 jika ada yang gagal)
+- `--scenarios [file]`: menjalankan file skenario (default `scenarios.txt`; exit 1 jika ada yang gagal)
+- `--explain "<SQL>"`: mencetak rencana kueri sebelum/sesudah optimasi beserta estimasi biaya, memakai `MockStorageManager`
+- tanpa argumen: menu interaktif (1 Parse SQL, 2 Run all tests, 3 Explain SQL, 4 Run scenario file, 0 Exit)
+
+## Sintaks CREATE INDEX
+
+```sql
+CREATE INDEX <nama> ON <tabel>(<kolom>) [USING HASH | BPLUS_TREE]
+```
+
+- Tepat satu kolom per index.
+- Tanpa `USING`, tipe index adalah `HASH`. Nama tipe tidak peka huruf besar/kecil; tipe lain menghasilkan `SYNTAX_ERROR`.
+- Index hash hanya dipakai untuk kondisi `=`; B+Tree dipakai untuk `=`, rentang (`<`, `<=`, `>`, `>=`), dan `BETWEEN` (dari dua batas).
+
+## Rumus biaya yang dipakai kode saat ini
+
+Sumber: `CostModel.java` dan `CardinalityEstimator.java`. Satuan biaya: milidetik (ms). Biaya sebuah rencana adalah jumlah biaya lokal setiap node ditambah biaya anaknya.
+
+Konstanta (`CostModel`): `tS` = 4,0 ms per seek, `tT` = 0,1 ms per transfer blok, `M` (`BUFFER_BLOCKS`) = 3 blok, nilai tetap (belum bisa diatur). Ukuran blok untuk hasil join: 4096 byte (`CardinalityEstimator`). Notasi: `b` = jumlah blok, `n` = jumlah baris, `V(A)` = jumlah nilai distinct kolom A, `fb` = blocking factor (semuanya dari `TableStatistics`).
+
+| Operasi | Rumus di kode |
+|---|---|
+| Linear scan | `b·tT + tS` (hanya satu seek), 0 jika `b = 0` |
+| Index scan (HASH atau B+Tree) | `(tS + tT) + p·(tS + tT)`; `p` = perkiraan halaman data berbeda = `b·(1 − (1 − 1/b)^r)`, dibulatkan ke atas, dibatasi `1..b`; `r` = baris hasil. Tinggi index tidak dimodelkan dan HASH/B+Tree/clustered memakai rumus yang sama |
+| Filter, Project, Limit | 0 (pipelined, hanya biaya anak) |
+| BNLJ (join, cartesian) | `rescan·(2·tS + b_inner·tT)` dengan `batch = ⌈b_outer/(M−2)⌉` dan `rescan = batch − 1`; biaya satu kali baca kedua anak sudah ada di biaya anak. Total = biaya anak kiri + biaya anak kanan + suku ini. Contoh: student (b=100) outer × takes (b=400) inner = 4.810 ms; takes outer = 7.240 ms |
+| Sort | jika `b ≤ M`: 0. Selain itu: `runs = ⌈b/M⌉`, fan-in `M−1`, `seek` dihitung per run (`runs` untuk run awal, lalu `runs + merged` per pass), `transfer = b + 2·b·pass`; biaya = `seek·tS + transfer·tT` |
+| Insert | `tS + tT` |
+| Update, Delete | `tS + b_dirty·tT` (`b_dirty` = blok hasil anak; 0 jika `b_dirty = 0`), ditambah biaya anak |
+| Create index | `(tS + b_tabel·tT) + (tS + ⌈n/fb⌉·tT)` |
+| Create table, Drop table | 0 |
+
+**Sort belum sama dengan materi.** Materi menghitung seek per blok buffer (`2⌈b/b_b⌉` per pass), sedangkan kode menghitung seek per run. Untuk `b = 100`, `M = 3`: kode 694 ms (transfer 1.300, seek 141) sedangkan rumus materi 4.802 ms (transfer 1.300, seek 1.168). Index scan juga belum sama dengan materi A2/A4/A6: tidak ada tinggi index (`h_i`) dan tidak ada pembedaan clustered/non-clustered. `M` konstan 3, sedangkan materi memakai `M` sebagai parameter.
+
+### Selektivitas (`CardinalityEstimator.selectivity`)
+
+| Predikat | Selektivitas |
+|---|---|
+| `kolom = literal` | `1/V(kolom)` |
+| `kolom <> literal` | `1 − 1/V(kolom)` |
+| `kolom <, <=, >, >= literal` | 0,5 (tanpa min/max/histogram) |
+| `kolom = kolom` | `1/max(V(kolom1), V(kolom2))` |
+| `kolom <> kolom` | 0,9 |
+| `kolom <, <=, >, >= kolom` | 1/3 |
+| `A AND B` | `sel(A)·sel(B)` |
+| bentuk lain | 0,5 |
+| Index scan `=` | `1/V(kolom index)` |
+| Index scan rentang dan `BETWEEN` | 0,5 (filter setara dua rentang `AND` = 0,25, jadi tidak konsisten) |
+
+Jumlah baris = `⌈n·selektivitas⌉` (dibulatkan ke atas, minimal 0).
+
+### Ukuran join (`CardinalityEstimator.joinRows`)
+
+| Join | Jumlah baris |
+|---|---|
+| Cartesian | `n_kiri · n_kanan` |
+| NATURAL (dengan kolom bersama) | `n_kiri · n_kanan / ∏ max(V_kiri(A), V_kanan(A))` untuk setiap kolom bersama A |
+| Theta (`ON`) | `n_kiri · n_kanan · sel(ON)` |
+
+Contoh: takes (n=10.000, V(ID)=2.500) ⋈ student (n=5.000, V(ID)=5.000) = 10.000 · 5.000 / 5.000 = 10.000 baris.
+
+Jumlah blok hasil join/filter/proyeksi = `⌈baris / fb⌉`, `fb = ⌊4096 / ukuran tuple⌋` (ukuran tuple join = jumlah ukuran tuple kedua anak). Rencana yang ditampilkan `--explain` memakai biaya sesudah optimasi.

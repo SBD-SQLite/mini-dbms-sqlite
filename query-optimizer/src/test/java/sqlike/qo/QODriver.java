@@ -3,6 +3,7 @@ package sqlike.qo;
 import java.util.Scanner;
 import java.util.function.IntSupplier;
 import sqlike.shared.ParsedQuery;
+import sqlike.shared.QoException;
 
 public final class QODriver {
     public static void main(String[] args) {
@@ -57,7 +58,7 @@ public final class QODriver {
                     String path = input.nextLine().trim();
                     QO1Test.runScenarios(path.isEmpty() ? QO1Test.DEFAULT_SCENARIOS : java.nio.file.Path.of(path), true);
                 }
-                default -> System.out.println("Choose 0, 1, or 2.");
+                default -> System.out.println("Choose 0, 1, 2, 3, or 4.");
             }
         }
     }

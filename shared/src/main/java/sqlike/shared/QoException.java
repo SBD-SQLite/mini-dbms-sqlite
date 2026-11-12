@@ -1,8 +1,9 @@
-package sqlike.qo;
+package sqlike.shared;
 
-import sqlike.shared.ErrorInfo;
-
-
+/**
+ * Domain exception thrown by the Query Optimizer; carries an ErrorInfo
+ * (code, component QO, message, optional position). Unchecked.
+ */
 public class QoException extends RuntimeException {
     private static final long serialVersionUID = 1L;
     private final transient ErrorInfo info;

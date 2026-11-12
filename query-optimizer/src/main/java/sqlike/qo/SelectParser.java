@@ -68,6 +68,9 @@ public class SelectParser {
                 ts.expectKeyword(Keyword.ON);
                 Expression cond = expressionParser.parseExpression(ts);
                 left = PlanNodes.join(left, right, new JoinSpec(JoinType.THETA, Optional.of(cond), JoinAlgorithm.BLOCK_NESTED_LOOP, List.of()));
+            } else if (t.type() == TokenType.IDENTIFIER && isOuterJoinWord(t.text())) {
+                // e.g. "a JOIN b ON ... LEFT JOIN c": the word follows an ON condition, not a table name
+                throw QoErrors.unsupported("LEFT/RIGHT/FULL/OUTER JOIN is not supported", t.offset());
             } else {
                 return left;
             }
@@ -79,9 +82,18 @@ public class SelectParser {
             throw QoErrors.unsupported("subquery is not part of the agreed contract", ts.peek().offset());
         Token name = ts.expectIdentifier("table name");
         Token p = ts.peek();
+        if (p.type() == TokenType.IDENTIFIER && isOuterJoinWord(p.text()))
+            throw QoErrors.unsupported("LEFT/RIGHT/FULL/OUTER JOIN is not supported", p.offset());
         if (p.isKeyword(Keyword.AS) || p.type() == TokenType.IDENTIFIER)
             throw QoErrors.unsupported("table alias is not part of the agreed contract", p.offset());
         return PlanNodes.scan(name.text());
+    }
+
+    // LEFT/RIGHT/FULL/OUTER are not lexer keywords (they stay usable as names), but right after a
+    // table name they can only start an outer join, never an alias.
+    private static boolean isOuterJoinWord(String word) {
+        return word.equalsIgnoreCase("LEFT") || word.equalsIgnoreCase("RIGHT")
+                || word.equalsIgnoreCase("FULL") || word.equalsIgnoreCase("OUTER");
     }
 
     private SortSpec parseOrderBy(TokenStream ts) {

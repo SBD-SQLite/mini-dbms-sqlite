@@ -78,6 +78,25 @@ public final class QO1Test {
         errorAt("SELECT * FORM t", ErrorCode.SYNTAX_ERROR, 9);
         errorAt("SELECT a FROM t WHERE x = 1 2", ErrorCode.SYNTAX_ERROR, 28);
         errorAt("SELECT a FROM t alias", ErrorCode.UNSUPPORTED_OPERATION, 16);
+        errorAt("SELECT * FROM a LEFT JOIN b ON a.x = b.x", ErrorCode.UNSUPPORTED_OPERATION, 16);
+        errorAt("SELECT * FROM a RIGHT JOIN b ON a.x = b.x", ErrorCode.UNSUPPORTED_OPERATION, 16);
+        errorAt("SELECT * FROM a LEFT OUTER JOIN b ON a.x = b.x", ErrorCode.UNSUPPORTED_OPERATION, 16);
+        errorAt("SELECT * FROM a FULL OUTER JOIN b ON a.x = b.x", ErrorCode.UNSUPPORTED_OPERATION, 16);
+        errorAt("SELECT * FROM a JOIN b ON a.x = b.x LEFT JOIN c ON b.x = c.x", ErrorCode.UNSUPPORTED_OPERATION, 36);
+        test("outer join message names the join, not aliases", () -> {
+            for (String kw : new String[] { "LEFT", "RIGHT", "OUTER", "FULL" }) {
+                try { QO.parseQuery("SELECT * FROM a " + kw + " JOIN b ON a.x = b.x"); throw new AssertionError("expected error for " + kw); }
+                catch (QoException e) {
+                    eq(ErrorCode.UNSUPPORTED_OPERATION, e.getInfo().code());
+                    check(e.getMessage().contains("LEFT/RIGHT/FULL/OUTER JOIN is not supported"), e.getMessage());
+                    check(!e.getMessage().contains("alias"), e.getMessage());
+                }
+            }
+        });
+        test("table alias message is unchanged", () -> {
+            try { QO.parseQuery("SELECT a FROM t alias"); throw new AssertionError("expected error"); }
+            catch (QoException e) { check(e.getMessage().contains("table alias"), e.getMessage()); }
+        });
         errorAt("SELECT a FROM t WHERE x = 1 OR y = 2", ErrorCode.UNSUPPORTED_OPERATION, 28);
         test("empty input is rejected", () -> error(ErrorCode.SYNTAX_ERROR, () -> QO.parseQuery("   ")));
         test("syntax errors never reach the catalog", () -> {

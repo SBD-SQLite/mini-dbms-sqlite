@@ -10,6 +10,7 @@ import sqlike.contract.IStorageManager;
 import sqlike.shared.ErrorCode;
 import sqlike.shared.JoinAlgorithm;
 import sqlike.shared.JoinSpec;
+import sqlike.shared.QoException;
 import sqlike.shared.JoinType;
 import sqlike.shared.PlanNode;
 
