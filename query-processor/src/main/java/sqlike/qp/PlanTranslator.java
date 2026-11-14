@@ -2,9 +2,7 @@ package sqlike.qp;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.Optional;
-import java.util.Set;
 import sqlike.contract.IStorageManager;
 import sqlike.qp.port.QpContracts.TableId;
 import sqlike.shared.ColumnRef;
@@ -15,7 +13,6 @@ import sqlike.shared.JoinType;
 import sqlike.shared.PlanNode;
 import sqlike.shared.PlanNodeKind;
 import sqlike.shared.QueryPlan;
-import sqlike.shared.ResultColumn;
 import sqlike.shared.ScanSpec;
 import sqlike.shared.SortSpec;
 import sqlike.shared.TableSchema;
@@ -154,6 +151,9 @@ public class PlanTranslator {
                     "Node kind " + root.kind() + " is a query/read node; use translateSelect instead");
         }
 
+        if (hasStorage() && mutations == null) {
+            throw new IllegalStateException("Production writes require a MutationCoordinator");
+        }
         return switch (root.kind()) {
             case INSERT -> {
                 InsertSpec spec = root.mutation()
@@ -251,7 +251,7 @@ public class PlanTranslator {
             Schema outputSchema = Schema.of(qualifier, List.of());
             return new MockOperator(PlanNodeKind.SCAN, outputSchema, List.of());
         }
-        Schema baseSchema = resolveTableSchema(spec.tableName(), node);
+        Schema baseSchema = resolveTableSchema(spec.tableName());
         Schema outputSchema = Schema.of(qualifier, baseSchema.columns());
         if (qpStorage != null) {
             return new TableScanOperator(qpStorage, spec, outputSchema);
@@ -272,7 +272,7 @@ public class PlanTranslator {
             Schema outputSchema = Schema.of(qualifier, List.of());
             return new MockOperator(PlanNodeKind.INDEX_SCAN, outputSchema, List.of());
         }
-        Schema baseSchema = resolveTableSchema(spec.tableName(), node);
+        Schema baseSchema = resolveTableSchema(spec.tableName());
         Schema outputSchema = Schema.of(qualifier, baseSchema.columns());
         if (qpStorage != null) {
             return new IndexScanOperator(qpStorage, spec, outputSchema);
@@ -298,47 +298,7 @@ public class PlanTranslator {
                 && spec.columns().get(0).tableName().isEmpty()) {
             return child;
         }
-        Schema childSchema = child.schema();
-        List<ColumnRef> expandedRefs = new ArrayList<>();
-        for (ColumnRef ref : spec.columns()) {
-            if (ref.columnName().equals("*")) {
-                if (ref.tableName().isEmpty()) {
-                    for (int i = 0; i < childSchema.columnCount(); i++) {
-                        ColumnSchema col = childSchema.getColumn(i);
-                        Optional<String> owner = childSchema.columnTablesAt(i).stream().findFirst();
-                        expandedRefs.add(new ColumnRef(owner, col.name()));
-                    }
-                } else {
-                    String targetTable = ref.tableName().get().trim().toLowerCase(Locale.ROOT);
-                    int matched = 0;
-                    for (int i = 0; i < childSchema.columnCount(); i++) {
-                        if (childSchema.columnTablesAt(i).contains(targetTable)
-                                || childSchema.tableName()
-                                        .map(tn -> tn.trim().equalsIgnoreCase(targetTable))
-                                        .orElse(false)) {
-                            expandedRefs.add(new ColumnRef(ref.tableName(), childSchema.getColumn(i).name()));
-                            matched++;
-                        }
-                    }
-                    if (matched == 0) {
-                        throw new IllegalArgumentException(
-                                "Table or alias not found in schema for wildcard projection: " + ref.tableName().get() + ".*");
-                    }
-                }
-            } else {
-                expandedRefs.add(ref);
-            }
-        }
-        ProjectSpec effectiveSpec = new ProjectSpec(expandedRefs);
-        List<ColumnSchema> projectedCols = new ArrayList<>(expandedRefs.size());
-        List<Set<String>> projectedOwners = new ArrayList<>(expandedRefs.size());
-        for (ColumnRef ref : expandedRefs) {
-            int offset = childSchema.findColumnOffset(ref);
-            projectedCols.add(childSchema.getColumn(offset));
-            projectedOwners.add(childSchema.columnTablesAt(offset));
-        }
-        Schema outputSchema = Schema.withColumnTables(projectedCols, childSchema.tableName(), projectedOwners);
-        return new ProjectOperator(child, effectiveSpec, outputSchema);
+        return new ProjectOperator(child, spec);
     }
 
     private Operator buildJoin(PlanNode node, JoinSpec spec) {
@@ -350,7 +310,7 @@ public class PlanTranslator {
         List<ColumnSchema> leftCols = leftChild.schema().getColumns();
         List<ColumnSchema> rightCols = rightChild.schema().getColumns();
         List<String> common = spec.commonColumns() != null ? spec.commonColumns() : List.of();
-        if (spec.joinType() == JoinType.NATURAL && common.isEmpty()) {
+        if (spec.joinType() == JoinType.NATURAL) {
             List<String> inferred = new ArrayList<>();
             for (ColumnSchema lc : leftCols) {
                 for (ColumnSchema rc : rightCols) {
@@ -358,6 +318,15 @@ public class PlanTranslator {
                         inferred.add(lc.name());
                         break;
                     }
+                }
+            }
+            if (!common.isEmpty()) {
+                var supplied = new java.util.TreeSet<String>(String.CASE_INSENSITIVE_ORDER);
+                supplied.addAll(common);
+                var expected = new java.util.TreeSet<String>(String.CASE_INSENSITIVE_ORDER);
+                expected.addAll(inferred);
+                if (supplied.size() != common.size() || !supplied.equals(expected)) {
+                    throw new IllegalArgumentException("NATURAL JOIN common columns must match both input schemas");
                 }
             }
             common = List.copyOf(inferred);
@@ -427,7 +396,7 @@ public class PlanTranslator {
         if (!hasStorage() || source == null || collector == null || evaluator == null || mutations == null) {
             return new MockCommandExecutor(PlanNodeKind.UPDATE);
         }
-        Schema tableSchema = resolveTableSchema(spec.tableName(), node);
+        Schema tableSchema = resolveTableSchema(spec.tableName());
         return new UpdateExecutor(source, spec, tableSchema, collector, evaluator, mutations);
     }
 
@@ -443,59 +412,45 @@ public class PlanTranslator {
         if (!hasStorage()) {
             return new MockCommandExecutor(PlanNodeKind.CREATE_INDEX);
         }
-        if (qpStorage != null) {
-            return new CreateIndexExecutor(spec, qpStorage);
-        }
-        return new CreateIndexExecutor(spec, storage);
+        return new CreateIndexExecutor(spec, mutations);
     }
 
     private CommandExecutor buildCreateTable(PlanNode node, sqlike.shared.CreateTableSpec spec) {
         if (!hasStorage()) {
             return new MockCommandExecutor(PlanNodeKind.CREATE_TABLE);
         }
-        if (qpStorage != null) {
-            return new CreateTableExecutor(spec, qpStorage, null);
-        }
-        return new CreateTableExecutor(spec, storage);
+        return new CreateTableExecutor(spec, mutations);
     }
 
     private CommandExecutor buildDropTable(PlanNode node, sqlike.shared.DropTableSpec spec) {
         if (!hasStorage()) {
             return new MockCommandExecutor(PlanNodeKind.DROP_TABLE);
         }
-        if (qpStorage != null) {
-            return new DropTableExecutor(spec, qpStorage, null);
-        }
-        return new DropTableExecutor(spec, storage);
+        return new DropTableExecutor(spec, mutations);
     }
 
     private boolean hasStorage() {
         return storage != null || qpStorage != null;
     }
 
-    private Schema resolveTableSchema(String tableName, PlanNode node) {
+    private Schema resolveTableSchema(String tableName) {
+        Schema schema;
         if (qpStorage != null) {
-            return qpStorage.getSchema(new TableId(tableName));
-        }
-        if (storage != null) {
-            TableSchema ts;
+            schema = qpStorage.getSchema(new TableId(tableName));
+        } else {
+            TableSchema metadata;
             try {
-                ts = storage.getSchema(tableName);
+                metadata = storage.getSchema(tableName);
             } catch (sqlike.storage.StorageException e) {
                 throw TableScanOperator.mapStorageException("Failed to resolve schema for table '" + tableName + "'", e);
             }
-            if (ts != null) {
-                return Schema.fromTableSchema(ts);
-            }
+            schema = metadata == null ? null : Schema.fromTableSchema(metadata);
         }
-        if (node != null && node.outputColumns() != null && !node.outputColumns().isEmpty()) {
-            List<ColumnSchema> cols = new ArrayList<>();
-            for (ResultColumn rc : node.outputColumns()) {
-                cols.add(new ColumnSchema(rc.name(), rc.dataType(), Optional.empty()));
-            }
-            return Schema.of(tableName, cols);
+        if (schema == null || schema.columnCount() == 0) {
+            throw new QpException(new sqlike.shared.ErrorInfo(sqlike.shared.ErrorCode.IO_ERROR,
+                    sqlike.shared.ComponentType.SM, "Missing schema for table: " + tableName, Optional.empty()));
         }
-        return Schema.of(tableName, List.of());
+        return schema;
     }
 
     private boolean isCommandKind(PlanNodeKind kind) {

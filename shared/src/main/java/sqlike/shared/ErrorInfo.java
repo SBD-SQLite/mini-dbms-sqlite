@@ -6,6 +6,8 @@ public record ErrorInfo(
         ErrorCode code,
         ComponentType component,
         String message,
-        Optional<Integer> position
-) {
+        Optional<Integer> position) {
+    public ErrorInfo {
+        position = position == null ? Optional.empty() : position;
+    }
 }

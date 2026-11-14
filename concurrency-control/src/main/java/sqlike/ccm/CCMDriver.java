@@ -239,6 +239,10 @@ public class CCMDriver {
             }
         }
 
+        if (!checkNoLeftover(scenario, stepLogs)) {
+            expectationMismatch[0] = true;
+        }
+
         List<ScheduleOperation> committedSchedule = recorder.committedSchedule();
         Map<Long, Set<Long>> graph = verifier.buildPrecedenceGraph(committedSchedule);
         boolean serializable = verifier.isConflictSerializable(committedSchedule);
@@ -549,6 +553,47 @@ public class CCMDriver {
         return sb.toString();
     }
 
+    /**
+     * After the scenario no lock, wait-for edge, uncommitted writer or reader mark may remain. The
+     * one exception is a COMMIT whose WAL write failed: its outcome is unknown, so its locks stay
+     * until recovery decides; that case must be cleared by initAfterRecovery.
+     */
+    private boolean checkNoLeftover(Scenario scenario, List<String> stepLogs) {
+        if (!(ccm instanceof ConcurrencyControlManager manager)) {
+            return true;
+        }
+        String left = settledLeftover(manager);
+        if (scenario.expectsUnresolvedCommit()) {
+            if (left.isEmpty()) {
+                stepLogs.add("MISMATCH: commit yang gagal ditulis ke WAL seharusnya menahan lock sampai recovery");
+                return false;
+            }
+            manager.initAfterRecovery(0L);
+            left = manager.leftoverState();
+        }
+        if (!left.isEmpty()) {
+            stepLogs.add("MISMATCH: sisa lock atau data protokol setelah skenario: " + left);
+            return false;
+        }
+        stepLogs.add("Tidak ada sisa lock atau data protokol setelah skenario");
+        return true;
+    }
+
+    /** Victims are rolled back by CCM's own threads, so give them a moment to finish before judging. */
+    private static String settledLeftover(ConcurrencyControlManager manager) {
+        String left = manager.leftoverState();
+        for (int i = 0; i < 40 && !left.isEmpty(); i++) {
+            try {
+                Thread.sleep(25L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            left = manager.leftoverState();
+        }
+        return left;
+    }
+
     public static List<Scenario> defaultScenarios() {
         ResourceId resA = Scenario.parseResource("A");
         ResourceId resB = Scenario.parseResource("B");
@@ -574,7 +619,7 @@ public class CCMDriver {
                 false);
 
         Scenario concurrentReadWrite = Scenario.fromScript(
-                "Concurrent Schedule - Serial Execution (Lock-Based)",
+                "Concurrent Schedule - Serial Execution",
                 """
                 # protokol: lock
                 T1 BEGIN
@@ -765,7 +810,7 @@ public class CCMDriver {
                 List.of(),
                 true);
 
-        return List.of(
+        List<Scenario> all = new ArrayList<>(List.of(
                 manualAcyclic,
                 manualCyclic,
                 concurrentReadWrite,
@@ -781,7 +826,13 @@ public class CCMDriver {
                 beginLogFailure,
                 commitLogFailure,
                 rollbackRetried,
-                ccmInvariants);
+                ccmInvariants));
+        // Scenarios that do not depend on how a protocol resolves conflicts also run under timestamp ordering (CC-10).
+        for (Scenario scenario : List.of(concurrentReadWrite, walFailureAbortsTx, readOldValueAfterAbort,
+                beginLogFailure, commitLogFailure, rollbackRetried)) {
+            scenario.asProtocol(ProtocolType.TIMESTAMP_BASED).ifPresent(all::add);
+        }
+        return List.copyOf(all);
     }
 
     public static void main(String[] args) {

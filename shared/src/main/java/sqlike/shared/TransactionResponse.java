@@ -6,6 +6,9 @@ public record TransactionResponse(
         long txId,
         long timestamp,
         TransactionStatus status,
-        Optional<ErrorInfo> error
-) {
+        Optional<ErrorInfo> error) {
+
+    public TransactionResponse {
+        error = error == null ? Optional.empty() : error;
+    }
 }

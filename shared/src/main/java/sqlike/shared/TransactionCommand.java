@@ -1,6 +1,4 @@
 package sqlike.shared;
 
-public record TransactionCommand(
-        TransactionAction action
-) {
+public record TransactionCommand(TransactionAction action) {
 }

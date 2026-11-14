@@ -51,11 +51,11 @@ public interface IStorageManager {
 
     // Class diagram Tab 6 signatures
     default void createTable(TableSchema schema) {
-        createTable(schema, 1L);
+        throw new UnsupportedOperationException("CREATE TABLE requires a WAL LSN");
     }
 
     default void dropTable(String table, DropBehavior behavior) {
-        dropTable(table, behavior, 1L);
+        throw new UnsupportedOperationException("DROP TABLE requires a WAL LSN");
     }
 
     // PRD §3.3 LSN-bearing schema & snapshot signatures
@@ -72,13 +72,14 @@ public interface IStorageManager {
     }
 
     default void createIndex(IndexMetadata definition, long lsn) {
-        createIndex(definition);
+        throw new UnsupportedOperationException("LSN-bearing createIndex is not implemented");
     }
 
     default String createSnapshot() {
-        return "snap-0";
+        throw new UnsupportedOperationException("Snapshots are not implemented");
     }
 
     default void restoreSnapshot(String snapshotId) {
+        throw new UnsupportedOperationException("Snapshot restore is not implemented");
     }
 }

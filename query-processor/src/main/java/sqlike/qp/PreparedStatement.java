@@ -45,6 +45,7 @@ public record PreparedStatement(String sql, QueryPlan plan, List<AccessRequest> 
         if (plan == null || plan.root() == null) {
             return List.of();
         }
+        new PlanValidator().validate(plan);
         List<AccessRequest> list = new ArrayList<>();
         collectAccessRequests(plan.root(), list);
         return List.copyOf(list);

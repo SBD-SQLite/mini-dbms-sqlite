@@ -99,9 +99,15 @@ final class WalFileIO {
         file.force(true);
     }
 
-    static void forceDirectory(Path directory) throws IOException {
+    // Force direktori supaya entry file-nya ikut durable. Ini best effort: Windows menolak membuka
+    // direktori sebagai channel (AccessDeniedException) dan sebagian file system juga tidak
+    // mendukungnya. File WAL-nya sendiri selalu di-force sebelum method ini dipanggil, jadi yang
+    // dikorbankan cuma durabilitas entry direktori, bukan isi record.
+    static void forceDirectory(Path directory) {
         try (FileChannel file = FileChannel.open(directory, READ)) {
             file.force(true);
+        } catch (IOException unsupported) {
+            // Platform tidak bisa fsync direktori; tidak ada yang bisa dilakukan.
         }
     }
 

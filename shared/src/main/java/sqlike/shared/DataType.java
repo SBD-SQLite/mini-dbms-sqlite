@@ -1,8 +1,6 @@
 package sqlike.shared;
 
 public enum DataType {
-    INTEGER,
-    FLOAT,
-    CHAR,
-    VARCHAR
+    INTEGER, FLOAT, CHAR, VARCHAR
 }
+

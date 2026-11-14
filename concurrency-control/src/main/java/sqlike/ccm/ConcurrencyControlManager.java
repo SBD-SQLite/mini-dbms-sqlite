@@ -261,6 +261,18 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
         return config;
     }
 
+    /**
+     * Describes what the active protocol and the transaction registry still hold for unfinished
+     * transactions. An empty string means nothing is left; used by drivers after every scenario.
+     */
+    public String leftoverState() {
+        String protocolLeft = protocol.leftoverState();
+        if (transactions.hasActive()) {
+            return (protocolLeft + " unfinishedTransactions").trim();
+        }
+        return protocolLeft;
+    }
+
     /** Operations granted by this CCM, used for serializability checks (CC-09). */
     public ScheduleRecorder getRecorder() {
         return recorder;

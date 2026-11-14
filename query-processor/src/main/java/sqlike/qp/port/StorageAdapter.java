@@ -29,7 +29,12 @@ public final class StorageAdapter implements IStorageManager {
     }
     @Override public Schema getSchema(TableId table) {
         try {
-            return Schema.fromTableSchema(storage.getSchema(table.value()));
+            var metadata = storage.getSchema(table.value());
+            if (metadata == null) {
+                throw new QpException(new sqlike.shared.ErrorInfo(sqlike.shared.ErrorCode.IO_ERROR,
+                        sqlike.shared.ComponentType.SM, "Missing schema for table: " + table.value(), Optional.empty()));
+            }
+            return Schema.fromTableSchema(metadata);
         } catch (StorageException e) {
             throw failure(e.getMessage());
         }
@@ -83,7 +88,7 @@ public final class StorageAdapter implements IStorageManager {
         reservations.forEach((rid, reservation) -> { if (reservation.tx().equals(tx)) releaseReservation(null, rid, tx); });
     }
     @Override public void applyChange(ChangeRecord change, WritePermit permit) {
-        if (!change.id().equals(permit.changeId()) || permit.lsn().value() < 0) throw failure("Invalid write permit");
+        if (!change.id().equals(permit.changeId()) || permit.lsn().value() <= 0) throw failure("Invalid write permit");
         scope(change.txId()); var data = change.value(); long lsn = permit.lsn().value();
         try {
             switch (data.operation()) {
@@ -114,9 +119,13 @@ public final class StorageAdapter implements IStorageManager {
         }
     }
     @Override public void createIndex(CreateIndexSpec spec, ExecutionContext context, AccessGrant grant) {
+        throw failure("CREATE INDEX requires a WAL LSN");
+    }
+    @Override public void createIndex(CreateIndexSpec spec, ExecutionContext context, AccessGrant grant, long lsn) {
         access(spec.tableId(), context, grant, AccessMode.WRITE);
+        if (lsn <= 0) throw failure("CREATE INDEX requires a positive WAL LSN");
         try {
-            storage.createIndex(spec.value());
+            storage.createIndex(spec.value(), lsn);
         } catch (StorageException e) {
             throw failure(e.getMessage());
         }

@@ -1,7 +1,5 @@
 package sqlike.shared;
 
-public record RID(
-        PageId pageId,
-        int slotId
-) {
+public record RID(PageId pageId, int slotId) {
 }
+

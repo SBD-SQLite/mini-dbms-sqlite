@@ -21,7 +21,7 @@ import sqlike.shared.ErrorInfo;
 import sqlike.shared.ParsedQuery;
 import sqlike.shared.PlanNode;
 import sqlike.shared.PlanNodeKind;
-import sqlike.shared.QoException;
+import sqlike.qo.QoException;
 import sqlike.shared.QueryPlan;
 import sqlike.shared.QueryResult;
 import sqlike.shared.RecoveryResult;
@@ -144,7 +144,7 @@ public final class QueryProcessor implements IQueryProcessor {
                 storageAdapter, evaluator, comparator, mutations, collector, estimator, validator, configuration);
         this.engine = new ExecutionEngine(this.translator);
         this.sessions = new SessionManager();
-        this.transactions = new TransactionCoordinator(this.concurrencyAdapter, configuration);
+        this.transactions = new TransactionCoordinator(this.concurrencyAdapter, configuration, storageAdapter);
         this.access = new AccessCoordinator(this.concurrencyAdapter);
         this.planExecutor = this.engine;
         this.state = SystemState.STARTING;
@@ -200,12 +200,17 @@ public final class QueryProcessor implements IQueryProcessor {
         }
         state = SystemState.RECOVERING;
         try {
+            if (storage != null) validateRuntimeProviders();
             if (recovery != null && concurrencyControl != null) {
                 RecoveryResult result = recovery.recover();
+                if (result == null || result.lastTxId() < 0 || result.lastTimestamp() < 0 || result.lastRecoveredLSN() < 0
+                        || result.checkpointLSN() == null || result.checkpointLSN().filter(lsn -> lsn < 0 || lsn > result.lastRecoveredLSN()).isPresent()) {
+                    throw new QpException(ErrorCode.RECOVERY_FAILURE, "FRM returned an invalid recovery result");
+                }
                 concurrencyControl.initAfterRecovery(result.lastTxId());
             }
             state = SystemState.READY;
-        } catch (RuntimeException e) {
+        } catch (RuntimeException | LinkageError e) {
             state = SystemState.FAILED;
             throw e;
         }
@@ -220,10 +225,15 @@ public final class QueryProcessor implements IQueryProcessor {
     }
 
     public synchronized void shutdown() {
-        for (SessionState session : sessions.activeSessions()) {
-            closeSession(session.getId());
+        try {
+            for (SessionState session : sessions.activeSessions()) {
+                closeSession(session.getId());
+            }
+            state = SystemState.STOPPED;
+        } catch (RuntimeException e) {
+            state = SystemState.FAILED;
+            throw e;
         }
-        state = SystemState.STOPPED;
     }
 
     public Session openSession() {
@@ -246,9 +256,9 @@ public final class QueryProcessor implements IQueryProcessor {
                 session.getCurrentTxId().ifPresent(this::abortQuietly);
                 session.clearTransaction();
             }
+            sessions.removeClosed(sessionId);
         } finally {
             session.unlockExecution();
-            sessions.removeClosed(sessionId);
         }
     }
 
@@ -336,12 +346,46 @@ public final class QueryProcessor implements IQueryProcessor {
             if (concurrencyAdapter != null) {
                 concurrencyAdapter.registerExternalTransaction(txId);
             }
-            if (access != null && plan != null && access.isTransactionActive(new TxId(txId))) {
+            if (access != null) {
+                if (!access.isTransactionActive(new TxId(txId))) {
+                    throw new QpException(ErrorCode.INVALID_STATE, "Execution requires an active transaction");
+                }
+                context = transactions.externalContext(txId);
+                translator.validate(PreparedStatement.of(plan));
+                if (isSchemaStatement(plan.root().kind().name())) {
+                    throw new QpException(ErrorCode.INVALID_STATE, "DDL requires auto-commit SQL execution");
+                }
+                access.acquireCatalog(false, context);
                 access.acquireAll(PreparedStatement.of(plan), context);
             }
             return planExecutor.execute(plan, context);
         } catch (RuntimeException e) {
             return errorResult(e);
+        }
+    }
+
+    private void validateRuntimeProviders() {
+        List<String> missing = new ArrayList<>();
+        requireOverride(storage, "createTable", missing, sqlike.shared.TableSchema.class, long.class);
+        requireOverride(storage, "dropTable", missing, String.class, sqlike.shared.DropBehavior.class, long.class);
+        requireOverride(storage, "createIndex", missing, sqlike.shared.IndexMetadata.class, long.class);
+        requireOverride(storage, "createSnapshot", missing);
+        requireOverride(storage, "restoreSchema", missing, sqlike.shared.SchemaImage.class, long.class);
+        requireOverride(concurrencyControl, "requestWriteAccess", missing, long.class, sqlike.shared.ResourceId.class);
+        requireOverride(concurrencyControl, "requestSchemaWrite", missing, long.class, sqlike.shared.SchemaChange.class);
+        requireOverride(concurrencyControl, "beginApply", missing, long.class, long.class);
+        requireOverride(concurrencyControl, "endApply", missing, long.class, long.class);
+        requireOverride(recovery, "logSchemaChange", missing, long.class, sqlike.shared.SchemaChange.class);
+        if (!missing.isEmpty()) throw new UnsupportedOperationException("Runtime providers lack PRD implementations: " + String.join(", ", missing));
+    }
+
+    private static void requireOverride(Object provider, String method, List<String> missing, Class<?>... parameters) {
+        try {
+            if (provider.getClass().getMethod(method, parameters).getDeclaringClass().isInterface()) {
+                missing.add(provider.getClass().getName() + "." + method);
+            }
+        } catch (NoSuchMethodException e) {
+            missing.add(provider.getClass().getName() + "." + method);
         }
     }
 
@@ -370,10 +414,18 @@ public final class QueryProcessor implements IQueryProcessor {
             if (parsed.transactionCommand().isPresent()) {
                 return runTransactionCommand(session, parsed.transactionCommand().get().action());
             }
+            boolean schemaStatement = isSchemaStatement(parsed.statementType().name());
+            if (schemaStatement && session.isExplicitTransaction()) {
+                throw new QpException(ErrorCode.INVALID_STATE, "DDL is not allowed within an explicit transaction");
+            }
+            ExecutionContext ctx = transactions.ensureTransaction(session);
+            context = Optional.of(ctx);
+            access.acquireCatalog(schemaStatement, ctx);
+            // Binding errors leave explicit transactions usable; implicit transactions still need cleanup.
+            if (!ctx.implicit) context = Optional.empty();
             QueryPlan plan = optimizer.optimizeQuery(parsed);
             PreparedStatement prepared = PreparedStatement.of(sql, plan);
             validateStatementPolicy(prepared, session);
-            ExecutionContext ctx = transactions.ensureTransaction(session);
             context = Optional.of(ctx);
             ExecutionSummary summary = executePrepared(prepared, ctx, sink);
             transactions.finishImplicit(session, ctx);
@@ -394,6 +446,9 @@ public final class QueryProcessor implements IQueryProcessor {
             case COMMIT: {
                 long txId = requireExplicitTransaction(session, "COMMIT");
                 TransactionState st = transactions.commit(session);
+                if (st == TransactionState.PARTIALLY_COMMITTED) {
+                    throw new QpException(ErrorCode.INVALID_STATE, "Commit outcome unknown. Recovery required.");
+                }
                 if (st != TransactionState.COMMITTED) {
                     return new Outcome(ExecutionSummary.failure(new ErrorInfo(
                             ErrorCode.TRANSACTION_ABORTED, ComponentType.CCM,
@@ -405,6 +460,9 @@ public final class QueryProcessor implements IQueryProcessor {
             default: {
                 long txId = requireExplicitTransaction(session, "ABORT");
                 TransactionState st = transactions.abort(session, "User ABORT");
+                if (st == TransactionState.PARTIALLY_COMMITTED) {
+                    throw new QpException(ErrorCode.INVALID_STATE, "Commit outcome unknown. Recovery required.");
+                }
                 if (st != TransactionState.ABORTED) {
                     return new Outcome(ExecutionSummary.failure(new ErrorInfo(
                             ErrorCode.INVALID_STATE, ComponentType.CCM,
@@ -413,6 +471,10 @@ public final class QueryProcessor implements IQueryProcessor {
                 return transactionOutcome(txId, TransactionStatus.ABORTED, "ABORT: ABORTED");
             }
         }
+    }
+
+    private static boolean isSchemaStatement(String kind) {
+        return kind.equals("CREATE_INDEX") || kind.equals("CREATE_TABLE") || kind.equals("DROP_TABLE");
     }
 
     private Outcome transactionOutcome(long txId, TransactionStatus status, String message) {
