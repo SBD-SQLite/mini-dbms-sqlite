@@ -10,6 +10,7 @@ import sqlike.index.IndexManager;
 import sqlike.buffer.BufferPoolManager;
 import sqlike.shared.IndexCondition;
 import sqlike.shared.IndexMetadata;
+import sqlike.shared.IndexStatistics;
 import sqlike.shared.InsertReservation;
 import sqlike.shared.RID;
 import sqlike.shared.Record;
@@ -101,6 +102,11 @@ public final class StorageManager implements IStorageManager {
     @Override
     public List<IndexMetadata> getIndexes(String table) throws StorageException {
         return catalog.getIndexes(table);
+    }
+
+    @Override
+    public IndexStatistics getIndexStatistics(String name) throws StorageException {
+        return indexes.getIndexStatistics(name);
     }
 
     @Override
