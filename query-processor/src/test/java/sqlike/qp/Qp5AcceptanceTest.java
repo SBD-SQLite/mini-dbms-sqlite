@@ -366,6 +366,9 @@ public final class Qp5AcceptanceTest {
     }
 
     private static void runAccessChecks() {
+        test("QP runtime rejects inherited placeholder capabilities before recovery", Qp5AcceptanceTest::runtimeCapabilities);
+        test("QP runtime validates recovery and wires one processor", Qp5AcceptanceTest::runtimeRecovery);
+        test("QP runtime preserves failed shutdown state", Qp5AcceptanceTest::runtimeShutdown);
         test("QP WAL executePlan shares transaction change identity", Qp5AcceptanceTest::walExternalPlans);
         test("QP WAL missing or invalid LSN never becomes a permit", Qp5AcceptanceTest::walPermitBoundaries);
         test("QP WAL unfinished apply blocks commit and rollback", Qp5AcceptanceTest::walApplyGuard);
@@ -377,6 +380,65 @@ public final class Qp5AcceptanceTest {
         test("QP-03 catalog permission precedes optimization", Qp5AcceptanceTest::catalogBeforeOptimization);
         test("QP-12 adapter catalog, abort, and cancelled grants", Qp5AcceptanceTest::adapterAccessBoundary);
         test("QP-02 failed disconnect rollback stays registered", Qp5AcceptanceTest::failedDisconnectRollback);
+    }
+
+    private static <T> T runtimeProxy(Class<T> contract, InvocationHandler handler) {
+        return contract.cast(Proxy.newProxyInstance(contract.getClassLoader(), new Class<?>[]{contract}, handler));
+    }
+
+    private static void runtimeCapabilities() throws Exception {
+        TestDatabase db = new TestDatabase();
+        var ccm = runtimeProxy(IConcurrencyControlManager.class, (proxy, method, args) -> { throw new AssertionError("CCM called before capability validation"); });
+        var frm = runtimeProxy(sqlike.contract.IFailureRecoveryManager.class, (proxy, method, args) -> { throw new AssertionError("Recovery called with incompatible providers"); });
+        var processor = new QueryProcessor(db.runner.optimizer, db.storage, ccm, frm);
+        try { processor.initialize(); throw new AssertionError("Provider default accepted"); }
+        catch (UnsupportedOperationException expected) { assertTrue(expected.getMessage().contains("restoreSchema"), expected.getMessage()); }
+        assertEquals(SystemState.FAILED, processor.getState());
+    }
+
+    private static void runtimeRecovery() throws Exception {
+        TestDatabase db = new TestDatabase();
+        for (int scenario : List.of(0, 1, 2)) {
+            var events = new ArrayList<String>();
+            var storage = runtimeProxy(sqlike.contract.IStorageManager.class, (proxy, method, args) -> { throw new AssertionError("Startup touched storage: " + method.getName()); });
+            var ccm = runtimeProxy(IConcurrencyControlManager.class, (proxy, method, args) -> {
+                assertEquals("initAfterRecovery", method.getName()); assertEquals(7L, args[0]); events.add("init"); return null;
+            });
+            var frm = runtimeProxy(sqlike.contract.IFailureRecoveryManager.class, (proxy, method, args) -> {
+                assertEquals("recover", method.getName()); events.add("recover");
+                return scenario == 0 ? null : new RecoveryResult(7, 8, 9, Optional.of(scenario == 1 ? 10L : 3L));
+            });
+            var config = new QpConfiguration(0, 2, 4096, IndexType.HASH, Files.createTempDirectory("qp-runtime-"));
+            var bootstrap = QpBootstrap.forComponents(db.runner.optimizer, storage, ccm, frm, config);
+            if (scenario < 2) {
+                try { bootstrap.start(); throw new AssertionError("Invalid recovery accepted"); }
+                catch (QpException expected) { assertEquals(ErrorCode.RECOVERY_FAILURE, expected.getErrorInfo().code()); }
+                assertEquals(SystemState.FAILED, bootstrap.getState()); assertEquals(List.of("recover"), events);
+            } else {
+                try { bootstrap.start(); bootstrap.start(); assertEquals(SystemState.READY, bootstrap.getState());
+                    assertEquals(List.of("recover", "init"), events);
+                } finally { bootstrap.stop(); }
+                assertEquals(SystemState.STOPPED, bootstrap.getState());
+            }
+        }
+        var other = StubQpRuntime.open(Files.createTempDirectory("qp-other-"), QpConfiguration.defaults());
+        var first = StubQpRuntime.open(Files.createTempDirectory("qp-first-"), QpConfiguration.defaults());
+        try { new QpBootstrap(first.processor, new QueryServer(other.processor, QpConfiguration.defaults())); throw new AssertionError("Mismatched processors accepted"); }
+        catch (IllegalArgumentException expected) { }
+    }
+
+    private static void runtimeShutdown() throws Exception {
+        var config = new QpConfiguration(0, 2, 4096, IndexType.HASH, Files.createTempDirectory("qp-stop-"));
+        var runtime = StubQpRuntime.open(config.temporaryDirectory(), config); runtime.recover();
+        var bootstrap = new QpBootstrap(runtime.processor, new QueryServer(runtime.processor, config));
+        bootstrap.start(); var session = runtime.processor.openSession();
+        runtime.processor.execute("BEGIN;", session);
+        runtime.transactions.nextCommit = TransactionState.PARTIALLY_COMMITTED;
+        runtime.processor.execute("COMMIT;", session);
+        try { bootstrap.stop(); throw new AssertionError("Failed shutdown reported success"); }
+        catch (IllegalStateException expected) { }
+        assertEquals(SystemState.FAILED, bootstrap.getState());
+        assertEquals(SystemState.FAILED, runtime.processor.getState());
     }
 
     private static void walExternalPlans() throws Exception {

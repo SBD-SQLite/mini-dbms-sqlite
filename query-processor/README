@@ -140,9 +140,9 @@ mvn -pl query-processor -am -Pqp-isolated test  # seluruh tes QP dengan salinan 
 
 Build produksi memakai `sqlike-shared` global dan `sqlike-query-optimizer`. Translator menolak metadata SM yang kosong dan DML dengan SM tetapi tanpa `MutationCoordinator`; output plan tidak dipakai sebagai pengganti metadata SM. JAR QP hanya memuat kode `src/main/java`; salinan QO dan runtime stub tidak masuk JAR. Gunakan `clean` sekali saat beralih dari konfigurasi lama agar class stub di `target/classes` ikut dibersihkan.
 
-`mvn test` menjalankan `QP1Driver --test`, `QP2TestDriver`, `QP3TestDriver`, `QP4TestDriver`, dan `Qp5AcceptanceTest --qo-integration` dalam JVM terpisah. Kegagalan driver menggagalkan build. Skenario integrasi memeriksa JOIN/filter/sort, UPDATE/ABORT, `executePlan`, dan propagasi error QO melalui API QP. Mode ini juga menjalankan lima regresi izin akses, katalog, blocking CCM, cancellation, dan penutupan sesi. Enam regresi WAL tambahan memeriksa LSN, lifecycle apply, schema before/after image, rollback, cleanup, dan identitas perubahan `executePlan`. SM/CCM/FRM masih memakai fixture pengujian. Integrasi layout juga menguji NATURAL JOIN dengan beberapa common-column, sort pada kolom yang tidak ditampilkan, serta plan INDEX_SCAN.
+`mvn test` menjalankan `QP1Driver --test`, `QP2TestDriver`, `QP3TestDriver`, `QP4TestDriver`, dan `Qp5AcceptanceTest --qo-integration` dalam JVM terpisah. Kegagalan driver menggagalkan build. Skenario integrasi memeriksa JOIN/filter/sort, UPDATE/ABORT, `executePlan`, dan propagasi error QO melalui API QP. Mode ini juga menjalankan lima regresi izin akses, katalog, blocking CCM, cancellation, dan penutupan sesi. Enam regresi WAL tambahan memeriksa LSN, lifecycle apply, schema before/after image, rollback, cleanup, dan identitas perubahan `executePlan`. Tiga regresi startup memeriksa capability penyedia, hasil recovery, kesamaan QP pada server/bootstrap, dan kegagalan shutdown. SM/CCM/FRM masih memakai fixture pengujian. Integrasi layout juga menguji NATURAL JOIN dengan beberapa common-column, sort pada kolom yang tidak ditampilkan, serta plan INDEX_SCAN.
 
-Profil `qp-isolated` menambahkan salinan QO **hanya ke source set test**, menjalankan empat driver tersebut, `QP1ScriptDriver` (18 skenario), serta acceptance QP5 lengkap (38 skenario). Alias tabel, `LIMIT`, subquery, dan `CREATE/DROP TABLE` pada suite ini belum didukung parser QO asli. Hasil suite terisolasi tidak membuktikan integrasi fitur bonus tersebut dengan QO asli.
+Profil `qp-isolated` menambahkan salinan QO **hanya ke source set test**, menjalankan empat driver tersebut, `QP1ScriptDriver` (18 skenario), serta acceptance QP5 lengkap (41 skenario). Alias tabel, `LIMIT`, subquery, dan `CREATE/DROP TABLE` pada suite ini belum didukung parser QO asli. Hasil suite terisolasi tidak membuktikan integrasi fitur bonus tersebut dengan QO asli.
 
 Hasil kompilasi produksi ada di `query-processor/target/classes`; class test ada di `target/test-classes-real-qo` atau `target/test-classes-isolated` agar perpindahan profil tidak memakai salinan QO dari profil sebelumnya. Driver lokal MS1 `M1ContractTestDriver.java` tidak dikompilasi oleh build resmi. `-DskipTests` melewati eksekusi driver. Untuk menjalankan driver tertentu setelah build:
 
@@ -165,6 +165,20 @@ Integrasi WAL fisik masih menunggu penyedia: kontrak SM saat ini belum menyediak
 
 QP memperoleh izin katalog READ sebelum binding/optimasi, atau WRITE untuk DDL/CREATE INDEX. Context eksekusi hanya menerima grant yang diberikan coordinator; context kosong tidak membuat izin sendiri. Adapter CCM mengikuti PRD blocking: request kembali dengan GRANTED/ABORTED; WAIT yang dikembalikan menjadi error kontrak dan tidak di-poll atau diulang, termasuk pencatatan perubahan. CCM saat ini masih dapat mengembalikan WAIT sehingga integrasi konflik menunggu penyesuaian komponen tersebut. Sesi dengan rollback gagal atau hasil COMMIT belum diketahui tetap terdaftar untuk penanganan lanjutan.
 
+### Wiring runtime terintegrasi (Tahap 7 belum lengkap)
+
+Pemilik assembly menyediakan objek QO, SM, CCM, dan FRM yang sudah saling terhubung, termasuk hook durability SM dan adapter CCM/FRM. Sisi QP menyediakan factory berikut:
+
+```java
+QpBootstrap runtime = QpBootstrap.forComponents(qo, sm, ccm, frm, configuration);
+runtime.start();
+// runtime.stop() saat layanan dihentikan
+```
+
+Sebelum recovery, startup produksi QP memeriksa bahwa metode schema/snapshot, akses WRITE, apply, dan schema WAL diimplementasikan oleh kelas penyedia, bukan default interface. Pemeriksaan ini hanya memverifikasi override metode, bukan membuktikan semantik atau durability penyedia. Berikutnya FRM.recover menghasilkan metadata valid, CCM.initAfterRecovery dipanggil sekali, lalu server mulai menerima koneksi. Bootstrap dan server wajib memakai objek QP yang sama; kegagalan shutdown mempertahankan status FAILED.
+
+Integrasi komponen asli masih tertahan. Pemeriksaan Maven `-pl storage-manager,concurrency-control,failure-recovery -am compile` berhenti di StorageDriver karena import sqlike.utils.SampleDatabaseLoader belum ada. StorageManager juga masih memiliki scan/reservasi/insert yang mengembalikan null dan operasi tulis kosong, serta belum menyediakan API schema/snapshot/indeks ber-LSN yang dibutuhkan. Folder penyedia tidak diubah. Karena itu belum tersedia entrypoint yang merakit seluruh implementasi nyata atau validasi crash recovery riil; server demo tetap memakai fixture pengujian.
+
 ### A. Menjalankan Seluruh Test Suite Otomatis
 
 Runner Bash berikut tetap tersedia sebagai alternatif tes terisolasi (QP1 s/d QP5, dengan salinan QO dan stub SM/CCM/FRM):
@@ -177,7 +191,7 @@ Atau jalankan per sub-komponen secara spesifik:
 ./query-processor/run-tests.sh qp2     # Menjalankan QP2TestDriver (89 test)
 ./query-processor/run-tests.sh qp3     # Menjalankan QP3TestDriver (55 test)
 ./query-processor/run-tests.sh qp4     # Menjalankan QP4TestDriver (17 skenario, 261 checks)
-./query-processor/run-tests.sh qp5     # Menjalankan Qp5AcceptanceTest (38 skenario dengan stub)
+./query-processor/run-tests.sh qp5     # Menjalankan Qp5AcceptanceTest (41 skenario dengan stub)
 ```
 
 ### B. Menjalankan Skrip SQL Kustom dengan `QP1ScriptDriver` (QP-14)

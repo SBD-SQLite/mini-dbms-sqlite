@@ -200,12 +200,17 @@ public final class QueryProcessor implements IQueryProcessor {
         }
         state = SystemState.RECOVERING;
         try {
+            if (storage != null) validateRuntimeProviders();
             if (recovery != null && concurrencyControl != null) {
                 RecoveryResult result = recovery.recover();
+                if (result == null || result.lastTxId() < 0 || result.lastTimestamp() < 0 || result.lastRecoveredLSN() < 0
+                        || result.checkpointLSN() == null || result.checkpointLSN().filter(lsn -> lsn < 0 || lsn > result.lastRecoveredLSN()).isPresent()) {
+                    throw new QpException(ErrorCode.RECOVERY_FAILURE, "FRM returned an invalid recovery result");
+                }
                 concurrencyControl.initAfterRecovery(result.lastTxId());
             }
             state = SystemState.READY;
-        } catch (RuntimeException e) {
+        } catch (RuntimeException | LinkageError e) {
             state = SystemState.FAILED;
             throw e;
         }
@@ -220,10 +225,15 @@ public final class QueryProcessor implements IQueryProcessor {
     }
 
     public synchronized void shutdown() {
-        for (SessionState session : sessions.activeSessions()) {
-            closeSession(session.getId());
+        try {
+            for (SessionState session : sessions.activeSessions()) {
+                closeSession(session.getId());
+            }
+            state = SystemState.STOPPED;
+        } catch (RuntimeException e) {
+            state = SystemState.FAILED;
+            throw e;
         }
-        state = SystemState.STOPPED;
     }
 
     public Session openSession() {
@@ -351,6 +361,31 @@ public final class QueryProcessor implements IQueryProcessor {
             return planExecutor.execute(plan, context);
         } catch (RuntimeException e) {
             return errorResult(e);
+        }
+    }
+
+    private void validateRuntimeProviders() {
+        List<String> missing = new ArrayList<>();
+        requireOverride(storage, "createTable", missing, sqlike.shared.TableSchema.class, long.class);
+        requireOverride(storage, "dropTable", missing, String.class, sqlike.shared.DropBehavior.class, long.class);
+        requireOverride(storage, "createIndex", missing, sqlike.shared.IndexMetadata.class, long.class);
+        requireOverride(storage, "createSnapshot", missing);
+        requireOverride(storage, "restoreSchema", missing, sqlike.shared.SchemaImage.class, long.class);
+        requireOverride(concurrencyControl, "requestWriteAccess", missing, long.class, sqlike.shared.ResourceId.class);
+        requireOverride(concurrencyControl, "requestSchemaWrite", missing, long.class, sqlike.shared.SchemaChange.class);
+        requireOverride(concurrencyControl, "beginApply", missing, long.class, long.class);
+        requireOverride(concurrencyControl, "endApply", missing, long.class, long.class);
+        requireOverride(recovery, "logSchemaChange", missing, long.class, sqlike.shared.SchemaChange.class);
+        if (!missing.isEmpty()) throw new UnsupportedOperationException("Runtime providers lack PRD implementations: " + String.join(", ", missing));
+    }
+
+    private static void requireOverride(Object provider, String method, List<String> missing, Class<?>... parameters) {
+        try {
+            if (provider.getClass().getMethod(method, parameters).getDeclaringClass().isInterface()) {
+                missing.add(provider.getClass().getName() + "." + method);
+            }
+        } catch (NoSuchMethodException e) {
+            missing.add(provider.getClass().getName() + "." + method);
         }
     }
 
