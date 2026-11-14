@@ -93,6 +93,10 @@ public final class CardinalityEstimator {
                     return comparisonSelectivity(left.column().orElseThrow(), op, child);
                 if (right.kind() == ExpressionKind.COLUMN && left.kind() == ExpressionKind.LITERAL)
                     return comparisonSelectivity(right.column().orElseThrow(), reverse(op), child);
+                if (left.kind() == ExpressionKind.COLUMN && isScalarSubquery(right))
+                    return scalarSubquerySelectivity(left.column().orElseThrow(), right, op, child);
+                if (right.kind() == ExpressionKind.COLUMN && isScalarSubquery(left))
+                    return scalarSubquerySelectivity(right.column().orElseThrow(), left, reverse(op), child);
                 if (left.kind() == ExpressionKind.COLUMN && right.kind() == ExpressionKind.COLUMN) {
                     ColumnRef leftColumn = left.column().orElseThrow();
                     ColumnRef rightColumn = right.column().orElseThrow();
@@ -103,8 +107,21 @@ public final class CardinalityEstimator {
                 }
             }
         }
-        // TODO(QO3): Estimate IN/EXISTS/scalar-subquery predicates from SubquerySpec.root instead of this fallback.
+        // Conservative fallback for computed expressions and unsupported subquery shapes.
         return 0.5;
+    }
+
+    private double scalarSubquerySelectivity(ColumnRef column, Expression scalar, ExpressionOperator op,
+                                             PlanNode input) {
+        SubquerySpec spec = scalar.subquery().orElseThrow();
+        if (spec.correlated() || !hasQualifier(input, column)) return 0.5;
+        if (estimateRows(spec.root()) == 0) return 0.0;
+        return comparisonSelectivity(column, op, input);
+    }
+
+    private static boolean isScalarSubquery(Expression expression) {
+        return expression.kind() == ExpressionKind.SUBQUERY
+                && expression.subquery().map(spec -> spec.type() == SubqueryType.SCALAR).orElse(false);
     }
 
     private double subquerySelectivity(Expression expression, PlanNode input) {

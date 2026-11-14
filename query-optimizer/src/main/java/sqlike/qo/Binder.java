@@ -57,7 +57,7 @@ public final class Binder {
                     .orElseThrow(() -> QoErrors.semantic("unknown index '" + scan.indexName().orElseThrow() + "'"));
             indexName = Optional.of(index.indexName());
         }
-        // TODO(QO1): Have the SELECT parser populate ScanSpec.alias for FROM t AS a; Binder already resolves it here.
+
         ScanSpec boundScan = new ScanSpec(schema.tableName(), indexName, scan.condition(), scan.alias());
         String qualifier = scan.alias().orElse(schema.tableName());
         List<ResultColumn> outputs = schema.columns().stream()
@@ -186,7 +186,7 @@ public final class Binder {
     }
 
     private Expression bindExpression(Expression expression, List<Relation> relations) {
-        // TODO(QO2): Emit SUBQUERY expressions with their parsed SELECT plan; Binder handles catalog binding here.
+
         // TODO(QO): Resolve correlated-subquery metadata as part of SQL subquery integration.
         if (expression.kind() == ExpressionKind.SUBQUERY) {
             SubquerySpec spec = expression.subquery()

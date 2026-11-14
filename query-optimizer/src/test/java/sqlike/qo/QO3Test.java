@@ -195,6 +195,30 @@ public final class QO3Test {
             long rows = estimator.estimateRows(filter);
             if (rows <= 0 || rows >= 5000) throw new AssertionError("expected reduced IN cardinality, got " + rows);
         });
+        test("scalar subquery estimates equality, range, and empty results", () -> {
+            PlanNode scalarResult = PlanNodes.project(PlanNodes.scan("dept"),
+                    List.of(Refs.column("dept", "dept_id")));
+            Expression scalar = subquery(SubqueryType.SCALAR, scalarResult, false, List.of());
+
+            PlanNode equality = binder.bind(new ParsedQuery(StatementType.SELECT,
+                    Optional.of(PlanNodes.filter(PlanNodes.scan("students"), binary(ExpressionOperator.EQ,
+                            columnExpression(Refs.column("students", "id")), scalar))), Optional.empty()));
+            eq(1L, estimator.estimateRows(equality));
+
+            PlanNode range = binder.bind(new ParsedQuery(StatementType.SELECT,
+                    Optional.of(PlanNodes.filter(PlanNodes.scan("students"), binary(ExpressionOperator.GT,
+                            columnExpression(Refs.column("students", "gpa")), scalar))), Optional.empty()));
+            eq(2500L, estimator.estimateRows(range));
+
+            PlanNode emptyResult = PlanNodes.project(
+                    PlanNodes.limit(PlanNodes.scan("dept"), new sqlike.shared.LimitSpec(0)),
+                    List.of(Refs.column("dept", "dept_id")));
+            Expression emptyScalar = subquery(SubqueryType.SCALAR, emptyResult, false, List.of());
+            PlanNode emptyComparison = binder.bind(new ParsedQuery(StatementType.SELECT,
+                    Optional.of(PlanNodes.filter(PlanNodes.scan("students"), binary(ExpressionOperator.EQ,
+                            columnExpression(Refs.column("students", "id")), emptyScalar))), Optional.empty()));
+            eq(0L, estimator.estimateRows(emptyComparison));
+        });
         test("subquery costs include execution and correlated repetition", () -> {
             Expression exists = subquery(SubqueryType.EXISTS, PlanNodes.scan("dept"), false, List.of());
             PlanNode uncorrelated = binder.bind(new ParsedQuery(StatementType.SELECT,
@@ -203,6 +227,15 @@ public final class QO3Test {
             double uncorrelatedCost = new CostModel(storage).getCost(uncorrelated);
             if (uncorrelatedCost <= baseScanCost)
                 throw new AssertionError("expected uncorrelated subquery I/O to be charged");
+
+            PlanNode scalarRoot = PlanNodes.project(PlanNodes.scan("dept"),
+                    List.of(Refs.column("dept", "dept_id")));
+            Expression scalar = subquery(SubqueryType.SCALAR, scalarRoot, false, List.of());
+            PlanNode scalarFilter = binder.bind(new ParsedQuery(StatementType.SELECT,
+                    Optional.of(PlanNodes.filter(PlanNodes.scan("students"), binary(ExpressionOperator.EQ,
+                            columnExpression(Refs.column("students", "id")), scalar))), Optional.empty()));
+            if (new CostModel(storage).getCost(scalarFilter) <= baseScanCost)
+                throw new AssertionError("expected scalar subquery I/O to be charged");
 
             Expression correlatedPredicate = binary(ExpressionOperator.EQ,
                     columnExpression(Refs.column("dept", "dept_id")),
