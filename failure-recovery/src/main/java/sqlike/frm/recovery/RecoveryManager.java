@@ -6,10 +6,10 @@ import sqlike.frm.RecoveryState;
 import sqlike.frm.port.SmPort;
 import sqlike.shared.RecoveryResult;
 
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 
 public class RecoveryManager {
     private RecoveryState state;
@@ -34,34 +34,45 @@ public class RecoveryManager {
         state = RecoveryState.RUNNING;
 
         try {
-            // baca log
+            // 1. Baca log
             List<LogRecord> records = logManager.readLogs(null);
 
-            // fase analysis
+            // 2. Fase Analysis
             RecoveryPlan plan = analyzer.analyze(records);
 
-            // fase undo: LogManager.logAbort menolak ABORT tanpa COMPENSATION per perubahan,
-            // jadi catat COMPENSATION (yang belum ada) sebelum menerapkan undo
-            Set<Long> compensated = new HashSet<>();
+            // 3. Fase Undo
+            // Kumpulkan semua CLR yang sudah ada (jika recovery sebelumnya terputus)
+            Map<Long, LogRecord> clrByOriginalLsn = new HashMap<>();
             for (LogRecord record : records) {
-                record.undoOfLSN().ifPresent(compensated::add);
-            }
-            for (LogRecord undoRec : plan.undoChanges) {
-                long txId = undoRec.txID().orElseThrow();
-                if (plan.needsAbortTx.contains(txId) && !compensated.contains(undoRec.lsn())) {
-                    logManager.logCompensation(txId, undoRec.lsn());
+                if (record.undoOfLSN().isPresent()) {
+                    clrByOriginalLsn.put(record.undoOfLSN().get(), record);
                 }
-                applier.undo(undoRec);
             }
 
-            // fase redo
+            for (LogRecord undoRec : plan.undoChanges) {
+                long txId = undoRec.txID().orElseThrow();
+                LogRecord clr = clrByOriginalLsn.get(undoRec.lsn());
+
+                // Jika belum ada CLR, dan transaksi ini memang butuh di-abort, buat CLR baru
+                if (clr == null && plan.needsAbortTx.contains(txId)) {
+                    clr = logManager.logCompensation(txId, undoRec.lsn());
+                    logManager.ensureDurable(clr.lsn()); // Pastikan CLR aman di disk
+                    clrByOriginalLsn.put(undoRec.lsn(), clr);
+                }
+
+                // Gunakan LSN dari CLR (jika ada), jika tidak ada baru pakai LSN asli
+                long lsnToUse = clr != null ? clr.lsn() : undoRec.lsn();
+                applier.undo(undoRec, lsnToUse);
+            }
+
+            // 4. Fase Redo
             for (LogRecord redoRec : plan.redoChanges) {
                 applier.apply(redoRec);
             }
 
-            // fase finalize
+            // 5. Fase Finalize
             for (Long txId : plan.needsAbortTx) {
-                logManager.logAbort(txId); // return void
+                logManager.logAbort(txId);
                 logManager.ensureDurable(logManager.getLastLsn()); 
             }
 
