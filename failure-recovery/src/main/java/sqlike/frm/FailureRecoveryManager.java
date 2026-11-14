@@ -27,6 +27,8 @@ import sqlike.shared.ErrorCode;
 import sqlike.shared.RecoveryResult;
 import sqlike.shared.RecoveryTarget;
 import sqlike.shared.RecoveryTargetKind;
+import sqlike.shared.SchemaChange;
+import sqlike.shared.SchemaImage;
 
 /**
  * Single entry point of FRM (FR1, PRD v1.0 §3.5). Validates the request, checks the lifecycle
@@ -120,6 +122,23 @@ public class FailureRecoveryManager
         requireTxId(txId);
         validateChange(change);
         return logged("logChange(" + txId + ")", () -> logManager.logChange(txId, change));
+    }
+
+    /**
+     * Logs a DDL change (PRD v1.0 §3.5). QP reaches this through CCM's {@code requestSchemaWrite},
+     * so the returned LSN is the one SM stamps on the catalog page it writes.
+     *
+     * <p>Undo is not supported yet: FR3 rejects the rollback of a transaction holding a
+     * SCHEMA_CHANGE with {@code UNSUPPORTED_OPERATION}, because {@code SmPort} has no
+     * {@code restoreSchema}. The record is written anyway, so recovery and the log view see the
+     * DDL, and the caller finds out at rollback instead of silently losing the change.
+     */
+    @Override
+    public long logSchemaChange(long txId, SchemaChange change) {
+        requireReady("logSchemaChange");
+        requireTxId(txId);
+        validateSchemaChange(change);
+        return logged("logSchemaChange(" + txId + ")", () -> logManager.logSchemaChange(txId, change));
     }
 
     /** Returns only after COMMIT and every earlier record of the transaction are durable. */
@@ -430,6 +449,33 @@ public class FailureRecoveryManager
                 || (!after && !change.after().values().isEmpty())) {
             throw new FrmException(ErrorCode.INVALID_VALUE,
                     "an absent RecordImage must have no values: " + change);
+        }
+    }
+
+    /**
+     * PRD §4: a schema change is a list of before/after image pairs, one pair per table. The
+     * record itself enforces matching unique table names, so this only has to reject what a
+     * caller can still get wrong before the record is built.
+     */
+    private static void validateSchemaChange(SchemaChange change) {
+        if (change == null || change.before() == null || change.after() == null) {
+            throw new FrmException(ErrorCode.INVALID_VALUE, "incomplete SchemaChange: " + change);
+        }
+        if (change.before().isEmpty() || change.before().size() != change.after().size()) {
+            throw new FrmException(ErrorCode.INVALID_VALUE,
+                    "SchemaChange needs one before/after image per table: " + change);
+        }
+        for (int i = 0; i < change.before().size(); i++) {
+            SchemaImage before = change.before().get(i);
+            SchemaImage after = change.after().get(i);
+            if (before == null || after == null) {
+                throw new FrmException(ErrorCode.INVALID_VALUE,
+                        "SchemaChange has an empty image at index " + i + ": " + change);
+            }
+            if (before.schema().isEmpty() && after.schema().isEmpty()) {
+                throw new FrmException(ErrorCode.INVALID_VALUE, "schema change for "
+                        + before.tableName() + " has no schema on either side: " + change);
+            }
         }
     }
 
