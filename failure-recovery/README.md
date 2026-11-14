@@ -39,7 +39,8 @@ java -cp "failure-recovery/target/classes;shared/target/classes" sqlike.frm.driv
 
 ## Menjalankan driver (FR-09)
 
-Butuh JDK 17 atau lebih baru (`javac` dan `java` ada di PATH). Skrip meng-compile `shared/` di root
+Butuh JDK 21 atau lebih baru (`javac` dan `java` ada di PATH), sama dengan
+`maven.compiler.release` di `pom.xml` root. Skrip meng-compile `shared/` di root
 bersama modul FRM ke `failure-recovery/out/`, lalu menjalankan `sqlike.frm.driver.FRMDriver`.
 
 ```bash
@@ -89,6 +90,7 @@ loan(id INTEGER, account_id INTEGER, amount FLOAT)                page 0, slot 0
 |---|---|---|
 | `startup-gate` | in-process | Log ditolak sebelum `recover()`, `ensureDurable` tetap boleh, `recover()` bisa diulang, `initAfterRecovery` dipanggil sekali oleh pemilik startup (QP) |
 | `log-view` | in-process | LSN unik dan naik, BEGIN/INSERT/UPDATE/DELETE/COMMIT per transaksi, isi before/after dan RID, filter txId, membaca log tidak mengubahnya (FR-01–FR-03) |
+| `schema-change-log` | in-process | `logSchemaChange` menulis record SCHEMA_CHANGE dengan isi `SchemaImage` utuh dan urut LSN bersama record data; rollback transaksi berisi perubahan skema ditolak `UNSUPPORTED_OPERATION` tanpa menulis COMPENSATION; permintaan tidak valid ditolak sebelum ada record |
 | `rollback` | in-process | Undo urutan terbalik pada RID yang sama, transaksi lain aman, ABORT final hanya satu, rollback ulang tidak mengubah data, rollback transaksi committed/tidak dikenal ditolak (FR-04) |
 | `checkpoint-timeout` | in-process | Checkpoint batal saat ada transaksi aktif tanpa flush, gate CCM selalu dibuka lagi, lalu berhasil dan mem-flush semua halaman (FR-06) |
 | `committed-not-flushed` | crash | Redo tiga transaksi committed yang halamannya belum di-flush, termasuk dua UPDATE pada record yang sama |
@@ -153,31 +155,47 @@ Checkpoint berkala dimulai otomatis setelah `recover()` berhasil jika interval t
 Interval nol hanya untuk pengujian khusus. Checkpoint manual, checkpoint berkala, dan `recoverTo`
 memakai satu maintenance lock.
 
-## Status integrasi (Milestone 2)
+## Status integrasi
 
-Branch ini mengikuti `develop/frm`: `LogManager` FR2 (PR #64), `RecoveryManager` FR5,
-`RollbackManager` FR3 (memakai `LogManager` yang sama), dan `MaintenanceService` FR4 (checkpoint, checkpoint berkala, PITR, `WalRecoveryLog` yang sudah
-mengikuti API FR2 sejak PR #65). Saat startup pertama, facade
-membuat satu checkpoint sebagai snapshot dasar PITR. `lastTxId` hasil recovery memakai
-`max(hasil FR5, LogManager.getMaxTxId())` supaya txId dari epoch arsip tidak dipakai ulang setelah PITR.
+FR1 sampai FR5 sudah terintegrasi di `main`: `LogManager` FR2 (PR #64), `RecoveryManager` FR5,
+`RollbackManager` FR3 (memakai `LogManager` yang sama), dan `MaintenanceService` FR4 (checkpoint,
+checkpoint berkala, PITR, `WalRecoveryLog` yang sudah mengikuti API FR2 sejak PR #65). Saat startup
+pertama, facade membuat satu checkpoint sebagai snapshot dasar PITR. `lastTxId` hasil recovery
+memakai `max(hasil FR5, LogManager.getMaxTxId())` supaya txId dari epoch arsip tidak dipakai ulang
+setelah PITR.
 `close()` juga menutup `LogManager` (melepas `<wal>.lock`). Kegagalan WAL yang butuh recovery
 (`WalException`), termasuk COMMIT yang hasilnya tidak pasti, membuat FRM FAILED (fail-stop) dan
 `FrmException.isCommitUnknown()` bernilai true.
 
-Hasil driver saat ini:
+Hasil pengujian (Windows 11, JDK 21):
 
-| Konfigurasi | Hasil |
+| Pengujian | Hasil |
 |---|---|
-| Modul FRM apa adanya | 6/9 PASS (startup-gate, log-view, rollback, checkpoint-timeout, committed-not-flushed, point-in-time-recovery) |
-| FRM referensi sementara (di luar repo) | 9/9 PASS; 7 bug yang ditanam semuanya tertangkap |
+| `FRMDriver` | 10/10 skenario PASS |
+| `RollbackTests` (FR3) | 12/12 |
+| `MaintenanceTests` (FR4) | 13/13 |
 
 FR2 mewajibkan setiap perubahan transaksi punya record COMPENSATION (`logCompensation(txId, lsnAsli)`,
 urut LSN menurun) sebelum `logAbort` diterima; tanpa itu muncul `WalException "Rollback belum selesai untuk T<id>"`.
 
-| Pemilik | Yang dibutuhkan agar skenario PASS |
+| Pemilik | Status |
 |---|---|
 | FR2 | Selesai (PR #64) |
-| FR3 | Selesai (`feat/frm/rollback-v2`): tiap undo menulis COMPENSATION lalu before-image dengan LSN CLR tersebut |
+| FR3 | Selesai (PR #70): tiap undo menulis COMPENSATION lalu before-image dengan LSN CLR tersebut |
 | FR4 | Selesai (PR #65) |
-| FR5 | Skenario `uncommitted-flushed`, `aborted-and-committed`, `checkpoint-recovery`. Di fase undo, untuk transaksi tanpa COMMIT/ABORT: per perubahan yang belum punya CLR, urut LSN menurun, panggil `logCompensation(txId, rec.lsn())` lalu tulis before-image dengan LSN CLR tersebut; baru setelah itu `logAbort(txId)`. Abaikan record COMPENSATION saat klasifikasi redo/undo |
-| Kontrak | Saat `contracts/` root ada: hapus salinan `IConcurrencyControlManager`, `IStorageManager`, `IWalDurability`, `sqlike.storage.*` di modul ini; ganti penantian di `ConcurrencyControlAdapter` dengan `awaitNoActiveTransactions(timeoutMs)`; tambah `logSchemaChange` (tipe `SchemaChange` sudah ada dari FR2) |
+| FR5 | Selesai (PR #68): fase undo menulis COMPENSATION sebelum ABORT, dan record COMPENSATION diabaikan saat klasifikasi redo/undo |
+
+### Batasan yang diketahui
+
+| Hal | Keterangan |
+|---|---|
+| Tipe skema di shared | `SchemaChange` dan `SchemaImage` masih punya tiga salinan (FRM, QP, CCM) dan **sudah beda semantik**: versi FRM memvalidasi ketat (pasangan before/after wajib ada, nama tabel cocok dan unik), versi QP/CCM menerima apa saja. Harus disepakati satu versi sebelum dipindah ke `shared/` |
+| `contracts/` root | Salinan `sqlike.contract.*` masih tersebar: `IStorageManager` 4 salinan, `IFailureRecoveryManager` dan `IConcurrencyControlManager` masing-masing 3. Saat folder root-nya ada, hapus salinan di modul ini beserta `sqlike.storage.*` |
+| `IWalDurability` | Ada di tiga package berbeda: `sqlike.contract` (FRM, QP), `sqlike.frm.log` (internal FR2), dan `sqlike.replacement_durability` (SM). Karena package-nya beda, SM belum benar-benar menyambung ke kontrak FRM (FR-08) |
+| Undo perubahan skema | `SmPort.restoreSchema` belum ada, jadi FR3 menolak rollback transaksi yang punya record SCHEMA_CHANGE dengan `UNSUPPORTED_OPERATION` |
+| LSN CLR di FR5 | `ChangeApplier.undo` menulis before-image dengan LSN record asli, bukan LSN CLR, sehingga page LSN bisa mundur. Tidak membuat skenario gagal |
+| Milestone 3 | Integrasi dengan SM dan CCM asli (bukan mock) serta skenario akses berkonflik |
+
+Tiga hal pertama menyentuh modul di luar `failure-recovery/`, jadi perlu koordinasi supergroup
+lebih dulu (lihat aturan "Only modify code within your own group's component directory" di
+`CONTRIBUTING.md`).

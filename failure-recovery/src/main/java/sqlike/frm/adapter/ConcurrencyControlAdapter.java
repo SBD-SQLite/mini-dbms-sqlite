@@ -1,12 +1,6 @@
 package sqlike.frm.adapter;
 
 import java.util.Objects;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
 import sqlike.contract.IConcurrencyControlManager;
 import sqlike.frm.FrmException;
@@ -17,19 +11,14 @@ import sqlike.shared.ErrorCode;
 /**
  * Plugs the real CCM into FRM's {@link CcmPort} (DIP, PRD v1.0 §1).
  *
- * <p>PRD §3.4 adds {@code awaitNoActiveTransactions(long timeoutMs)} to CCM. Until that overload
- * is in the contract, {@link #waitUntilIdle(long)} runs the old blocking
- * {@code awaitNoActiveTransactions()} on a helper thread and stops waiting after the timeout, so a
- * checkpoint never blocks forever. Replace the body with the overload once it exists.
+ * <p>{@link #waitUntilIdle(long)} forwards to {@code awaitNoActiveTransactions(timeoutMs)}
+ * (PRD §3.4), so the bound is CCM's own: it knows which transactions are active and can stop
+ * waiting without a helper thread. A checkpoint therefore never blocks forever, and a timeout
+ * comes back as {@code false} instead of an exception.
  */
-public class ConcurrencyControlAdapter implements CcmPort, AutoCloseable {
+public class ConcurrencyControlAdapter implements CcmPort {
 
     private final IConcurrencyControlManager ccm;
-    private final ExecutorService waiter = Executors.newCachedThreadPool(runnable -> {
-        Thread thread = new Thread(runnable, "frm-ccm-idle-wait");
-        thread.setDaemon(true);
-        return thread;
-    });
 
     public ConcurrencyControlAdapter(IConcurrencyControlManager ccm) {
         this.ccm = Objects.requireNonNull(ccm, "ccm");
@@ -45,21 +34,15 @@ public class ConcurrencyControlAdapter implements CcmPort, AutoCloseable {
         if (timeoutMs <= 0) {
             throw new IllegalArgumentException("timeoutMs must be positive");
         }
-        // TODO(contract): return ccm.awaitNoActiveTransactions(timeoutMs) once PRD §3.4 lands.
-        Future<?> idle = waiter.submit(ccm::awaitNoActiveTransactions);
         try {
-            idle.get(timeoutMs, TimeUnit.MILLISECONDS);
-            return true;
-        } catch (TimeoutException timedOut) {
-            idle.cancel(true);
-            return false;
-        } catch (InterruptedException interrupted) {
-            idle.cancel(true);
-            Thread.currentThread().interrupt();
-            return false;
-        } catch (ExecutionException failed) {
+            return ccm.awaitNoActiveTransactions(timeoutMs);
+        } catch (FrmException error) {
+            throw error;
+        } catch (RuntimeException error) {
+            // Keep the blame on CCM: FR4 turns a false into a cancelled checkpoint, but a broken
+            // CCM must not be reported as an FRM I/O problem (PRD §2 ErrorInfo).
             throw new FrmException(ErrorCode.INVALID_STATE, ComponentType.CCM,
-                    "CCM awaitNoActiveTransactions failed: " + failed.getCause(), failed.getCause());
+                    "CCM awaitNoActiveTransactions failed: " + error, error);
         }
     }
 
@@ -71,10 +54,5 @@ public class ConcurrencyControlAdapter implements CcmPort, AutoCloseable {
     @Override
     public void initAfterRecovery(long maxTxId) {
         ccm.initAfterRecovery(maxTxId);
-    }
-
-    @Override
-    public void close() {
-        waiter.shutdownNow();
     }
 }

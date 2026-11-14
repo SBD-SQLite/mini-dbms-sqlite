@@ -10,6 +10,7 @@ import sqlike.frm.driver.scenario.CommittedNotFlushedScenario;
 import sqlike.frm.driver.scenario.LogViewScenario;
 import sqlike.frm.driver.scenario.PointInTimeRecoveryScenario;
 import sqlike.frm.driver.scenario.RollbackScenario;
+import sqlike.frm.driver.scenario.SchemaChangeLogScenario;
 import sqlike.frm.driver.scenario.StartupGateScenario;
 import sqlike.frm.driver.scenario.UncommittedFlushedScenario;
 
@@ -23,6 +24,7 @@ public final class Scenarios {
         return List.of(
                 new StartupGateScenario(),
                 new LogViewScenario(),
+                new SchemaChangeLogScenario(),
                 new RollbackScenario(),
                 new CheckpointTimeoutScenario(),
                 new CommittedNotFlushedScenario(),
