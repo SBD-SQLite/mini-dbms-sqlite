@@ -21,6 +21,7 @@ import sqlike.frm.log.LogType;
 import sqlike.frm.maintenance.MaintenanceService;
 import sqlike.frm.mock.MockRecoveryLog;
 import sqlike.frm.pitr.HistoricalRecoveryPlan;
+import sqlike.frm.pitr.PitrMarker;
 import sqlike.frm.pitr.PointInTimeRecovery;
 import sqlike.frm.port.CcmPort;
 import sqlike.frm.port.SmPort;
@@ -74,6 +75,16 @@ public final class MaintenanceTests {
                 MaintenanceTests::secondRestoreIgnoresAbandoned);
         run("pitr: no snapshot before target fails and resumes",
                 MaintenanceTests::noSnapshotFails);
+        run("pitr marker: written during restore, removed after success",
+                MaintenanceTests::pitrMarkerClearedAfterSuccess);
+        run("pitr marker: crash before log separation is resumed at startup",
+                MaintenanceTests::pitrResumeBeforeSeparation);
+        run("pitr marker: crash after log separation is resumed with same result",
+                MaintenanceTests::pitrResumeAfterSeparation);
+        run("pitr marker: no marker means nothing to resume",
+                MaintenanceTests::pitrNoMarkerNothingToResume);
+        run("pitr marker: target survives reload from file",
+                MaintenanceTests::pitrMarkerRoundTrip);
         run("snapshot catalog: survives reload from file",
                 MaintenanceTests::catalogPersists);
         run("service: restore uses recovery points created through the same service",
@@ -235,6 +246,75 @@ public final class MaintenanceTests {
         expectData(f.sm, Map.of(R1, row("A")), "data unchanged");
     }
 
+    private static final Map<RID, RecordImage> RESTORED_BETWEEN =
+            Map.of(R1, row("A"), R2, row("C"), R3, NONE);
+
+    private static void pitrMarkerClearedAfterSuccess() throws Exception {
+        Fixture f = new Fixture(tempMarker());
+        Instant between = standardHistory(f);
+        f.sm.onRestore = () -> expect(f.marker.read().isPresent(), true, "marker during restore");
+        f.pitr.recoverTo(time(between));
+        expect(Files.exists(f.marker.path()), false, "marker file removed");
+        expect(f.pitr.isInterrupted(), false, "not interrupted");
+    }
+
+    private static void pitrResumeBeforeSeparation() throws Exception {
+        Fixture f = new Fixture(tempMarker());
+        Instant between = standardHistory(f);
+        int epochsBefore = f.log.activeLog().size();
+        f.sm.failFlushOnce = true; // crash after the snapshot was restored, before separation
+        expectThrows(() -> f.pitr.recoverTo(time(between)), "interrupted restore");
+        expect(f.pitr.isInterrupted(), true, "marker left behind");
+        expect(f.log.activeLog().size(), epochsBefore, "old timeline still active");
+
+        Optional<HistoricalRecoveryPlan> plan = f.restartPitr().resumeInterrupted();
+
+        expect(plan.isPresent(), true, "restore resumed");
+        expectData(f.sm, RESTORED_BETWEEN, "data after resume");
+        expect(f.pitr.isInterrupted(), false, "marker removed after resume");
+        expect(f.log.activeLog().get(0).type(), LogType.CHECKPOINT, "new timeline active");
+    }
+
+    private static void pitrResumeAfterSeparation() throws Exception {
+        Fixture f = new Fixture(tempMarker());
+        Instant between = standardHistory(f);
+        f.sm.failSnapshotOnce = true; // crash in the final checkpoint, after separation
+        expectThrows(() -> f.pitr.recoverTo(time(between)), "interrupted checkpoint");
+        expect(f.pitr.isInterrupted(), true, "marker left behind");
+
+        Optional<HistoricalRecoveryPlan> plan = f.restartPitr().resumeInterrupted();
+
+        expect(plan.isPresent(), true, "restore resumed");
+        expect(plan.get().committedTxIds(), Set.of(1L, 3L), "same committed set");
+        expectData(f.sm, RESTORED_BETWEEN, "same data after resume");
+        expect(f.pitr.isInterrupted(), false, "marker removed after resume");
+        expect(f.catalog.latestUsableFor(Long.MAX_VALUE).isPresent(), true, "restored state checkpointed");
+    }
+
+    private static void pitrNoMarkerNothingToResume() throws Exception {
+        Fixture f = new Fixture(tempMarker());
+        standardHistory(f);
+        Map<RID, RecordImage> before = f.sm.dump(TABLE);
+        expect(f.pitr.resumeInterrupted().isPresent(), false, "nothing resumed");
+        expect(f.sm.dump(TABLE), before, "data unchanged");
+        expect(new Fixture().pitr.resumeInterrupted().isPresent(), false, "no marker configured");
+    }
+
+    private static void pitrMarkerRoundTrip() throws Exception {
+        PitrMarker marker = tempMarker();
+        marker.write(time(T0));
+        expect(new PitrMarker(marker.path()).read(), Optional.of(time(T0)), "time target");
+        marker.write(tx(7));
+        expect(new PitrMarker(marker.path()).read(), Optional.of(tx(7)), "transaction target");
+        marker.clear();
+        marker.clear();
+        expect(marker.read(), Optional.empty(), "cleared twice");
+    }
+
+    private static PitrMarker tempMarker() throws Exception {
+        return new PitrMarker(Files.createTempDirectory("frm-pitr").resolve("pitr.inprogress"));
+    }
+
     private static void catalogPersists() throws Exception {
         Path dir = Files.createTempDirectory("snapshot-catalog");
         Path file = dir.resolve("snapshots.catalog");
@@ -308,16 +388,33 @@ public final class MaintenanceTests {
         final FakeCcm ccm;
         final SnapshotCatalog catalog;
         final CheckpointManager checkpoints;
-        final PointInTimeRecovery pitr;
+        final PitrMarker marker;
+        PointInTimeRecovery pitr;
 
         Fixture() {
+            this(null);
+        }
+
+        Fixture(PitrMarker marker) {
+            this.marker = marker;
             this.clock = new AtomicReference<>(T0);
             this.log = new MockRecoveryLog(clock::get);
             this.sm = new FakeSm();
             this.ccm = new FakeCcm();
             this.catalog = SnapshotCatalog.inMemory();
             this.checkpoints = new CheckpointManager(sm, ccm, log, catalog, TIMEOUT_MS);
-            this.pitr = new PointInTimeRecovery(sm, ccm, log, catalog, checkpoints, TIMEOUT_MS);
+            this.pitr = newPitr();
+        }
+
+        private PointInTimeRecovery newPitr() {
+            return new PointInTimeRecovery(sm, ccm, log, catalog, checkpoints, TIMEOUT_MS,
+                    new java.util.concurrent.locks.ReentrantLock(), marker);
+        }
+
+        /** New PITR object over the same disk state, as after a process restart. */
+        PointInTimeRecovery restartPitr() {
+            pitr = newPitr();
+            return pitr;
         }
 
         Instant now() {
@@ -360,6 +457,9 @@ public final class MaintenanceTests {
         private final Map<String, Map<RID, RecordImage>> tables = new HashMap<>();
         private final Map<String, Map<String, Map<RID, RecordImage>>> snapshots = new HashMap<>();
         private int count;
+        boolean failFlushOnce;
+        boolean failSnapshotOnce;
+        Runnable onRestore = () -> { };
 
         public RecordImage readAt(String table, RID rid) {
             return tables.getOrDefault(table, Map.of()).getOrDefault(rid, NONE);
@@ -375,9 +475,17 @@ public final class MaintenanceTests {
         }
 
         public void flushAll() {
+            if (failFlushOnce) {
+                failFlushOnce = false;
+                throw new IllegalStateException("simulated crash during flushAll");
+            }
         }
 
         public String createSnapshot() {
+            if (failSnapshotOnce) {
+                failSnapshotOnce = false;
+                throw new IllegalStateException("simulated crash during createSnapshot");
+            }
             String id = "snap-" + (++count);
             snapshots.put(id, copy(tables));
             return id;
@@ -390,6 +498,7 @@ public final class MaintenanceTests {
             }
             tables.clear();
             tables.putAll(copy(snapshot));
+            onRestore.run();
         }
 
         Map<RID, RecordImage> dump(String table) {

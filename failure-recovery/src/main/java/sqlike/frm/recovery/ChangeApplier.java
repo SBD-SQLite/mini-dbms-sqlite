@@ -11,27 +11,25 @@ public class ChangeApplier {
         this.sm = sm;
     }
 
+    // redo
     public void apply(LogRecord record) throws Exception {
-        if (record.change().isEmpty()) return;
-        DataChange change = record.change().get();
-        
-        sm.writeAt(
-            change.tableName(), 
-            change.rid(), 
-            change.after(), 
-            record.lsn()
-        );
+        apply(record, record.lsn());
     }
 
-    public void undo(LogRecord record) throws Exception {
+    public void apply(LogRecord record, long lsn) throws Exception {
         if (record.change().isEmpty()) return;
         DataChange change = record.change().get();
-        
-        sm.writeAt(
-            change.tableName(), 
-            change.rid(), 
-            change.before(), 
-            record.lsn()
-        );
+        sm.writeAt(change.tableName(), change.rid(), change.after(), lsn);
+    }
+
+    // undo
+    public void undo(LogRecord record) throws Exception {
+        undo(record, record.lsn());
+    }
+
+    public void undo(LogRecord record, long lsn) throws Exception {
+        if (record.change().isEmpty()) return;
+        DataChange change = record.change().get();
+        sm.writeAt(change.tableName(), change.rid(), change.before(), lsn);
     }
 }

@@ -1,90 +1,114 @@
 package sqlike.frm.recovery;
 
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+import sqlike.frm.RecoveryError;
 import sqlike.frm.log.LogManager;
 import sqlike.frm.log.LogRecord;
-import sqlike.frm.RecoveryState;
 import sqlike.frm.port.SmPort;
 import sqlike.shared.RecoveryResult;
 
-import java.util.HashSet;
-import java.util.List;
-import java.util.Optional;
-import java.util.Set;
-
 public class RecoveryManager {
-    private RecoveryState state;
     private final LogManager logManager;
     private final RecoveryAnalyzer analyzer;
     private final ChangeApplier applier;
     private final SmPort sm;
-    private RecoveryResult lastResult;
 
     public RecoveryManager(LogManager logManager, SmPort sm) {
         this.logManager = logManager;
         this.sm = sm;
         this.analyzer = new RecoveryAnalyzer();
         this.applier = new ChangeApplier(sm);
-        this.state = RecoveryState.NOT_STARTED;
     }
 
-    public synchronized RecoveryResult recover() throws Exception {
-        if (state == RecoveryState.READY && lastResult != null) return lastResult;
-        if (state == RecoveryState.RUNNING) throw new IllegalStateException("Recovery sedang berjalan!");
+    public synchronized RecoveryResult recover() {
+        List<LogRecord> records = inPhase(
+                RecoveryError.LOG_READ_FAILED,
+                "Unable to read the active WAL",
+                () -> logManager.readLogs(null));
 
-        state = RecoveryState.RUNNING;
+        RecoveryPlan plan = inPhase(
+                RecoveryError.LOG_INCONSISTENT,
+                "WAL analysis failed",
+                () -> analyzer.analyze(records));
 
-        try {
-            // baca log
-            List<LogRecord> records = logManager.readLogs(null);
-
-            // fase analysis
-            RecoveryPlan plan = analyzer.analyze(records);
-
-            // fase undo: LogManager.logAbort menolak ABORT tanpa COMPENSATION per perubahan,
-            // jadi catat COMPENSATION (yang belum ada) sebelum menerapkan undo
-            Set<Long> compensated = new HashSet<>();
+        inPhase(RecoveryError.UNDO_FAILED, "Undo phase failed", () -> {
+            Map<Long, LogRecord> clrByOriginalLsn = new HashMap<>();
             for (LogRecord record : records) {
-                record.undoOfLSN().ifPresent(compensated::add);
+                if (record.undoOfLSN().isPresent()) {
+                    clrByOriginalLsn.put(record.undoOfLSN().orElseThrow(), record);
+                }
             }
+
             for (LogRecord undoRec : plan.undoChanges) {
                 long txId = undoRec.txID().orElseThrow();
-                if (plan.needsAbortTx.contains(txId) && !compensated.contains(undoRec.lsn())) {
-                    logManager.logCompensation(txId, undoRec.lsn());
-                }
-                applier.undo(undoRec);
-            }
+                LogRecord clr = clrByOriginalLsn.get(undoRec.lsn());
 
-            // fase redo
+                if (clr == null && plan.needsAbortTx.contains(txId)) {
+                    clr = logManager.logCompensation(txId, undoRec.lsn());
+                    logManager.ensureDurable(clr.lsn());
+                    clrByOriginalLsn.put(undoRec.lsn(), clr);
+                }
+
+                long lsnToUse = clr == null ? undoRec.lsn() : clr.lsn();
+                applier.undo(undoRec, lsnToUse);
+            }
+            return null;
+        });
+
+        inPhase(RecoveryError.REDO_FAILED, "Redo phase failed", () -> {
             for (LogRecord redoRec : plan.redoChanges) {
                 applier.apply(redoRec);
             }
+            return null;
+        });
 
-            // fase finalize
+        inPhase(RecoveryError.FINALIZE_FAILED, "Transaction finalization failed", () -> {
             for (Long txId : plan.needsAbortTx) {
-                logManager.logAbort(txId); // return void
-                logManager.ensureDurable(logManager.getLastLsn()); 
+                logManager.logAbort(txId);
+                logManager.ensureDurable(logManager.getLastLsn());
             }
+            return null;
+        });
 
+        inPhase(RecoveryError.FLUSH_FAILED, "Flushing recovered data failed", () -> {
             sm.flushAll();
+            return null;
+        });
 
-            state = RecoveryState.READY;
-            
-            lastResult = new RecoveryResult(
-                Math.max(plan.maxTxId, logManager.getMaxTxId()),
+        long maxTxId = inPhase(
+                RecoveryError.FINALIZE_FAILED,
+                "Reading the recovered transaction high-water mark failed",
+                logManager::getMaxTxId);
+        return new RecoveryResult(
+                Math.max(plan.maxTxId, maxTxId),
                 plan.lastTimestamp,
                 plan.lastRecoveredLSN,
-                plan.checkpointLsn != null ? Optional.of(plan.checkpointLsn) : Optional.empty()
-            );
-            
-            return lastResult;
+                plan.checkpointLsn == null
+                        ? Optional.empty()
+                        : Optional.of(plan.checkpointLsn));
+    }
 
-        } catch (Exception e) {
-            state = RecoveryState.FAILED;
-            throw new Exception("Recovery gagal: " + e.getMessage(), e);
+    private static <T> T inPhase(
+            RecoveryError phase, String message, PhaseOperation<T> operation) {
+        try {
+            return operation.run();
+        } catch (RecoveryException error) {
+            throw error;
+        } catch (Exception error) {
+            String detail = error.getMessage();
+            throw new RecoveryException(
+                    phase,
+                    detail == null ? message : message + ": " + detail,
+                    error);
         }
     }
 
-    public RecoveryState getState() {
-        return state;
+    @FunctionalInterface
+    private interface PhaseOperation<T> {
+        T run() throws Exception;
     }
 }
