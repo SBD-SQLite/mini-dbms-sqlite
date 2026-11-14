@@ -10,7 +10,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 import sqlike.contract.IConcurrencyControlManager;
 import sqlike.qo.PlanNodes;
-import sqlike.qo.QoException;
+import sqlike.shared.QoException;
 import sqlike.shared.*;
 import sqlike.qp.port.ConcurrencyAdapter;
 import sqlike.qp.port.QpContracts.*;
