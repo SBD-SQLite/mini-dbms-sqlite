@@ -159,6 +159,10 @@ public class BufferPoolManager{
         return blocks.getPageCount(tableId);
     }
 
+    public int getPageSize() {
+        return blocks.getPageSize();
+    }
+
     public void truncateTable(String tableId) throws StorageException {
         lock.lock();
         try {

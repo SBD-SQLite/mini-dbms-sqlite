@@ -34,6 +34,8 @@ import static sqlike.storage.StorageErrorCode.TABLE_NOT_FOUND;
 import sqlike.storage.StorageException;
 
 public class RecordManager {
+    private enum WriteMode { INSERT, MODIFY, RESTORE }
+
     private final BufferPoolManager buffer;
     private final RecordSerializer serializer;
     private final CatalogManager catalog;
@@ -166,14 +168,29 @@ public class RecordManager {
         TableSchema schema = resolveTable(table);
         List<Value> snapshot = values == null ? null : new ArrayList<>(values);
         int size = serializer.serializedSize(snapshot, schema);
-        // RID yang sudah diberikan mungkin tercatat di WAL, sehingga page reservasi tidak dipakai ulang
-        Page page = buffer.newPage(schema.tableId());
+        if (!SlottedPage.fitsEmptyPage(buffer.getPageSize(), size)) {
+            throw new StorageException(INVALID_VALUE, "Record tidak muat dalam satu page");
+        }
+
+        String tableId = schema.tableId();
+        long pageCount = buffer.getPageCount(tableId);
+        Optional<RID> rid = Optional.empty();
+        for (long number = 0; number < pageCount && rid.isEmpty(); number++) {
+            rid = reserveSlot(buffer.fetchPage(new PageId(tableId, number)), size);
+        }
+        RID reservedRid = rid.orElseGet(() -> reserveSlot(buffer.newPage(tableId), size).orElseThrow());
+        InsertReservation reservation = new InsertReservation(UUID.randomUUID().toString(), schema.tableName(),
+                reservedRid, List.copyOf(snapshot));
+        reservations.put(reservation.reservationId(), reservation);
+        return reservation;
+    }
+
+    private Optional<RID> reserveSlot(Page page, int size) {
         try {
-            if (!readPage(page).canFit(size)) throw new StorageException(INVALID_VALUE, "Record tidak muat dalam satu page");
-            InsertReservation reservation = new InsertReservation(UUID.randomUUID().toString(), schema.tableName(),
-                    new RID(page.getPageId(), 0), List.copyOf(snapshot));
-            reservations.put(reservation.reservationId(), reservation);
-            return reservation;
+            SlottedPage slotted = readPage(page);
+            Optional<Integer> slot = slotted.reserveSlot(size);
+            if (slot.isPresent()) savePage(page, slotted);
+            return slot.map(id -> new RID(page.getPageId(), id));
         } finally { buffer.unpinPage(page.getPageId()); }
     }
 
@@ -185,33 +202,44 @@ public class RecordManager {
             TableSchema schema = resolveTable(stored.tableName());
             validateRid(schema, stored.rid());
             byte[] bytes = serializer.serialize(stored.values(), schema);
-            if (fetch(schema.tableName(), stored.rid()).isPresent()) throw new StorageException(INVALID_RESERVATION, "RID reservasi sudah terisi");
-            writeRecord(schema, stored.rid(), bytes, lsn, false);
-            return stored.rid();
-        } finally {
-            reservations.remove(stored.reservationId());
-            finishedReservations.put(stored.reservationId(), stored);
+            writeRecord(schema, stored.rid(), bytes, lsn, WriteMode.INSERT);
+        } catch (RuntimeException failure) {
+            try {
+                releaseReservation(stored);
+            } catch (RuntimeException cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
+            }
+            throw failure;
         }
+        finishReservation(stored);
+        return stored.rid();
     }
 
     public synchronized void update(String table, RID rid, List<Value> values, long lsn) throws StorageException {
         validateLsn(lsn);
         TableSchema schema = resolveTable(table);
         validateRid(schema, rid);
-        writeRecord(schema, rid, serializer.serialize(values, schema), lsn, true);
+        writeRecord(schema, rid, serializer.serialize(values, schema), lsn, WriteMode.MODIFY);
     }
 
     public synchronized void delete(String table, RID rid, long lsn) throws StorageException {
         validateLsn(lsn);
         TableSchema schema = resolveTable(table);
         validateRid(schema, rid);
-        writeRecord(schema, rid, null, lsn, true);
+        writeRecord(schema, rid, null, lsn, WriteMode.MODIFY);
     }
 
     public synchronized void releaseReservation(InsertReservation reservation) throws StorageException {
         InsertReservation stored = requireReservation(reservation);
-        reservations.remove(stored.reservationId());
-        finishedReservations.put(stored.reservationId(), stored);
+        if (!reservations.containsKey(stored.reservationId())) return;
+        RID rid = stored.rid();
+        Page page = buffer.fetchPage(rid.pageId());
+        try {
+            SlottedPage slotted = readPage(page);
+            slotted.releaseSlot(rid.slotId());
+            savePage(page, slotted);
+        } finally { buffer.unpinPage(rid.pageId()); }
+        finishReservation(stored);
     }
 
     public synchronized void restoreRecord(String table, RID rid, RecordImage image, long lsn) throws StorageException {
@@ -219,10 +247,10 @@ public class RecordManager {
         TableSchema schema = resolveTable(table);
         validateRid(schema, rid);
         if (image == null) throw new StorageException(INVALID_VALUE, "RecordImage tidak boleh null");
-        if (image.exists() && reservations.values().stream().anyMatch(token -> token.rid().pageId().equals(rid.pageId()))) {
-            throw new StorageException(INVALID_STATE, "Page masih dimiliki reservasi aktif: " + rid.pageId());
+        if (image.exists() && reservations.values().stream().anyMatch(token -> token.rid().equals(rid))) {
+            throw new StorageException(INVALID_STATE, "RID masih dimiliki reservasi aktif: " + rid);
         }
-        writeRecord(schema, rid, image.exists() ? serializer.serialize(image.values(), schema) : null, lsn, false);
+        writeRecord(schema, rid, image.exists() ? serializer.serialize(image.values(), schema) : null, lsn, WriteMode.RESTORE);
     }
 
     // Additional: clear sebuah table
@@ -264,10 +292,11 @@ public class RecordManager {
         }
     }
 
-    private void writeRecord(TableSchema schema, RID rid, byte[] bytes, long lsn, boolean requireExisting) {
+    private void writeRecord(TableSchema schema, RID rid, byte[] bytes, long lsn, WriteMode mode) {
         long count = buffer.getPageCount(schema.tableId());
         if (rid.pageId().pageNumber() >= count) {
-            if (requireExisting) throw new StorageException(RECORD_NOT_FOUND, "Record tidak ditemukan: " + rid);
+            if (mode == WriteMode.INSERT) throw new StorageException(INVALID_RESERVATION, "RID reservasi tidak ditemukan: " + rid);
+            if (mode == WriteMode.MODIFY) throw new StorageException(RECORD_NOT_FOUND, "Record tidak ditemukan: " + rid);
             if (bytes == null) return;
             while (count <= rid.pageId().pageNumber()) {
                 Page allocated = buffer.newPage(schema.tableId());
@@ -279,18 +308,16 @@ public class RecordManager {
         try {
             SlottedPage slotted = readPage(page);
             byte[] before = slotted.getRecordBytes(rid.slotId()).orElse(null);
-            if (requireExisting && before == null) throw new StorageException(RECORD_NOT_FOUND, "Record tidak ditemukan: " + rid);
+            if (mode == WriteMode.MODIFY && before == null) throw new StorageException(RECORD_NOT_FOUND, "Record tidak ditemukan: " + rid);
             if (before == null && bytes == null) return;
             boolean changed = !Arrays.equals(before, bytes);
             if (bytes == null) slotted.deleteSlot(rid.slotId());
-            else if (requireExisting) {
+            else if (mode == WriteMode.INSERT) slotted.insertAtSlot(rid.slotId(), bytes);
+            else if (mode == WriteMode.MODIFY) {
                 if (!slotted.updateRecordBytes(rid.slotId(), bytes)) throw new StorageException(INVALID_VALUE, "Record membesar melebihi kapasitas page: " + rid);
             } else slotted.putAtSlot(rid.slotId(), bytes);
             slotted.setPageLSN(lsn);
-            
-            buffer.markDirty(rid.pageId(), slotted.getPageLSN());
-            System.arraycopy(slotted.getPage().getData(), 0, page.getData(), 0, page.getData().length);
-            page.setPageLSN(slotted.getPageLSN());
+            savePage(page, slotted);
             if (changed) {
                 Map<RecordCursor, Boolean> active = cursors.get(schema.tableId());
                 if (active != null) active.replaceAll((cursor, invalid) -> true);
@@ -300,6 +327,16 @@ public class RecordManager {
         } catch (IllegalStateException failure) {
             throw new StorageException(IO_ERROR, "Slot record rusak: " + rid, failure);
         } finally { buffer.unpinPage(rid.pageId()); }
+    }
+
+    private void savePage(Page page, SlottedPage slotted) {
+        buffer.markDirty(page.getPageId(), slotted.getPageLSN());
+        System.arraycopy(slotted.getPage().getData(), 0, page.getData(), 0, page.getData().length);
+    }
+
+    private void finishReservation(InsertReservation reservation) {
+        reservations.remove(reservation.reservationId());
+        finishedReservations.put(reservation.reservationId(), reservation);
     }
 
     private TableSchema resolveTable(String table) throws StorageException {
