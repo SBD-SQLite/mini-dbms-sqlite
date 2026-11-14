@@ -50,8 +50,7 @@ public final class ExecutionEngine implements PlanExecutor {
                 }
             }
         } catch (RuntimeException e) {
-            DbmsException cause = e instanceof DbmsException dbms ? dbms : new DbmsException(e.getMessage(), e);
-            closeAfterFailure(root, cause);
+            closeAfterFailure(root, e);
             throw e;
         }
         root.close();
@@ -69,15 +68,14 @@ public final class ExecutionEngine implements PlanExecutor {
         try {
             affected = command.execute(context);
         } catch (RuntimeException e) {
-            DbmsException cause = e instanceof DbmsException dbms ? dbms : new DbmsException(e.getMessage(), e);
-            closeAfterFailure(command, cause);
+            closeAfterFailure(command, e);
             throw e;
         }
         command.close();
         return affected;
     }
 
-    private void closeAfterFailure(AutoCloseable resource, DbmsException cause) {
+    private void closeAfterFailure(AutoCloseable resource, Throwable cause) {
         if (resource == null) {
             return;
         }

@@ -151,9 +151,8 @@ public class PlanTranslator {
                     "Node kind " + root.kind() + " is a query/read node; use translateSelect instead");
         }
 
-        if (hasStorage() && mutations == null
-                && (root.kind() == PlanNodeKind.INSERT || root.kind() == PlanNodeKind.UPDATE || root.kind() == PlanNodeKind.DELETE)) {
-            throw new IllegalStateException("Production DML requires a MutationCoordinator");
+        if (hasStorage() && mutations == null) {
+            throw new IllegalStateException("Production writes require a MutationCoordinator");
         }
         return switch (root.kind()) {
             case INSERT -> {
@@ -413,30 +412,21 @@ public class PlanTranslator {
         if (!hasStorage()) {
             return new MockCommandExecutor(PlanNodeKind.CREATE_INDEX);
         }
-        if (qpStorage != null) {
-            return new CreateIndexExecutor(spec, qpStorage);
-        }
-        return new CreateIndexExecutor(spec, storage);
+        return new CreateIndexExecutor(spec, mutations);
     }
 
     private CommandExecutor buildCreateTable(PlanNode node, sqlike.shared.CreateTableSpec spec) {
         if (!hasStorage()) {
             return new MockCommandExecutor(PlanNodeKind.CREATE_TABLE);
         }
-        if (qpStorage != null) {
-            return new CreateTableExecutor(spec, qpStorage, null);
-        }
-        return new CreateTableExecutor(spec, storage);
+        return new CreateTableExecutor(spec, mutations);
     }
 
     private CommandExecutor buildDropTable(PlanNode node, sqlike.shared.DropTableSpec spec) {
         if (!hasStorage()) {
             return new MockCommandExecutor(PlanNodeKind.DROP_TABLE);
         }
-        if (qpStorage != null) {
-            return new DropTableExecutor(spec, qpStorage, null);
-        }
-        return new DropTableExecutor(spec, storage);
+        return new DropTableExecutor(spec, mutations);
     }
 
     private boolean hasStorage() {

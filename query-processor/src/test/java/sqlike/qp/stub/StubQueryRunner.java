@@ -66,7 +66,7 @@ public final class StubQueryRunner {
             QpConfiguration config) {
         this.optimizer = new QueryOptimizer(sm);
         this.storage = new StorageAdapter(sm);
-        this.transactions = new TransactionCoordinator(concurrency, config);
+        this.transactions = new TransactionCoordinator(concurrency, config, storage);
         this.access = new AccessCoordinator(concurrency);
         this.mutations = new MutationCoordinator(storage, concurrency);
         this.translator = PlanTranslator.withQpStorage(
@@ -125,6 +125,9 @@ public final class StubQueryRunner {
                     throw failure(plan.kind() + " is not allowed within an explicit transaction");
                 }
                 context = transactions.ensureTransaction(session);
+                if (plan.kind() == PlanNodeKind.CREATE_INDEX || plan.kind() == PlanNodeKind.CREATE_TABLE || plan.kind() == PlanNodeKind.DROP_TABLE) {
+                    access.acquireCatalog(true, context);
+                }
                 access.acquireAll(prepared, context);
 
                 boolean isCommand = plan.kind() == PlanNodeKind.INSERT

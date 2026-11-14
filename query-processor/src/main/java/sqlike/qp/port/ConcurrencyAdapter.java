@@ -6,7 +6,6 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import sqlike.contract.IConcurrencyControlManager;
 import sqlike.contract.IFailureRecoveryManager;
@@ -41,17 +40,13 @@ import static sqlike.qp.port.QpContracts.failure;
  */
 public final class ConcurrencyAdapter implements IConcurrencyControl {
     private final IConcurrencyControlManager ccm;
-    private final IFailureRecoveryManager frm;
     private final Map<TxId, TransactionState> states = new ConcurrentHashMap<>();
     private final Map<TxId, CancellationToken> tokens = new ConcurrentHashMap<>();
     private final Map<ChangeId, WritePermit> permits = new ConcurrentHashMap<>();
     private final Set<ChangeId> leases = ConcurrentHashMap.newKeySet();
-    // The counter is a compatibility fallback. WAL-backed writes need an LSN from CCM or FRM.
-    private final AtomicLong fallbackLsn = new AtomicLong();
 
     public ConcurrencyAdapter(IConcurrencyControlManager ccm, IFailureRecoveryManager frm) {
         this.ccm = Objects.requireNonNull(ccm, "IConcurrencyControlManager cannot be null");
-        this.frm = frm;
     }
 
     @Override
@@ -114,29 +109,31 @@ public final class ConcurrencyAdapter implements IConcurrencyControl {
 
     @Override
     public WritePermit authorizeChange(ChangeRecord change) {
+        validateChangeId(change.id(), change.txId());
         AccessResponse resp = awaitWriteGrant(change.txId(),
                 () -> ccm.requestWrite(change.txId().value(), change.value()));
-        long lsn = resp.changeLSN().isPresent()
-                ? resp.changeLSN().get()
-                : (frm != null
-                        ? frm.logChange(change.txId().value(), change.value())
-                        : fallbackLsn.incrementAndGet());
-        WritePermit permit = new WritePermit(change.id(), new Lsn(lsn));
-        permits.put(change.id(), permit);
-        return permit;
+        return registerPermit(change.id(), resp);
     }
 
     @Override
     public WritePermit authorizeSchemaChange(SchemaChangeRecord change) {
+        validateChangeId(change.id(), change.txId());
         AccessResponse resp = awaitWriteGrant(change.txId(),
                 () -> ccm.requestSchemaWrite(change.txId().value(), change.value()));
-        long lsn = resp.changeLSN().isPresent()
-                ? resp.changeLSN().get()
-                : (frm != null
-                        ? frm.logSchemaChange(change.txId().value(), change.value())
-                        : fallbackLsn.incrementAndGet());
-        WritePermit permit = new WritePermit(change.id(), new Lsn(lsn));
-        permits.put(change.id(), permit);
+        return registerPermit(change.id(), resp);
+    }
+
+    private void validateChangeId(ChangeId id, TxId txId) {
+        if (!txId.equals(id.txId()) || permits.containsKey(id)) throw failure("Mismatched or unfinished change ID: " + id);
+    }
+
+    private WritePermit registerPermit(ChangeId id, AccessResponse response) {
+        long lsn = response.changeLSN().orElse(0L);
+        if (lsn <= 0) {
+            throw new QpException(ErrorCode.WAL_FAILURE, "CCM granted a write without a positive WAL LSN");
+        }
+        WritePermit permit = new WritePermit(id, new Lsn(lsn));
+        if (permits.putIfAbsent(id, permit) != null) throw failure("Duplicate change ID: " + id);
         return permit;
     }
 
@@ -180,15 +177,25 @@ public final class ConcurrencyAdapter implements IConcurrencyControl {
         }
         long txId = permit.changeId().txId().value();
         long lsn = permit.lsn().value();
-        if (!ccm.beginApply(txId, lsn)) {
+        boolean begun;
+        try {
+            begun = ccm.beginApply(txId, lsn);
+        } catch (RuntimeException e) {
+            states.put(permit.changeId().txId(), TransactionState.FAILED);
+            throw e;
+        }
+        if (!begun) {
             leases.remove(permit.changeId());
             throw failure("CCM rejected beginApply for txId=" + txId + " lsn=" + lsn);
         }
         return () -> {
+            if (!leases.contains(permit.changeId())) return;
             try {
                 ccm.endApply(txId, lsn);
-            } finally {
                 leases.remove(permit.changeId());
+            } catch (RuntimeException e) {
+                states.put(permit.changeId().txId(), TransactionState.FAILED);
+                throw e;
             }
         };
     }
@@ -213,6 +220,10 @@ public final class ConcurrencyAdapter implements IConcurrencyControl {
 
     @Override
     public TransactionState commit(TxId txId) {
+        if (leases.stream().anyMatch(id -> id.txId().equals(txId))
+                || permits.keySet().stream().anyMatch(id -> id.txId().equals(txId))) {
+            throw failure("Cannot commit with an unfinished WAL apply");
+        }
         TransactionResponse response;
         try {
             response = ccm.commit(txId.value());
@@ -239,6 +250,9 @@ public final class ConcurrencyAdapter implements IConcurrencyControl {
 
     @Override
     public TransactionState abort(TxId txId, String reason) {
+        if (leases.stream().anyMatch(id -> id.txId().equals(txId))) {
+            throw failure("Apply outcome unknown. Recovery required before rollback.");
+        }
         TransactionResponse resp = ccm.abort(txId.value());
         TransactionState state = resp == null || resp.status() == null
                 ? TransactionState.FAILED

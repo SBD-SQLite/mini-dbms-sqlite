@@ -366,11 +366,188 @@ public final class Qp5AcceptanceTest {
     }
 
     private static void runAccessChecks() {
+        test("QP WAL executePlan shares transaction change identity", Qp5AcceptanceTest::walExternalPlans);
+        test("QP WAL missing or invalid LSN never becomes a permit", Qp5AcceptanceTest::walPermitBoundaries);
+        test("QP WAL unfinished apply blocks commit and rollback", Qp5AcceptanceTest::walApplyGuard);
+        test("QP WAL schema writes log before apply with the same LSN", Qp5AcceptanceTest::walSchemaWrites);
+        test("QP WAL schema failures restore prior state", Qp5AcceptanceTest::walSchemaFailures);
+        test("QP WAL cleanup preserves the primary failure", Qp5AcceptanceTest::walCleanupFailures);
         test("QP-12 CCM adapter blocks without retrying writes", Qp5AcceptanceTest::adapterWriteWait);
         test("QP-12 strict grants and cancellation", Qp5AcceptanceTest::strictGrants);
         test("QP-03 catalog permission precedes optimization", Qp5AcceptanceTest::catalogBeforeOptimization);
         test("QP-12 adapter catalog, abort, and cancelled grants", Qp5AcceptanceTest::adapterAccessBoundary);
         test("QP-02 failed disconnect rollback stays registered", Qp5AcceptanceTest::failedDisconnectRollback);
+    }
+
+    private static void walExternalPlans() throws Exception {
+        var runtime = StubQpRuntime.open(Files.createTempDirectory("qp-wal-plans-"), QpConfiguration.defaults());
+        runtime.recover(); var processor = runtime.processor; var session = processor.openSession();
+        try {
+            var begin = processor.execute("BEGIN;", session);
+            long tx = begin.transaction().orElseThrow().txId();
+            var ddl = PlanNodes.createIndex(new IndexMetadata("idx_external", "student", "id", IndexType.HASH));
+            assertEquals(ResultKind.ERROR, processor.executePlan(new QueryPlan(ddl, 0), tx).kind());
+            for (int id : List.of(4, 5)) {
+                var plan = PlanNodes.insert(new MutationSpec("student", List.of(sqlike.qo.Literals.integer(id),
+                        new Value(DataType.VARCHAR, Optional.empty(), Optional.empty(), Optional.of("Added")),
+                        new Value(DataType.FLOAT, Optional.empty(), Optional.of(3.0), Optional.empty())), Optional.empty(), Optional.empty()));
+                assertEquals(ResultKind.AFFECTED_ROWS, processor.executePlan(new QueryPlan(plan, 0), tx).kind());
+            }
+            assertEquals(2L, processor.execute("DELETE FROM student WHERE id >= 4;", session).affectedRows());
+            assertEquals(ResultKind.TRANSACTION, processor.execute("ABORT;", session).kind());
+            assertEquals(3, processor.execute("SELECT * FROM student;", session).rows().size());
+        } finally { processor.closeSession(session.sessionId()); }
+    }
+
+    private static void walApplyGuard() {
+        for (String failing : List.of("beginApply", "endApply")) {
+            var calls = new ArrayList<String>();
+            var adapter = adapterWith((proxy, method, args) -> {
+                calls.add(method.getName());
+                if (method.getName().equals(failing)) throw new IllegalStateException("Apply response lost");
+                return switch (method.getName()) {
+                    case "requestWrite" -> new AccessResponse(AccessStatus.GRANTED, Optional.of(42L), Optional.empty(), Optional.empty());
+                    case "beginApply" -> true;
+                    default -> throw new AssertionError("Unexpected CCM call: " + method.getName());
+                };
+            });
+            var tx = new TxId(1); adapter.registerExternalTransaction(1);
+            var change = new DataChange(ChangeOperation.DELETE, "employees", new RID(new PageId("employees", 0), 0),
+                    new RecordImage(true, List.of()), new RecordImage(false, List.of()));
+            var permit = adapter.authorizeChange(new ChangeRecord(new ChangeId(tx, 1), tx, change));
+            try {
+                try (var lease = adapter.acquireApplyLease(permit)) { adapter.confirmApplied(permit.changeId()); }
+                throw new AssertionError("Apply failure was ignored");
+            } catch (IllegalStateException expected) { }
+            assertEquals(TransactionState.FAILED, adapter.getState(tx));
+            try { adapter.commit(tx); throw new AssertionError("Committed unfinished apply"); } catch (IllegalStateException expected) { }
+            try { adapter.abort(tx, "test"); throw new AssertionError("Rolled back unfinished apply"); } catch (IllegalStateException expected) { }
+            assertTrue(!calls.contains("commit") && !calls.contains("abort"), "Uncertain apply reached finalization");
+        }
+    }
+
+    private static void walSchemaWrites() throws Exception {
+        TestDatabase db = new TestDatabase(); db.seed(); db.trace.clear();
+        db.execute("CREATE INDEX idx_wal ON employees (id);");
+        var record = db.transactions.lastSchemaChange;
+        assertEquals(record.value().before().get(0).schema(), record.value().after().get(0).schema());
+        assertEquals(0, record.value().before().get(0).indexes().size());
+        assertEquals(1, record.value().after().get(0).indexes().size());
+        assertTrue(record.value().before().get(0).snapshotId().isEmpty(), "Index change captured a data snapshot");
+        assertBefore(db.trace, "FRM.SCHEMA_CHANGE", "CCM.lease");
+        assertBefore(db.trace, "CCM.lease", "SM.createIndex.HASH");
+        assertBefore(db.trace, "SM.createIndex.HASH", "CCM.confirm");
+        assertBefore(db.trace, "CCM.confirm", "CCM.lease.close");
+        assertBefore(db.trace, "CCM.lease.close", "CCM.commit");
+        assertEquals(db.trace.stream().filter(e -> e.startsWith("FRM.LSN.")).map(e -> e.substring(8)).toList(),
+                db.trace.stream().filter(e -> e.startsWith("SM.LSN.")).map(e -> e.substring(7)).toList());
+        assertTrue(!db.trace.contains("FRM.CHANGE"), "Index used a fake record change");
+        db.trace.clear(); db.execute("INSERT INTO employees VALUES (3, 3000);");
+        assertEquals(db.trace.stream().filter(e -> e.startsWith("FRM.LSN.")).map(e -> e.substring(8)).toList(),
+                db.trace.stream().filter(e -> e.startsWith("SM.LSN.")).map(e -> e.substring(7)).toList());
+        assertEquals(0, db.storage.reservationCount());
+    }
+
+    private static void walSchemaFailures() throws Exception {
+        for (String operation : List.of("CREATE", "DROP", "INDEX")) {
+            for (boolean walFailure : List.of(true, false)) {
+                TestDatabase db = new TestDatabase(); db.seed();
+                db.runner.transactions.ensureTransaction(db.session);
+                db.transactions.failLog = walFailure;
+                db.storage.failSchemaApply = !walFailure;
+                PlanNode plan = switch (operation) {
+                    case "CREATE" -> PlanNodes.createTable(new CreateTableSpec("created", List.of(
+                            new ColumnSchema("id", DataType.INTEGER, Optional.empty())), List.of("id"), List.of()));
+                    case "DROP" -> PlanNodes.dropTable(new DropTableSpec("employees", DropBehavior.RESTRICT));
+                    default -> PlanNodes.createIndex(new IndexMetadata("idx_failure", "employees", "id", IndexType.HASH));
+                };
+                db.trace.clear();
+                var failed = db.runner.executePlan(db.session, plan);
+                assertTrue(!failed.success(), "Schema failure reported success");
+                assertEquals(List.of("employees"), db.storage.listTables());
+                assertTrue(db.storage.getIndexes("employees").isEmpty(), "Failed index remained visible");
+                assertEquals(List.of(List.of(1, 1000.0), List.of(2, 2000.0)), db.rows());
+                assertTrue(db.session.currentTxId().isEmpty(), "Completed rollback kept an active transaction");
+                if (walFailure) assertTrue(db.trace.stream().noneMatch(e -> e.startsWith("SM.LSN.")), "WAL failure reached apply");
+                else assertBefore(db.trace, "CCM.lease.close", "FRM.rollback");
+                if (operation.equals("DROP")) {
+                    String snapshot = db.transactions.lastSchemaChange.value().before().get(0).snapshotId().orElseThrow();
+                    assertTrue(db.storage.hasSnapshot(snapshot), "DROP logged an unknown snapshot");
+                }
+            }
+        }
+    }
+
+    private static void walCleanupFailures() throws Exception {
+        var primary = new IllegalStateException("Primary apply failure");
+        var cleanup = new IllegalStateException("Cleanup failure");
+        CommandExecutor command = new AbstractCommandExecutor() {
+            @Override protected long doExecute(ExecutionContext context) { throw primary; }
+            @Override protected void doClose() { throw cleanup; }
+        };
+        try { new ExecutionEngine().executeCommand(command, ExecutionContext.of(1)); throw new AssertionError("Lost failure"); }
+        catch (IllegalStateException expected) {
+            assertTrue(expected == primary, "Primary failure was replaced");
+            assertEquals(List.of(cleanup), List.of(expected.getSuppressed()));
+        }
+        TestDatabase db = new TestDatabase();
+        var releases = new AtomicInteger();
+        var storage = (sqlike.contract.IStorageManager) Proxy.newProxyInstance(
+                Qp5AcceptanceTest.class.getClassLoader(), new Class<?>[]{sqlike.contract.IStorageManager.class,
+                        sqlike.qp.port.StorageAdapter.TransactionScope.class}, (proxy, method, args) -> {
+                    if (method.getName().equals("releaseReservation") && releases.incrementAndGet() == 1) {
+                        throw new IllegalStateException("Release failed once");
+                    }
+                    try { return method.invoke(db.storage, args); }
+                    catch (java.lang.reflect.InvocationTargetException e) { throw e.getCause(); }
+                });
+        var runner = new StubQueryRunner(storage, db.transactions, QpConfiguration.defaults());
+        var result = runner.execute(new SessionState(), "INSERT INTO employees VALUES (1, 1000);");
+        assertTrue(!result.success(), "Reservation cleanup failure reported success");
+        assertEquals(2, releases.get());
+        assertEquals(0, db.storage.reservationCount());
+        assertEquals(List.of(), db.rows());
+
+        var terminal = (IConcurrencyControl) Proxy.newProxyInstance(Qp5AcceptanceTest.class.getClassLoader(),
+                new Class<?>[]{IConcurrencyControl.class}, (proxy, method, args) -> {
+                    if (method.getName().equals("getState")) return TransactionState.COMMITTED;
+                    throw new AssertionError("Terminal transaction was finalized again: " + method.getName());
+                });
+        var attempts = new AtomicInteger();
+        var cleanupStorage = (IStorageManager) Proxy.newProxyInstance(Qp5AcceptanceTest.class.getClassLoader(),
+                new Class<?>[]{IStorageManager.class}, (proxy, method, args) -> {
+                    assertEquals("releaseReservations", method.getName());
+                    if (attempts.incrementAndGet() == 1) throw new IllegalStateException("Cleanup retry needed");
+                    return null;
+                });
+        var coordinator = new TransactionCoordinator(terminal, QpConfiguration.defaults(), cleanupStorage);
+        var session = new SessionState(); session.attachTransaction(new TxId(1), true);
+        try { coordinator.commit(session); throw new AssertionError("Cleanup failure was ignored"); }
+        catch (IllegalStateException expected) { }
+        assertTrue(session.currentTxId().isPresent(), "Cleanup failure discarded terminal transaction");
+        assertEquals(TransactionState.COMMITTED, coordinator.abort(session, "Retry cleanup"));
+        assertTrue(session.currentTxId().isEmpty(), "Cleanup retry did not clear terminal session");
+        assertEquals(2, attempts.get());
+
+    }
+
+    private static void walPermitBoundaries() {
+        for (Optional<Long> lsn : List.of(Optional.<Long>empty(), Optional.of(0L), Optional.of(-1L))) {
+            var adapter = adapterWith((proxy, method, args) -> {
+                assertEquals("requestWrite", method.getName());
+                return new AccessResponse(AccessStatus.GRANTED, lsn, Optional.empty(), Optional.empty());
+            });
+            adapter.registerExternalTransaction(1);
+            var tx = new TxId(1);
+            var change = new DataChange(ChangeOperation.INSERT, "employees", new RID(new PageId("employees", 0), 0),
+                    new RecordImage(false, List.of()), new RecordImage(true, List.of()));
+            try {
+                adapter.authorizeChange(new ChangeRecord(new ChangeId(tx, 1), tx, change));
+                throw new AssertionError("Missing or invalid LSN became a write permit: " + lsn);
+            } catch (QpException expected) {
+                assertEquals(ErrorCode.WAL_FAILURE, expected.getErrorInfo().code());
+            }
+        }
     }
 
     private static void adapterAccessBoundary() {
@@ -827,6 +1004,12 @@ public final class Qp5AcceptanceTest {
         // CASCADE removes the foreign key and preserves the child rows.
         Result cascaded = database.execute("DROP TABLE departments CASCADE;");
         assertEquals("Table departments dropped successfully", cascaded.message());
+        var schemaChange = database.transactions.lastSchemaChange.value();
+        assertEquals(2, schemaChange.before().size()); assertEquals(2, schemaChange.after().size());
+        var droppedImage = schemaChange.before().stream().filter(image -> image.tableName().equals("departments")).findFirst().orElseThrow();
+        assertTrue(database.storage.hasSnapshot(droppedImage.snapshotId().orElseThrow()), "CASCADE logged a placeholder snapshot");
+        assertTrue(schemaChange.after().stream().filter(image -> image.tableName().equals("staff"))
+                .findFirst().orElseThrow().schema().orElseThrow().foreignKeys().isEmpty(), "CASCADE omitted child schema change");
         assertTrue(!database.storage.listTables().contains("departments"), "departments must be removed");
         assertTrue(database.storage.listTables().contains("staff"), "child table staff must remain");
         assertEquals(List.of(), database.storage.getSchema("staff").foreignKeys());

@@ -1,8 +1,6 @@
 package sqlike.contract;
 
-import java.util.Optional;
 import sqlike.shared.AccessResponse;
-import sqlike.shared.AccessStatus;
 import sqlike.shared.DataChange;
 import sqlike.shared.ProtocolType;
 import sqlike.shared.ResourceId;
@@ -46,21 +44,22 @@ public interface IConcurrencyControlManager {
 
     /** Requests write protection on a resource before reading before-image, without logging a change (PRD §3.4). */
     default AccessResponse requestWriteAccess(long txId, ResourceId resource) {
-        return new AccessResponse(AccessStatus.GRANTED, Optional.empty(), Optional.empty(), Optional.empty());
+        throw new UnsupportedOperationException("Pre-write access protection is not implemented");
     }
 
     /** Final permission and WAL logging of a schema change through FRM (PRD §3.4). */
     default AccessResponse requestSchemaWrite(long txId, SchemaChange change) {
-        return new AccessResponse(AccessStatus.GRANTED, Optional.of(1L), Optional.empty(), Optional.empty());
+        throw new UnsupportedOperationException("Schema WAL authorization is not implemented");
     }
 
     /** Prevents concurrent abort/rollback while an authorized SM mutation is being applied (PRD §3.4). */
     default boolean beginApply(long txId, long changeLSN) {
-        return true;
+        throw new UnsupportedOperationException("Apply protection is not implemented");
     }
 
     /** Marks completion of an SM mutation apply step (PRD §3.4). */
     default void endApply(long txId, long changeLSN) {
+        throw new UnsupportedOperationException("Apply protection is not implemented");
     }
 
     /** Timeout overload for checkpoint idle waiting (PRD §3.4). */

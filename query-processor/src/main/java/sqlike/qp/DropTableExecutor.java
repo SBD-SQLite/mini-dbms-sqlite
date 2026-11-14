@@ -6,11 +6,7 @@ import java.util.Objects;
 import java.util.Optional;
 import sqlike.qp.port.QpContracts.AccessMode;
 import sqlike.qp.port.QpContracts.IConcurrencyControl;
-import sqlike.qp.port.QpContracts.SchemaChangeRecord;
 import sqlike.qp.port.QpContracts.TableId;
-import sqlike.qp.port.QpContracts.TxId;
-import sqlike.qp.port.QpContracts.WriteLease;
-import sqlike.qp.port.QpContracts.WritePermit;
 import sqlike.shared.DropBehavior;
 import sqlike.shared.DropTableSpec;
 import sqlike.shared.ErrorCode;
@@ -19,7 +15,6 @@ import sqlike.shared.IndexMetadata;
 import sqlike.shared.SchemaChange;
 import sqlike.shared.SchemaImage;
 import sqlike.shared.TableSchema;
-import sqlike.storage.StorageException;
 
 /**
  * Physical command executor for DROP TABLE <tableName> [RESTRICT | CASCADE] (QP-15* / PRD §12).
@@ -27,31 +22,21 @@ import sqlike.storage.StorageException;
  */
 public final class DropTableExecutor extends AbstractCommandExecutor {
     private final DropTableSpec spec;
-    private final sqlike.contract.IStorageManager storageContract;
     private final sqlike.qp.port.QpContracts.IStorageManager qpStorage;
-    private final IConcurrencyControl concurrency;
+    private final MutationCoordinator mutations;
 
     public DropTableExecutor(DropTableSpec spec, sqlike.contract.IStorageManager storage) {
-        this(spec, Objects.requireNonNull(storage), null, null);
+        this(spec, new MutationCoordinator(Objects.requireNonNull(storage)));
     }
 
-    public DropTableExecutor(
-            DropTableSpec spec,
-            sqlike.qp.port.QpContracts.IStorageManager qpStorage,
-            IConcurrencyControl concurrency) {
-        this(spec, null, Objects.requireNonNull(qpStorage), concurrency);
+    public DropTableExecutor(DropTableSpec spec, sqlike.qp.port.QpContracts.IStorageManager storage, IConcurrencyControl concurrency) {
+        this(spec, new MutationCoordinator(Objects.requireNonNull(storage), concurrency));
     }
 
-    private DropTableExecutor(
-            DropTableSpec spec,
-            sqlike.contract.IStorageManager storageContract,
-            sqlike.qp.port.QpContracts.IStorageManager qpStorage,
-            IConcurrencyControl concurrency) {
-        super();
-        this.spec = Objects.requireNonNull(spec, "DropTableSpec cannot be null");
-        this.storageContract = storageContract;
-        this.qpStorage = qpStorage;
-        this.concurrency = concurrency;
+    public DropTableExecutor(DropTableSpec spec, MutationCoordinator mutations) {
+        this.spec = Objects.requireNonNull(spec);
+        this.mutations = Objects.requireNonNull(mutations);
+        this.qpStorage = Objects.requireNonNull(mutations.getStorage());
     }
 
     public DropTableSpec getSpec() {
@@ -65,6 +50,9 @@ public final class DropTableExecutor extends AbstractCommandExecutor {
                     ErrorCode.INVALID_STATE,
                     "DROP TABLE is not allowed within an explicit transaction");
         }
+        mutations.requireWalContext(context);
+        context.requireGrant("__catalog__", AccessMode.WRITE);
+        context.requireGrant(spec.tableName(), AccessMode.WRITE);
         String requestedName = spec.tableName() != null ? spec.tableName().trim() : "";
         if (requestedName.isEmpty()) {
             throw new QpException(ErrorCode.SEMANTIC_ERROR, "DROP TABLE requires a valid table name");
@@ -84,12 +72,12 @@ public final class DropTableExecutor extends AbstractCommandExecutor {
         List<SchemaImage> beforeImages = new ArrayList<>();
         List<SchemaImage> afterImages = new ArrayList<>();
 
-        String snapshotId = createSnapshot();
+
         beforeImages.add(new SchemaImage(
                 targetSchema.tableName(),
                 Optional.of(targetSchema),
                 getIndexes(targetSchema.tableName()),
-                Optional.ofNullable(snapshotId)));
+                Optional.empty()));
         afterImages.add(new SchemaImage(
                 targetSchema.tableName(),
                 Optional.empty(),
@@ -135,68 +123,33 @@ public final class DropTableExecutor extends AbstractCommandExecutor {
 
         TableId tableId = new TableId(targetTable);
         var grant = context.requireGrant(tableId, AccessMode.WRITE);
+        var requests = beforeImages.stream().map(image -> new sqlike.qp.port.QpContracts.AccessRequest(
+                sqlike.qp.port.QpContracts.ResourceKey.table(new TableId(image.tableName())), AccessMode.WRITE)).toList();
+        new AccessCoordinator(mutations.getConcurrency()).acquireAll(new PreparedStatement(requests), context);
+        String snapshotId = createSnapshot();
+        if (snapshotId == null || snapshotId.isBlank()) throw new QpException(ErrorCode.IO_ERROR, "SM returned no snapshot ID");
+        SchemaImage target = beforeImages.get(0);
+        beforeImages.set(0, new SchemaImage(target.tableName(), target.schema(), target.indexes(), Optional.of(snapshotId)));
         SchemaChange schemaChange = new SchemaChange(beforeImages, afterImages);
 
-        if (concurrency != null && qpStorage != null) {
-            SchemaChangeRecord record = new SchemaChangeRecord(
-                    context.nextChangeId(), new TxId(context.txId), schemaChange);
-            WritePermit permit = concurrency.authorizeSchemaChange(record);
-            try (WriteLease lease = concurrency.acquireApplyLease(permit)) {
-                Objects.requireNonNull(lease);
-                context.check();
-                qpStorage.dropTable(tableId, behavior, context, grant, permit.lsn().value());
-                concurrency.confirmApplied(record.id());
-            }
-        } else if (qpStorage != null) {
-            qpStorage.dropTable(tableId, behavior, context, grant, 1L);
-        } else if (storageContract != null) {
-            try {
-                storageContract.dropTable(targetTable, behavior, 1L);
-            } catch (StorageException e) {
-                throw new QpException(ErrorCode.IO_ERROR, "Failed to drop table: " + e.getMessage());
-            }
-        }
+        mutations.applySchemaChange(schemaChange, context, lsn -> qpStorage.dropTable(tableId, behavior, context, grant, lsn));
         return 0L;
     }
 
     private List<String> listTables() {
-        if (qpStorage != null) {
-            return qpStorage.listTables();
-        }
-        if (storageContract != null) {
-            return storageContract.listTables();
-        }
-        return List.of();
+        return Objects.requireNonNull(qpStorage.listTables(), "Missing table list");
     }
 
     private TableSchema getTableSchema(String table) {
-        if (qpStorage != null) {
-            return qpStorage.getTableSchema(new TableId(table));
-        }
-        if (storageContract != null) {
-            return storageContract.getSchema(table);
-        }
-        throw new QpException(ErrorCode.SEMANTIC_ERROR, "Unknown table: " + table);
+        return Objects.requireNonNull(qpStorage.getTableSchema(new TableId(table)), "Missing table schema");
     }
 
     private List<IndexMetadata> getIndexes(String table) {
-        if (qpStorage != null) {
-            return qpStorage.getIndexes(new TableId(table));
-        }
-        if (storageContract != null) {
-            return storageContract.getIndexes(table);
-        }
-        return List.of();
+        return Objects.requireNonNull(qpStorage.getIndexes(new TableId(table)), "Missing index metadata");
     }
 
     private String createSnapshot() {
-        if (qpStorage != null) {
-            return qpStorage.createSnapshot();
-        }
-        if (storageContract != null) {
-            return storageContract.createSnapshot();
-        }
-        return "snap-0";
+        return qpStorage.createSnapshot();
     }
 
     @Override

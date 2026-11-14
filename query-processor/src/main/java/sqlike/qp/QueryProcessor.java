@@ -144,7 +144,7 @@ public final class QueryProcessor implements IQueryProcessor {
                 storageAdapter, evaluator, comparator, mutations, collector, estimator, validator, configuration);
         this.engine = new ExecutionEngine(this.translator);
         this.sessions = new SessionManager();
-        this.transactions = new TransactionCoordinator(this.concurrencyAdapter, configuration);
+        this.transactions = new TransactionCoordinator(this.concurrencyAdapter, configuration, storageAdapter);
         this.access = new AccessCoordinator(this.concurrencyAdapter);
         this.planExecutor = this.engine;
         this.state = SystemState.STARTING;
@@ -340,10 +340,12 @@ public final class QueryProcessor implements IQueryProcessor {
                 if (!access.isTransactionActive(new TxId(txId))) {
                     throw new QpException(ErrorCode.INVALID_STATE, "Execution requires an active transaction");
                 }
-                context = new ExecutionContext(txId, Optional.empty(), true,
-                        new java.util.concurrent.atomic.AtomicLong(), access.cancellationToken(new TxId(txId)));
+                context = transactions.externalContext(txId);
                 translator.validate(PreparedStatement.of(plan));
-                access.acquireCatalog(isSchemaStatement(plan.root().kind().name()), context);
+                if (isSchemaStatement(plan.root().kind().name())) {
+                    throw new QpException(ErrorCode.INVALID_STATE, "DDL requires auto-commit SQL execution");
+                }
+                access.acquireCatalog(false, context);
                 access.acquireAll(PreparedStatement.of(plan), context);
             }
             return planExecutor.execute(plan, context);

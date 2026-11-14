@@ -591,7 +591,18 @@ public class QP3TestDriver {
                 schema);
 
         MutationTargetCollector collector = new MutationTargetCollector(storage);
-        MutationCoordinator mutations = new MutationCoordinator(storage);
+        var sequence = new AtomicLong();
+        var concurrency = (sqlike.qp.port.QpContracts.IConcurrencyControl) java.lang.reflect.Proxy.newProxyInstance(
+                QP3TestDriver.class.getClassLoader(), new Class<?>[]{sqlike.qp.port.QpContracts.IConcurrencyControl.class},
+                (proxy, method, args) -> switch (method.getName()) {
+                    case "getState" -> sqlike.qp.port.QpContracts.TransactionState.ACTIVE;
+                    case "authorizeChange" -> new sqlike.qp.port.QpContracts.WritePermit(
+                            ((sqlike.qp.port.QpContracts.ChangeRecord) args[0]).id(), new sqlike.qp.port.QpContracts.Lsn(sequence.incrementAndGet()));
+                    case "acquireApplyLease" -> (sqlike.qp.port.QpContracts.WriteLease) () -> { };
+                    case "confirmApplied" -> null;
+                    default -> throw new AssertionError("Unexpected CCM fixture call: " + method.getName());
+                });
+        MutationCoordinator mutations = new MutationCoordinator(storage, concurrency);
         DeleteExecutor deleteExec = new DeleteExecutor(
                 filterOp,
                 new DeleteSpec("students"),
@@ -739,6 +750,7 @@ public class QP3TestDriver {
 
         @Override
         public void delete(String table, RID rid, long lsn) {
+            if (lsn <= 0) throw new AssertionError("Unlogged delete");
             Map<RID, Record> tableMap = tables.get(table);
             if (tableMap != null) {
                 tableMap.remove(rid);

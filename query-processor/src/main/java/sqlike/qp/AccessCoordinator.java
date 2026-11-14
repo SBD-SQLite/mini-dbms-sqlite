@@ -17,10 +17,6 @@ public final class AccessCoordinator {
         return txId != null && concurrency.getState(txId) == TransactionState.ACTIVE;
     }
 
-    CancellationToken cancellationToken(TxId txId) {
-        return concurrency.getCancellationToken(txId);
-    }
-
     public void acquireCatalog(boolean write, ExecutionContext context) {
         context.addGrant(acquireOne(ResourceKey.table(new TableId("__catalog__")),
                 write ? AccessMode.WRITE : AccessMode.READ, context));
