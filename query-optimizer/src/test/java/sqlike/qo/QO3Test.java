@@ -10,8 +10,10 @@ import sqlike.contract.IStorageManager;
 import sqlike.shared.ErrorCode;
 import sqlike.shared.JoinAlgorithm;
 import sqlike.shared.JoinSpec;
+import sqlike.shared.MutationSpec;
 import sqlike.shared.QoException;
 import sqlike.shared.JoinType;
+import sqlike.shared.ColumnRef;
 import sqlike.shared.Expression;
 import sqlike.shared.ExpressionKind;
 import sqlike.shared.ExpressionOperator;
@@ -72,6 +74,65 @@ public final class QO3Test {
             PlanNode bound = binder.bind(optimizer.parseQuery("SELECT * FROM students WHERE id > 10"));
             PlanNode filter = bound.children().get(0);
             eq(2500L, estimator.estimateRows(filter));
+        });
+        test("column-to-column selectivity handles identical and distinct columns", () -> {
+            PlanNode students = binder.bind(optimizer.parseQuery("SELECT * FROM students")).children().get(0);
+            ColumnRef id = Refs.column("students", "id");
+            for (ExpressionOperator alwaysTrue : List.of(ExpressionOperator.EQ, ExpressionOperator.GE, ExpressionOperator.LE))
+                close(1.0, estimator.selectivity(binary(alwaysTrue, columnExpression(id), columnExpression(id)), students));
+            for (ExpressionOperator alwaysFalse : List.of(ExpressionOperator.NE, ExpressionOperator.GT, ExpressionOperator.LT))
+                close(0.0, estimator.selectivity(binary(alwaysFalse, columnExpression(id), columnExpression(id)), students));
+
+            ColumnRef deptId = Refs.column("students", "dept_id");
+            close(1.0 / 5000.0, estimator.selectivity(binary(ExpressionOperator.EQ,
+                    columnExpression(id), columnExpression(deptId)), students));
+            close(1.0 - 1.0 / 5000.0, estimator.selectivity(binary(ExpressionOperator.NE,
+                    columnExpression(id), columnExpression(deptId)), students));
+            close(0.5, estimator.selectivity(binary(ExpressionOperator.LT,
+                    columnExpression(id), columnExpression(deptId)), students));
+        });
+        test("theta join cardinality keeps its existing column-comparison heuristics", () -> {
+            JoinSpec theta = new JoinSpec(JoinType.THETA,
+                    Optional.of(binary(ExpressionOperator.NE,
+                            columnExpression(Refs.column("students", "id")),
+                            columnExpression(Refs.column("takes", "id")))),
+                    JoinAlgorithm.BLOCK_NESTED_LOOP, List.of());
+            PlanNode join = PlanNodes.join(PlanNodes.scan("students"), PlanNodes.scan("takes"), theta);
+            eq(45_000_000L, estimator.estimateRows(binder.bind(new ParsedQuery(StatementType.SELECT,
+                    Optional.of(join), Optional.empty()))));
+        });
+        test("clustered index scans estimate contiguous result pages", () -> {
+            IndexMetadata tree = new IndexMetadata("ix_students_clustered", "students", "id", IndexType.BPLUS_TREE);
+            IndexStatistics unclusteredStats = new IndexStatistics(OptionalInt.of(3), OptionalInt.empty(),
+                    OptionalLong.of(10), OptionalLong.empty(), false);
+            IndexStatistics clusteredStats = new IndexStatistics(OptionalInt.of(3), OptionalInt.empty(),
+                    OptionalLong.of(10), OptionalLong.empty(), true);
+            IndexCondition range = new IndexCondition(IndexOperator.GT, integerValue(10), Optional.empty(), true, true);
+            IStorageManager unclustered = MockStorageManager.create(List.of(tree), Map.of(tree.indexName(), unclusteredStats));
+            IStorageManager clustered = MockStorageManager.create(List.of(tree), Map.of(tree.indexName(), clusteredStats));
+            PlanNode scan = PlanNodes.indexScan("students", tree.indexName(), range);
+            eq(50L, new CardinalityEstimator(unclustered).estimateBlocks(scan));
+            eq(25L, new CardinalityEstimator(clustered).estimateBlocks(scan));
+        });
+        test("UPDATE and DELETE write pages touched in the target table", () -> {
+            MutationSpec update = new MutationSpec("students", List.of(),
+                    Optional.of(Refs.column("students", "gpa")), Optional.of(intLiteral(3)));
+            Expression halfTable = binary(ExpressionOperator.GT,
+                    columnExpression(Refs.column("students", "id")), intLiteral(10));
+            PlanNode filtered = PlanNodes.filter(PlanNodes.scan("students"), halfTable);
+            close(18.0, new CostModel(storage).getCost(PlanNodes.update(filtered, update)));
+            close(18.0, new CostModel(storage).getCost(PlanNodes.delete(filtered,
+                    new MutationSpec("students", List.of(), Optional.empty(), Optional.empty()))));
+
+            IndexMetadata tree = new IndexMetadata("ix_students_clustered", "students", "id", IndexType.BPLUS_TREE);
+            IndexStatistics clusteredStats = new IndexStatistics(OptionalInt.of(3), OptionalInt.empty(),
+                    OptionalLong.of(10), OptionalLong.empty(), true);
+            IStorageManager clustered = MockStorageManager.create(List.of(tree), Map.of(tree.indexName(), clusteredStats));
+            PlanNode clusteredScan = PlanNodes.indexScan("students", tree.indexName(),
+                    new IndexCondition(IndexOperator.GT, integerValue(10), Optional.empty(), true, true));
+            double clusteredRead = new CostModel(clustered).getCost(clusteredScan);
+            double clusteredUpdate = new CostModel(clustered).getCost(PlanNodes.update(clusteredScan, update));
+            close(6.5, clusteredUpdate - clusteredRead);
         });
         test("join output blocks use combined tuple size", () -> {
             PlanNode bound = binder.bind(optimizer.parseQuery(
@@ -136,6 +197,12 @@ public final class QO3Test {
             PlanNode sorted = PlanNodes.sort(PlanNodes.scan("students"),
                     new SortSpec(Refs.column("students", "id"), SortDirection.ASC));
             close(4802.0, new CostModel(sortStorage, 3).getCost(sorted));
+        });
+        test("JOIN ON rejects a non-boolean expression", () -> {
+            expectSemantic(() -> binder.bind(optimizer.parseQuery(
+                    "SELECT * FROM students JOIN dept ON students.id")));
+            expectSemantic(() -> binder.bind(optimizer.parseQuery(
+                    "SELECT * FROM students JOIN dept ON students.id = 1 AND students.name")));
         });
         test("ambiguous NATURAL JOIN input column reports semantic error", () -> {
             try {
@@ -401,6 +468,14 @@ public final class QO3Test {
             eq(false, found.get(0).correlated());
             eq(true, found.get(1).correlated());
         });
+        test("nested same-table aliases correlate only to the nearest binding", () -> {
+            List<SubquerySpec> found = subqueries(optimizer.optimizeQuery(optimizer.parseQuery(
+                    "SELECT s.name FROM students AS s WHERE EXISTS (SELECT * FROM students AS s WHERE EXISTS "
+                            + "(SELECT * FROM dept AS d WHERE d.dept_id = s.dept_id))")).root());
+            eq(2, found.size());
+            eq(false, found.get(0).correlated());
+            eq(true, found.get(1).correlated());
+        });
         test("correlated subquery plans pass PlanNodes.validate", () -> {
             for (String sql : List.of(
                     "SELECT s.name FROM students AS s WHERE EXISTS (SELECT * FROM takes AS t WHERE t.id = s.id)",
@@ -516,8 +591,12 @@ public final class QO3Test {
             }
             expectSemantic(() -> optimizer.optimizeQuery(optimizer.parseQuery(sql)));
         });
-        test("NATURAL JOIN without common columns is a SEMANTIC_ERROR; other joins still report ambiguous columns", () -> {
-            expectSemantic(() -> binder.bind(optimizer.parseQuery("SELECT * FROM dept NATURAL JOIN takes")));
+        test("NATURAL JOIN without common columns is a Cartesian join; ordinary duplicate columns stay ambiguous", () -> {
+            PlanNode bound = binder.bind(optimizer.parseQuery("SELECT * FROM dept NATURAL JOIN takes"));
+            PlanNode join = bound.children().get(0);
+            eq(List.of(), join.join().orElseThrow().commonColumns());
+            eq(200_000L, new CardinalityEstimator(storage).estimateRows(join));
+            PlanNodes.validate(optimizer.optimizeQuery(optimizer.parseQuery("SELECT * FROM dept NATURAL JOIN takes")).root());
             expectSemantic(() -> binder.bind(optimizer.parseQuery("SELECT id FROM students, takes")));
             expectSemantic(() -> binder.bind(optimizer.parseQuery("SELECT id FROM students JOIN takes ON students.id = takes.id")));
         });

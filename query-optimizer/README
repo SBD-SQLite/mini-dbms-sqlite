@@ -55,16 +55,16 @@ Konstanta (`CostModel`): `tS` = 4,0 ms per seek, `tT` = 0,1 ms per transfer blok
 | Operasi | Rumus di kode |
 |---|---|
 | Linear scan | `b·tT + tS` (hanya satu seek), 0 jika `b = 0` |
-| Index scan (HASH atau B+Tree) | `(tS + tT) + p·(tS + tT)`; `p` = perkiraan halaman data berbeda = `b·(1 − (1 − 1/b)^r)`, dibulatkan ke atas, dibatasi `1..b`; `r` = baris hasil. Tinggi index tidak dimodelkan dan HASH/B+Tree/clustered memakai rumus yang sama |
+| Index scan | `p_i·(tS + tT) + biaya halaman heap`; HASH (EQ saja): `p_i = 3 + overflowPageCount/bucketCount`; B+Tree: `p_i = 1 + height + max(0, leafPagesRead−1)`, dengan `leafPagesRead ≈ ceil(totalLeafPages·r/n)`; heap clustered: `ceil(r/fb)` halaman berurutan, unclustered: `ceil(b·(1 − (1 − 1/b)^r))` halaman tersebar, dibatasi `0..b` (`r` = baris hasil) |
 | Filter, Project, Limit | 0 (pipelined, hanya biaya anak) |
 | BNLJ (join, cartesian) | `rescan·(2·tS + b_inner·tT)` dengan `batch = ⌈b_outer/(M−2)⌉` dan `rescan = batch − 1`; biaya satu kali baca kedua anak sudah ada di biaya anak. Total = biaya anak kiri + biaya anak kanan + suku ini. Contoh: student (b=100) outer × takes (b=400) inner = 4.810 ms; takes outer = 7.240 ms |
 | Sort | jika `b ≤ M`: 0. Selain itu: `p = ⌈log_(M−1)(b/M)⌉`, total seek `2⌈b/M⌉ + b·(2p−1)`, total transfer `b·(2p+1)` mengikuti materi dengan `b_b=1`. Biaya SORT lokal mengurangi satu seek dan `b` transfer karena pembacaan awal sudah dihitung oleh plan anak. Untuk SORT(SCAN) dengan `b=100`, `M=3`: total `4.802 ms` (4.802 ribu ms) |
 | Insert | `tS + tT` |
-| Update, Delete | `tS + b_dirty·tT` (`b_dirty` = blok hasil anak; 0 jika `b_dirty = 0`), ditambah biaya anak |
+| Update, Delete | `tS + b_dirty·tT` (`k` = baris yang cocok; unclustered: `b_dirty = min(b_tabel, k)`; jalur index clustered: `b_dirty = min(b_tabel, ceil(k/fb))`), ditambah biaya anak |
 | Create index | `(tS + b_tabel·tT) + (tS + ⌈n/fb⌉·tT)` |
 | Create table, Drop table | 0 |
 
-Rumus sort sekarang mengikuti rumus external sort pada materi. Untuk `b = 100`, `M = 3`, `b_b = 1`, hasil oracle adalah 1.168 seek dan 1.300 transfer, total 4.802 ms (notasi ribuan; 4.802 ribu ms). Biaya awal baca input tidak dihitung ulang karena sudah masuk biaya child. Index scan masih heuristik: kontrak SM belum menyediakan tinggi index (`h_i`) atau statistik clustered/non-clustered.
+Rumus sort mengikuti rumus external sort pada materi. Untuk `b = 100`, `M = 3`, `b_b = 1`, hasil oracle adalah 1.168 seek dan 1.300 transfer, total 4.802 ms (4.802 ribu ms). Biaya awal baca input tidak dihitung ulang karena sudah masuk biaya child. Index scan memakai statistik `IndexStatistics` dari SM: HASH memakai rata-rata overflow per bucket; B+Tree memperkirakan leaf yang dibaca dari fraksi baris hasil; heap clustered dianggap berurutan, sedangkan RID unclustered dianggap tersebar merata. Ini tetap heuristik karena statistik tidak memuat pemetaan tuple-ke-halaman atau histogram.
 
 ### Selektivitas (`CardinalityEstimator.selectivity`)
 
@@ -73,15 +73,16 @@ Rumus sort sekarang mengikuti rumus external sort pada materi. Untuk `b = 100`, 
 | `kolom = literal` | `1/V(kolom)` |
 | `kolom <> literal` | `1 − 1/V(kolom)` |
 | `kolom <, <=, >, >= literal` | 0,5 (tanpa min/max/histogram) |
-| `kolom = kolom` | `1/max(V(kolom1), V(kolom2))` |
-| `kolom <> kolom` | 0,9 |
-| `kolom <, <=, >, >= kolom` | 1/3 |
+| `kolom = kolom` (dua kolom berbeda, filter) | `1/max(V(kolom1), V(kolom2))` |
+| `kolom <> kolom` (dua kolom berbeda, filter) | `1 − 1/max(V(kolom1), V(kolom2))` |
+| `kolom <, <=, >, >= kolom` (dua kolom berbeda, filter) | 0,5 |
+| Kolom yang dibandingkan dengan dirinya sendiri | EQ/GE/LE = 1; NE/GT/LT = 0 (mengasumsikan non-NULL karena statistik NULL tidak tersedia) |
 | `A AND B` | `sel(A)·sel(B)` |
 | bentuk lain | 0,5 |
 | Index scan `=` | `1/V(kolom index)` |
 | Index scan rentang dan `BETWEEN` | 0,5 |
 
-Jumlah baris = `⌈n·selektivitas⌉` (dibulatkan ke atas, minimal 0).
+Untuk theta-join, `joinRows` tetap memakai heuristik sebelumnya bagi dua kolom berbeda: EQ `1/max(V)`, NE `0,9`, dan rentang `1/3`; ini dipisahkan dari selektivitas filter agar estimasi ukuran join yang sudah dipakai tidak berubah. Jumlah baris filter = `⌈n·selektivitas⌉` (dibulatkan ke atas, minimal 0).
 
 ### Ukuran join (`CardinalityEstimator.joinRows`)
 
@@ -89,6 +90,7 @@ Jumlah baris = `⌈n·selektivitas⌉` (dibulatkan ke atas, minimal 0).
 |---|---|
 | Cartesian | `n_kiri · n_kanan` |
 | NATURAL (dengan kolom bersama) | `n_kiri · n_kanan / ∏ max(V_kiri(A), V_kanan(A))` untuk setiap kolom bersama A |
+| NATURAL (tanpa kolom bersama) | `n_kiri · n_kanan` (Cartesian join) |
 | Theta (`ON`) | `n_kiri · n_kanan · sel(ON)` |
 
 Contoh: takes (n=10.000, V(ID)=2.500) ⋈ student (n=5.000, V(ID)=5.000) = 10.000 · 5.000 / 5.000 = 10.000 baris.

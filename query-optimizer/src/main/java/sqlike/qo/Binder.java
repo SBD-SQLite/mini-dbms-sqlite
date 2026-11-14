@@ -123,7 +123,6 @@ public final class Binder {
             Map<String, List<ResultColumn>> leftNames = outputsByName(left.outputColumns());
             Map<String, List<ResultColumn>> rightNames = outputsByName(right.outputColumns());
             common = leftNames.keySet().stream().filter(rightNames::containsKey).toList();
-            if (common.isEmpty()) throw QoErrors.semantic("NATURAL JOIN has no columns in common");
             for (String name : common) {
                 // Only a column name shared by both sides must be unique on each side; other repeated names are irrelevant.
                 if (leftNames.get(name).size() > 1 || rightNames.get(name).size() > 1)
@@ -135,6 +134,8 @@ public final class Binder {
             List<Relation> joinRelations = mergeScope(scope(left), scope(right));
             if (condition.isPresent()) {
                 condition = Optional.of(bindExpression(condition.get(), joinRelations));
+                if (!isBoolean(condition.get()))
+                    throw QoErrors.semantic("JOIN ON condition must be boolean; found " + expressionContext(condition.get()));
                 validateComparisonTree(condition.get(), joinRelations);
             }
         }
@@ -463,7 +464,9 @@ public final class Binder {
 
         CorrelationProbe(List<Relation> outside) { this.outside = outside; }
 
-        void note(Relation relation) { if (outside.contains(relation)) hit = true; }
+        void note(Relation relation) {
+            if (outside.stream().anyMatch(candidate -> candidate == relation)) hit = true;
+        }
     }
 
     private PlanNode copy(PlanNode n, List<PlanNode> children, List<ResultColumn> outputs, Optional<ScanSpec> scan,

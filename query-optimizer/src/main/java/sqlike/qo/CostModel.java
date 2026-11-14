@@ -241,11 +241,38 @@ public final class CostModel {
 
     private double costModifiedPages(PlanNode node) {
         if (node.children().isEmpty()) return 0.0;
-        long modifiedBlocks = estimator.estimateBlocks(node.children().get(0));
+        MutationSpec mutation = node.mutation().orElseThrow();
+        PlanNode input = node.children().get(0);
+        long qualifyingRows = estimator.estimateRows(input);
+        if (qualifyingRows == 0) return 0.0;
+
+        TableStatistics table = estimator.statisticsForTable(mutation.tableName());
+        long tableBlocks = table.blockCount();
+        if (tableBlocks <= 0) return 0.0;
+
+        long modifiedBlocks = hasClusteredIndexScan(input, mutation.tableName())
+                ? ceilDiv(qualifyingRows, Math.max(1, table.blockingFactor()))
+                : Math.min(tableBlocks, qualifyingRows);
+        modifiedBlocks = Math.min(tableBlocks, modifiedBlocks);
         if (modifiedBlocks == 0) return 0.0;
-        // Child costs include finding/reading qualifying rows. Charge one seek and
-        // one transfer per dirty page to persist the modifications.
+
+        // Without tuple-to-page statistics, unclustered matches may touch up to
+        // one target page per row; clustered index matches are assumed contiguous.
         return SEEK_TIME_MS + modifiedBlocks * TRANSFER_TIME_MS;
+    }
+
+    private boolean hasClusteredIndexScan(PlanNode node, String tableName) {
+        if (node.kind() == sqlike.shared.PlanNodeKind.INDEX_SCAN) {
+            ScanSpec scan = node.scan().orElseThrow();
+            if (scan.tableName().equalsIgnoreCase(tableName)) {
+                String indexName = scan.indexName().orElseThrow();
+                IndexStatistics statistics = storage.getIndexStatistics(indexName);
+                if (statistics == null)
+                    throw QoErrors.invalidState("SM returned null statistics for index '" + indexName + "'");
+                return statistics.clustered();
+            }
+        }
+        return node.children().stream().anyMatch(child -> hasClusteredIndexScan(child, tableName));
     }
 
     private double costCreateIndex(PlanNode node) {

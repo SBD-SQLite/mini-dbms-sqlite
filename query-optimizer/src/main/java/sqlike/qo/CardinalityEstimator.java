@@ -50,14 +50,18 @@ public final class CardinalityEstimator {
         if (node.kind() == PlanNodeKind.SCAN)
             return stats(node.scan().orElseThrow().tableName()).blockCount();
         if (node.kind() == PlanNodeKind.INDEX_SCAN) {
-            String table = node.scan().orElseThrow().tableName();
-            long tableBlocks = stats(table).blockCount();
+            ScanSpec scan = node.scan().orElseThrow();
+            String table = scan.tableName();
+            TableStatistics tableStats = stats(table);
+            long tableBlocks = tableStats.blockCount();
             long qualifyingRows = estimateRows(node);
             if (tableBlocks <= 0 || qualifyingRows <= 0) return 0;
 
-            // SM reports its secondary indexes as unclustered. Assume qualifying
-            // RIDs are uniformly scattered across table pages: expected distinct
-            // pages = b * (1 - (1 - 1/b)^n).
+            if (indexStatistics(scan).clustered())
+                return Math.min(tableBlocks, ceilDiv(qualifyingRows, Math.max(1, tableStats.blockingFactor())));
+
+            // For an unclustered index, qualifying RIDs are uniformly scattered
+            // across table pages: expected distinct pages = b * (1 - (1 - 1/b)^n).
             double expectedPages = -((double) tableBlocks) *
                     Math.expm1(qualifyingRows * Math.log1p(-1.0 / tableBlocks));
             long roundedPages = (long) Math.ceil(expectedPages);
@@ -101,9 +105,7 @@ public final class CardinalityEstimator {
                     ColumnRef leftColumn = left.column().orElseThrow();
                     ColumnRef rightColumn = right.column().orElseThrow();
                     if (!hasQualifier(child, leftColumn) || !hasQualifier(child, rightColumn)) return 0.5;
-                    return op == ExpressionOperator.EQ
-                            ? 1.0 / Math.max(distinct(leftColumn, child), distinct(rightColumn, child))
-                            : (op == ExpressionOperator.NE ? 0.9 : 1.0 / 3.0);
+                    return columnComparisonSelectivity(leftColumn, rightColumn, op, child);
                 }
             }
         }
@@ -162,8 +164,58 @@ public final class CardinalityEstimator {
             }
             return clampRows(leftRows * (double) rightRows * selectivity);
         }
-        if (join.condition().isPresent()) return clampRows(leftRows * (double) rightRows * selectivity(join.condition().get(), node));
+        if (join.condition().isPresent())
+            return clampRows(leftRows * (double) rightRows * joinConditionSelectivity(join.condition().get(), node));
         return safeMultiply(leftRows, rightRows);
+    }
+
+    private double joinConditionSelectivity(Expression condition, PlanNode scope) {
+        if (condition.kind() == ExpressionKind.BINARY
+                && condition.operator().orElse(null) == ExpressionOperator.AND
+                && condition.operands().size() == 2)
+            return clamp(joinConditionSelectivity(condition.operands().get(0), scope)
+                    * joinConditionSelectivity(condition.operands().get(1), scope));
+        if (condition.kind() == ExpressionKind.BINARY && isComparison(condition.operator().orElse(null))
+                && condition.operands().size() == 2
+                && condition.operands().get(0).kind() == ExpressionKind.COLUMN
+                && condition.operands().get(1).kind() == ExpressionKind.COLUMN) {
+            ColumnRef left = condition.operands().get(0).column().orElseThrow();
+            ColumnRef right = condition.operands().get(1).column().orElseThrow();
+            if (!hasQualifier(scope, left) || !hasQualifier(scope, right)) return 0.5;
+            if (left.equals(right)) return columnComparisonSelectivity(left, right,
+                    condition.operator().orElseThrow(), scope);
+
+            // Preserve the existing theta-join cardinality heuristic; filter selectivity
+            // uses the distinct-count complement and 0.5 range heuristic below.
+            long maxDistinct = Math.max(distinct(left, scope), distinct(right, scope));
+            return switch (condition.operator().orElseThrow()) {
+                case EQ -> 1.0 / maxDistinct;
+                case NE -> 0.9;
+                case GT, GE, LT, LE -> 1.0 / 3.0;
+                default -> 0.5;
+            };
+        }
+        return selectivity(condition, scope);
+    }
+
+    private double columnComparisonSelectivity(ColumnRef left, ColumnRef right,
+                                               ExpressionOperator op, PlanNode scope) {
+        if (left.equals(right)) {
+            // No NULL-fraction statistics are available; assume comparisons of a
+            // column with itself are evaluated over non-NULL values.
+            return switch (op) {
+                case EQ, GE, LE -> 1.0;
+                case NE, GT, LT -> 0.0;
+                default -> 0.5;
+            };
+        }
+        double equality = 1.0 / Math.max(distinct(left, scope), distinct(right, scope));
+        return switch (op) {
+            case EQ -> equality;
+            case NE -> 1.0 - equality;
+            case GT, GE, LT, LE -> 0.5;
+            default -> 0.5;
+        };
     }
 
     private double comparisonSelectivity(ColumnRef column, ExpressionOperator op, PlanNode scope) {
@@ -177,6 +229,13 @@ public final class CardinalityEstimator {
             case GT, GE, LT, LE -> 0.5;
             default -> 0.5;
         };
+    }
+
+    private IndexStatistics indexStatistics(ScanSpec scan) {
+        String indexName = scan.indexName().orElseThrow();
+        IndexStatistics result = storage.getIndexStatistics(indexName);
+        if (result == null) throw QoErrors.invalidState("SM returned null statistics for index '" + indexName + "'");
+        return result;
     }
 
     private double indexSelectivity(ScanSpec scan) {
@@ -292,6 +351,9 @@ public final class CardinalityEstimator {
     }
 
     private static String key(String value) { return value.toLowerCase(Locale.ROOT); }
+    private static long ceilDiv(long numerator, long denominator) {
+        return numerator <= 0 ? 0 : 1 + (numerator - 1) / denominator;
+    }
 
     private static final class CatalogCache {
         private List<String> tableNames;
