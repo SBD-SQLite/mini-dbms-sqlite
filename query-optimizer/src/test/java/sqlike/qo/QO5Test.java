@@ -43,6 +43,7 @@ public final class QO5Test {
         test("disconnected join inputs keep every Cartesian combination", QO5Test::disconnectedInputs);
         test("candidate equivalence holds for varied fixture contents", QO5Test::variedContents);
         QO5AccessPathTest.run(QO5Test::test);
+        QO5GeneticTest.run(QO5Test::test);
         System.out.printf("QO5: %d passed, %d failed%n", passed, failed);
         return failed;
     }
