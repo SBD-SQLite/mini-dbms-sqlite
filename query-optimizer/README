@@ -50,7 +50,7 @@ CREATE INDEX <nama> ON <tabel>(<kolom>) [USING HASH | BPLUS_TREE]
 
 Sumber: `CostModel.java` dan `CardinalityEstimator.java`. Satuan biaya: milidetik (ms). Biaya sebuah rencana adalah jumlah biaya lokal setiap node ditambah biaya anaknya.
 
-Konstanta (`CostModel`): `tS` = 4,0 ms per seek, `tT` = 0,1 ms per transfer blok, `M` (`BUFFER_BLOCKS`) = 3 blok, nilai tetap (belum bisa diatur). Ukuran blok untuk hasil join: 4096 byte (`CardinalityEstimator`). Notasi: `b` = jumlah blok, `n` = jumlah baris, `V(A)` = jumlah nilai distinct kolom A, `fb` = blocking factor (semuanya dari `TableStatistics`).
+Konstanta (`CostModel`): `tS` = 4,0 ms per seek, `tT` = 0,1 ms per transfer blok, `M` = jumlah buffer block (default 3, dapat dikonfigurasi melalui `CostModel` atau `QueryOptimizer`). Ukuran blok untuk hasil join: 4096 byte (`CardinalityEstimator`). Notasi: `b` = jumlah blok, `n` = jumlah baris, `V(A)` = jumlah nilai distinct kolom A, `fb` = blocking factor (semuanya dari `TableStatistics`). Sort memakai asumsi `b_b = 1` buffer block per run.
 
 | Operasi | Rumus di kode |
 |---|---|
@@ -58,13 +58,13 @@ Konstanta (`CostModel`): `tS` = 4,0 ms per seek, `tT` = 0,1 ms per transfer blok
 | Index scan (HASH atau B+Tree) | `(tS + tT) + p·(tS + tT)`; `p` = perkiraan halaman data berbeda = `b·(1 − (1 − 1/b)^r)`, dibulatkan ke atas, dibatasi `1..b`; `r` = baris hasil. Tinggi index tidak dimodelkan dan HASH/B+Tree/clustered memakai rumus yang sama |
 | Filter, Project, Limit | 0 (pipelined, hanya biaya anak) |
 | BNLJ (join, cartesian) | `rescan·(2·tS + b_inner·tT)` dengan `batch = ⌈b_outer/(M−2)⌉` dan `rescan = batch − 1`; biaya satu kali baca kedua anak sudah ada di biaya anak. Total = biaya anak kiri + biaya anak kanan + suku ini. Contoh: student (b=100) outer × takes (b=400) inner = 4.810 ms; takes outer = 7.240 ms |
-| Sort | jika `b ≤ M`: 0. Selain itu: `runs = ⌈b/M⌉`, fan-in `M−1`, `seek` dihitung per run (`runs` untuk run awal, lalu `runs + merged` per pass), `transfer = b + 2·b·pass`; biaya = `seek·tS + transfer·tT` |
+| Sort | jika `b ≤ M`: 0. Selain itu: `p = ⌈log_(M−1)(b/M)⌉`, total seek `2⌈b/M⌉ + b·(2p−1)`, total transfer `b·(2p+1)` mengikuti materi dengan `b_b=1`. Biaya SORT lokal mengurangi satu seek dan `b` transfer karena pembacaan awal sudah dihitung oleh plan anak. Untuk SORT(SCAN) dengan `b=100`, `M=3`: total `4.802 ms` (4.802 ribu ms) |
 | Insert | `tS + tT` |
 | Update, Delete | `tS + b_dirty·tT` (`b_dirty` = blok hasil anak; 0 jika `b_dirty = 0`), ditambah biaya anak |
 | Create index | `(tS + b_tabel·tT) + (tS + ⌈n/fb⌉·tT)` |
 | Create table, Drop table | 0 |
 
-**Sort belum sama dengan materi.** Materi menghitung seek per blok buffer (`2⌈b/b_b⌉` per pass), sedangkan kode menghitung seek per run. Untuk `b = 100`, `M = 3`: kode 694 ms (transfer 1.300, seek 141) sedangkan rumus materi 4.802 ms (transfer 1.300, seek 1.168). Index scan juga belum sama dengan materi A2/A4/A6: tidak ada tinggi index (`h_i`) dan tidak ada pembedaan clustered/non-clustered. `M` konstan 3, sedangkan materi memakai `M` sebagai parameter.
+Rumus sort sekarang mengikuti rumus external sort pada materi. Untuk `b = 100`, `M = 3`, `b_b = 1`, hasil oracle adalah 1.168 seek dan 1.300 transfer, total 4.802 ms (notasi ribuan; 4.802 ribu ms). Biaya awal baca input tidak dihitung ulang karena sudah masuk biaya child. Index scan masih heuristik: kontrak SM belum menyediakan tinggi index (`h_i`) atau statistik clustered/non-clustered.
 
 ### Selektivitas (`CardinalityEstimator.selectivity`)
 
@@ -79,7 +79,7 @@ Konstanta (`CostModel`): `tS` = 4,0 ms per seek, `tT` = 0,1 ms per transfer blok
 | `A AND B` | `sel(A)·sel(B)` |
 | bentuk lain | 0,5 |
 | Index scan `=` | `1/V(kolom index)` |
-| Index scan rentang dan `BETWEEN` | 0,5 (filter setara dua rentang `AND` = 0,25, jadi tidak konsisten) |
+| Index scan rentang dan `BETWEEN` | 0,5 |
 
 Jumlah baris = `⌈n·selektivitas⌉` (dibulatkan ke atas, minimal 0).
 

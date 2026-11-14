@@ -16,13 +16,17 @@ public class QueryOptimizer implements IQueryOptimizer {
     private final PlanAnnotator annotator;
 
     public QueryOptimizer(IStorageManager storage) {
+        this(storage, 3);
+    }
+
+    public QueryOptimizer(IStorageManager storage, int bufferBlocks) {
         if (storage == null) throw new IllegalArgumentException("storage is required");
         ExpressionParser expr = new ExpressionParser();
         this.lexer = new Lexer();
         this.queryParser = new QueryParser(new SelectParser(expr), new StatementParser());
         this.binder = new Binder(storage);
         this.selectionProjectionRewriter = new SelectionProjectionRewriter();
-        this.costModel = new CostModel(storage);
+        this.costModel = new CostModel(storage, bufferBlocks);
         this.optimizer = new JoinAccessPathOptimizer(costModel, storage);
         this.printer = new PlanPrinter();
         this.annotator = new PlanAnnotator(new CardinalityEstimator(storage));
