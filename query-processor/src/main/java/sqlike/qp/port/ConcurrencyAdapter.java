@@ -40,15 +40,12 @@ import static sqlike.qp.port.QpContracts.failure;
  * to the internal QP port {@link IConcurrencyControl}.
  */
 public final class ConcurrencyAdapter implements IConcurrencyControl {
-    private static final long ACCESS_RETRY_DELAY_MS = 10;
-
     private final IConcurrencyControlManager ccm;
     private final IFailureRecoveryManager frm;
     private final Map<TxId, TransactionState> states = new ConcurrentHashMap<>();
     private final Map<TxId, CancellationToken> tokens = new ConcurrentHashMap<>();
     private final Map<ChangeId, WritePermit> permits = new ConcurrentHashMap<>();
     private final Set<ChangeId> leases = ConcurrentHashMap.newKeySet();
-    private final Map<UUID, AccessGrant> pendingWaits = new ConcurrentHashMap<>();
     // The counter is a compatibility fallback. WAL-backed writes need an LSN from CCM or FRM.
     private final AtomicLong fallbackLsn = new AtomicLong();
 
@@ -66,7 +63,6 @@ public final class ConcurrencyAdapter implements IConcurrencyControl {
         tokens.clear();
         permits.clear();
         leases.clear();
-        pendingWaits.clear();
         ccm.initAfterRecovery(report.lastTxId());
     }
 
@@ -93,7 +89,9 @@ public final class ConcurrencyAdapter implements IConcurrencyControl {
         if (getState(txId) != TransactionState.ACTIVE) {
             throw failure("Transaction is not active: " + txId.value());
         }
-        ResourceId rid = resource.rid().isPresent()
+        getCancellationToken(txId).check();
+        ResourceId rid = resource.tableId().value().equals("__catalog__")
+                ? ResourceId.ofCatalog() : resource.rid().isPresent()
                 ? ResourceId.ofRecord(resource.tableId().value(), resource.rid().get().value())
                 : ResourceId.ofTable(resource.tableId().value());
         AccessGrant grant = new AccessGrant(txId, resource, mode);
@@ -101,25 +99,17 @@ public final class ConcurrencyAdapter implements IConcurrencyControl {
         AccessResponse response = checkedAccessResponse(txId, mode == AccessMode.READ
                 ? ccm.requestRead(txId.value(), rid)
                 : ccm.requestWriteAccess(txId.value(), rid));
+        if (response.status() == AccessStatus.GRANTED) getCancellationToken(txId).check();
         return switch (response.status()) {
             case GRANTED -> new AccessDecision(AccessStatus.GRANTED, Optional.of(grant), reqId);
-            case WAIT -> {
-                pendingWaits.put(reqId, grant);
-                yield new AccessDecision(AccessStatus.WAIT, Optional.empty(), reqId);
-            }
+            case WAIT -> throw failure("CCM must block until GRANTED or ABORTED; QP cannot retry access requests");
             case ABORTED -> new AccessDecision(AccessStatus.ABORTED, Optional.empty(), reqId);
         };
     }
 
     @Override
     public AccessDecision waitAccess(UUID requestId) {
-        AccessGrant grant = Optional.ofNullable(pendingWaits.remove(requestId))
-                .orElseThrow(() -> failure("Unknown wait request ID: " + requestId));
-        waitBeforeRetry();
-        if (getState(grant.txId()) == TransactionState.ABORTED) {
-            return new AccessDecision(AccessStatus.ABORTED, Optional.empty(), requestId);
-        }
-        return acquireAccess(grant.txId(), grant.resource(), grant.mode());
+        throw failure("CCM access is blocking; waitAccess is not supported by this adapter");
     }
 
     @Override
@@ -151,20 +141,19 @@ public final class ConcurrencyAdapter implements IConcurrencyControl {
     }
 
     private AccessResponse awaitWriteGrant(TxId txId, Supplier<AccessResponse> request) {
-        while (true) {
-            getCancellationToken(txId).check();
-            if (getState(txId) != TransactionState.ACTIVE) {
-                throw failure("Transaction not active: " + txId.value());
-            }
-            AccessResponse response = checkedAccessResponse(txId, request.get());
-            if (response.status() == AccessStatus.GRANTED) {
-                return response;
-            }
-            if (response.status() == AccessStatus.ABORTED) {
-                throw new QpException(ErrorCode.TRANSACTION_ABORTED, "CCM aborted transaction " + txId.value());
-            }
-            waitBeforeRetry();
+        getCancellationToken(txId).check();
+        if (getState(txId) != TransactionState.ACTIVE) {
+            throw failure("Transaction not active: " + txId.value());
         }
+        AccessResponse response = checkedAccessResponse(txId, request.get());
+        if (response.status() == AccessStatus.ABORTED) {
+            throw new QpException(ErrorCode.TRANSACTION_ABORTED, "CCM aborted transaction " + txId.value());
+        }
+        getCancellationToken(txId).check();
+        if (response.status() != AccessStatus.GRANTED) {
+            throw failure("CCM must block until GRANTED or ABORTED; QP cannot retry writes");
+        }
+        return response;
     }
 
     private AccessResponse checkedAccessResponse(TxId txId, AccessResponse response) {
@@ -179,16 +168,6 @@ public final class ConcurrencyAdapter implements IConcurrencyControl {
             throw new QpException(response.error().get());
         }
         return response;
-    }
-
-    private static void waitBeforeRetry() {
-        // Legacy CCM implementations can return WAIT and require a retry.
-        try {
-            Thread.sleep(ACCESS_RETRY_DELAY_MS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw failure("Access wait interrupted");
-        }
     }
 
     @Override
@@ -224,7 +203,7 @@ public final class ConcurrencyAdapter implements IConcurrencyControl {
 
     @Override
     public TransactionState getState(TxId txId) {
-        return states.getOrDefault(txId, TransactionState.ACTIVE);
+        return states.getOrDefault(txId, TransactionState.FAILED);
     }
 
     @Override
@@ -280,7 +259,6 @@ public final class ConcurrencyAdapter implements IConcurrencyControl {
         getCancellationToken(txId).cancel();
         permits.keySet().removeIf(id -> id.txId().equals(txId));
         leases.removeIf(id -> id.txId().equals(txId));
-        pendingWaits.values().removeIf(grant -> grant.txId().equals(txId));
     }
 
     /** Register transactions started directly through CCM before requesting grants through this adapter. */

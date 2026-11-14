@@ -26,6 +26,7 @@ public final class Qp5AcceptanceTest {
     public static void main(String[] args) throws Exception {
         if (args.length == 1 && args[0].equals("--qo-integration")) {
             runQoIntegrationChecks();
+            runAccessChecks();
             reportResults();
             return;
         }
@@ -36,6 +37,7 @@ public final class Qp5AcceptanceTest {
         if (args.length != 0) throw new IllegalArgumentException("Expected no arguments, --qo-integration, or a restart phase and snapshot");
         System.out.println("QP acceptance checks with stub SM and CCM/FRM.");
         runQoIntegrationChecks();
+        runAccessChecks();
         test("QP-10 INSERT and QP-12 ABORT", Qp5AcceptanceTest::insertAndAbort);
         test("QP-11 SET, arithmetic, WHERE, and counts", Qp5AcceptanceTest::updateRows);
         test("QP-11 committed UPDATE survives restart", Qp5AcceptanceTest::updateSurvivesRestart);
@@ -43,7 +45,6 @@ public final class Qp5AcceptanceTest {
         test("QP-12 auto-commit", Qp5AcceptanceTest::autoCommit);
         test("QP-12 access permission and WAIT", Qp5AcceptanceTest::accessAndWait);
         test("QP-12 foreign-key validation requires a read grant", Qp5AcceptanceTest::foreignKeyReadAccess);
-        test("QP-12 CCM adapter waits for write grants", Qp5AcceptanceTest::adapterWriteWait);
         test("QP-12 CCM adapter reports failed ABORT and preserves the session", Qp5AcceptanceTest::adapterAbortStatus);
         test("QP-09 Access request ordering and merging", Qp5AcceptanceTest::accessOrderingAndMerging);
         test("QP-04 CHAR/VARCHAR length in Unicode code points", Qp5AcceptanceTest::textCodePointLength);
@@ -329,32 +330,147 @@ public final class Qp5AcceptanceTest {
         }
     }
 
-    private static void adapterWriteWait() {
-        var waiting = new AccessResponse(AccessStatus.WAIT, Optional.empty(), Optional.empty(), Optional.empty());
-        var accessGranted = new AccessResponse(AccessStatus.GRANTED, Optional.empty(), Optional.empty(), Optional.empty());
-        var writeGranted = new AccessResponse(AccessStatus.GRANTED, Optional.of(42L), Optional.empty(), Optional.empty());
-        var accessResponses = new ArrayDeque<>(List.of(waiting, accessGranted));
-        var writeResponses = new ArrayDeque<>(List.of(waiting, writeGranted));
-        var adapter = adapterWith((proxy, method, args) -> switch (method.getName()) {
-            case "requestWriteAccess" -> accessResponses.remove();
-            case "requestWrite" -> writeResponses.remove();
-            default -> throw new AssertionError("Unexpected CCM call: " + method.getName());
+    private static void runAccessChecks() {
+        test("QP-12 CCM adapter blocks without retrying writes", Qp5AcceptanceTest::adapterWriteWait);
+        test("QP-12 strict grants and cancellation", Qp5AcceptanceTest::strictGrants);
+        test("QP-03 catalog permission precedes optimization", Qp5AcceptanceTest::catalogBeforeOptimization);
+        test("QP-12 adapter catalog, abort, and cancelled grants", Qp5AcceptanceTest::adapterAccessBoundary);
+        test("QP-02 failed disconnect rollback stays registered", Qp5AcceptanceTest::failedDisconnectRollback);
+    }
+
+    private static void adapterAccessBoundary() {
+        for (int scenario = 0; scenario < 3; scenario++) {
+            final int selected = scenario;
+            var reference = new java.util.concurrent.atomic.AtomicReference<ConcurrencyAdapter>();
+            var adapter = adapterWith((proxy, method, args) -> {
+                assertEquals("requestRead", method.getName());
+                assertEquals(ResourceId.ofCatalog(), args[1]);
+                if (selected == 1) reference.get().getCancellationToken(new TxId(1)).cancel();
+                return new AccessResponse(selected == 2 ? AccessStatus.ABORTED : AccessStatus.GRANTED,
+                        Optional.empty(), Optional.empty(), Optional.empty());
+            });
+            reference.set(adapter); adapter.registerExternalTransaction(1);
+            try {
+                var grant = adapter.acquireAccess(new TxId(1), ResourceKey.table(new TableId("__catalog__")), AccessMode.READ);
+                assertEquals(selected == 2 ? AccessStatus.ABORTED : AccessStatus.GRANTED, grant.status());
+                if (selected == 2) {
+                    assertTrue(grant.grant().isEmpty(), "Aborted request returned a grant");
+                    assertEquals(TransactionState.ABORTED, adapter.getState(new TxId(1)));
+                }
+            } catch (IllegalStateException expected) { assertEquals(1, selected); }
+            catch (QpException expected) { assertEquals(2, selected); assertEquals(ErrorCode.TRANSACTION_ABORTED, expected.getErrorInfo().code()); }
+        }
+    }
+
+    private static void failedDisconnectRollback() throws Exception {
+        TestDatabase db = new TestDatabase();
+        SessionManager sessions = new SessionManager();
+        var processor = new QueryProcessor(db.runner.optimizer, db.runner.translator, db.runner.engine,
+                sessions, db.runner.transactions, db.runner.access);
+        processor.initialize(); var session = processor.openSession();
+        assertEquals(ResultKind.TRANSACTION, processor.execute("BEGIN;", session).kind());
+        db.transactions.failAbort = true;
+        try { processor.closeSession(session.sessionId()); throw new AssertionError("Failed rollback closed session"); }
+        catch (IllegalStateException expected) { }
+        assertEquals(1, sessions.activeSessions().size());
+        assertTrue(sessions.activeSessions().get(0).currentTxId().isPresent(), "Lost unresolved transaction");
+        processor.closeSession(session.sessionId());
+        assertTrue(sessions.activeSessions().isEmpty(), "Successful rollback left session registered");
+        session = processor.openSession();
+        processor.execute("BEGIN;", session);
+        db.transactions.nextCommit = TransactionState.PARTIALLY_COMMITTED;
+        var unknown = processor.execute("COMMIT;", session);
+        assertEquals(ErrorCode.INVALID_STATE, unknown.error().orElseThrow().code());
+        assertTrue(unknown.message().contains("Commit outcome unknown"), unknown.message());
+        db.trace.clear();
+        assertEquals(ResultKind.ERROR, processor.execute("ABORT;", session).kind());
+        try { processor.closeSession(session.sessionId()); throw new AssertionError("Unknown commit outcome was discarded"); }
+        catch (IllegalStateException expected) { }
+        assertEquals(1, sessions.activeSessions().size());
+        assertTrue(!db.trace.contains("FRM.rollback"), "Unknown commit was rolled back");
+    }
+
+    private static void strictGrants() {
+        ExecutionContext context = ExecutionContext.of(1);
+        try { context.requireGrant("student", AccessMode.READ); throw new AssertionError("Fabricated grant"); }
+        catch (IllegalStateException expected) { assertTrue(expected.getMessage().contains("Missing"), expected.getMessage()); }
+        context.addGrant(new AccessGrant(new TxId(1), ResourceKey.table(new TableId("student")), AccessMode.READ));
+        try { context.requireGrant("student", AccessMode.WRITE); throw new AssertionError("READ upgraded itself"); }
+        catch (IllegalStateException expected) { }
+        try { context.addGrant(new AccessGrant(new TxId(2), ResourceKey.table(new TableId("student")), AccessMode.WRITE)); throw new AssertionError("Foreign grant"); }
+        catch (IllegalStateException expected) { }
+        Thread.currentThread().interrupt();
+        try { context.check(); throw new AssertionError("Ignored interrupt"); }
+        catch (IllegalStateException expected) { assertTrue(Thread.currentThread().isInterrupted(), "Interrupt lost"); }
+        finally { Thread.interrupted(); }
+    }
+
+    private static void catalogBeforeOptimization() throws Exception {
+        TestDatabase db = new TestDatabase();
+        var bindings = new AtomicInteger();
+        var optimizer = (sqlike.contract.IQueryOptimizer) Proxy.newProxyInstance(
+                sqlike.contract.IQueryOptimizer.class.getClassLoader(), new Class<?>[]{sqlike.contract.IQueryOptimizer.class},
+                (proxy, method, args) -> {
+                    if (method.getName().equals("optimizeQuery")) {
+                        bindings.incrementAndGet();
+                        assertTrue(db.trace.contains("CCM.catalog.READ") || db.trace.contains("CCM.catalog.WRITE"), "Binding without catalog grant");
+                    }
+                    try { return method.invoke(db.runner.optimizer, args); }
+                    catch (java.lang.reflect.InvocationTargetException e) { throw e.getCause(); }
+                });
+        var processor = new QueryProcessor(optimizer, db.runner.translator, db.runner.engine,
+                new SessionManager(), db.runner.transactions, db.runner.access);
+        processor.initialize();
+        var session = processor.openSession();
+        try {
+            db.trace.clear();
+            assertEquals(ResultKind.ROWS, processor.execute("SELECT * FROM employees;", session).kind());
+            assertBefore(db.trace, "CCM.catalog.READ", "SM.scan");
+            db.trace.clear();
+            assertEquals(ResultKind.AFFECTED_ROWS, processor.execute("CREATE INDEX idx_stage4 ON employees (salary);", session).kind());
+            assertTrue(db.trace.contains("CCM.catalog.WRITE") && !db.trace.contains("CCM.catalog.READ"), "DDL upgraded catalog S to X");
+            int previousBindings = bindings.get();
+            db.trace.clear(); db.transactions.scriptAccess(AccessStatus.ABORTED);
+            var denied = processor.execute("SELECT * FROM employees;", session);
+            assertEquals(ErrorCode.TRANSACTION_ABORTED, denied.error().orElseThrow().code());
+            assertEquals(previousBindings, bindings.get());
+            assertTrue(!db.trace.contains("SM.scan"), "Denied catalog access reached storage");
+            assertEquals(ResultKind.ROWS, processor.execute("SELECT * FROM employees;", session).kind());
+        } finally { processor.closeSession(session.sessionId()); }
+    }
+
+    private static void adapterWriteWait() throws Exception {
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var calls = new AtomicInteger();
+        var adapter = adapterWith((proxy, method, args) -> {
+            assertEquals("requestWrite", method.getName());
+            calls.incrementAndGet(); entered.countDown();
+            if (!release.await(3, TimeUnit.SECONDS)) throw new AssertionError("Blocking request timed out");
+            return new AccessResponse(AccessStatus.GRANTED, Optional.of(42L), Optional.empty(), Optional.empty());
         });
-        var tx = new TxId(1);
-        adapter.registerExternalTransaction(tx.value());
-
-        var resource = ResourceKey.table(new TableId("employees"));
-        AccessDecision decision = adapter.acquireAccess(tx, resource, AccessMode.WRITE);
-        assertEquals(AccessStatus.WAIT, decision.status());
-        assertTrue(decision.grant().isEmpty(), "WAIT returned a write grant");
-        assertEquals(AccessStatus.GRANTED, adapter.waitAccess(decision.requestId()).status());
-
+        var tx = new TxId(1); adapter.registerExternalTransaction(1);
+        assertEquals(TransactionState.FAILED, adapter.getState(new TxId(99)));
         var rid = new RID(new PageId("employees", 0), 0);
         var change = new DataChange(ChangeOperation.INSERT, "employees", rid,
                 new RecordImage(false, List.of()), new RecordImage(true, List.of()));
-        WritePermit permit = adapter.authorizeChange(new ChangeRecord(new ChangeId(tx, 1), tx, change));
-        assertEquals(new Lsn(42), permit.lsn());
-        assertTrue(accessResponses.isEmpty() && writeResponses.isEmpty(), "CCM grant was not awaited");
+        var worker = Executors.newSingleThreadExecutor();
+        try {
+            var result = worker.submit(() -> adapter.authorizeChange(new ChangeRecord(new ChangeId(tx, 1), tx, change)));
+            assertTrue(entered.await(3, TimeUnit.SECONDS), "CCM request not entered");
+            assertTrue(!result.isDone(), "Write continued before CCM granted access");
+            release.countDown(); assertEquals(new Lsn(42), result.get(5, TimeUnit.SECONDS).lsn());
+            assertEquals(1, calls.get());
+        } finally { release.countDown(); worker.shutdownNow(); }
+        var retries = new AtomicInteger();
+        var invalid = adapterWith((proxy, method, args) -> {
+            retries.incrementAndGet();
+            return new AccessResponse(AccessStatus.WAIT, Optional.empty(), Optional.empty(), Optional.empty());
+        });
+        invalid.registerExternalTransaction(1);
+        try { invalid.authorizeChange(new ChangeRecord(new ChangeId(tx, 1), tx, change)); throw new AssertionError("Accepted returned WAIT"); }
+        catch (IllegalStateException expected) { assertTrue(expected.getMessage().contains("cannot retry"), expected.getMessage()); }
+        assertEquals(1, retries.get());
     }
 
     private static void adapterAbortStatus() {

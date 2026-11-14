@@ -37,7 +37,7 @@ public final class StubTransactions implements IConcurrencyControl, IFailureReco
     }
     private void active(TxId tx) { if (getState(tx) != TransactionState.ACTIVE) throw failure("Transaction not active"); }
     @Override public AccessDecision acquireAccess(TxId tx, ResourceKey resource, AccessMode mode) {
-        active(tx); trace.add("CCM.access." + mode); return decide(UUID.randomUUID(), new AccessGrant(tx, resource, mode));
+        active(tx); trace.add((resource.tableId().value().equals("__catalog__") ? "CCM.catalog." : "CCM.access.") + mode); return decide(UUID.randomUUID(), new AccessGrant(tx, resource, mode));
     }
     private AccessDecision decide(UUID request, AccessGrant grant) {
         AccessStatus status = Optional.ofNullable(script.poll()).orElse(AccessStatus.GRANTED);

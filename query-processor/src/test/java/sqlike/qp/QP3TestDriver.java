@@ -45,6 +45,12 @@ public class QP3TestDriver {
     private static int testsRun = 0;
     private static int testsPassed = 0;
 
+    private static ExecutionContext grantedContext(long txId) {
+        ExecutionContext context = ExecutionContext.of(txId);
+        context.addGrant(new AccessGrant(new TxId(txId), ResourceKey.table(new TableId("students")), AccessMode.WRITE));
+        return context;
+    }
+
     public static void main(String[] args) {
         System.out.println("==================================================");
         System.out.println("   SQLike QP3 (Row Operators & Delete) Tests      ");
@@ -132,7 +138,7 @@ public class QP3TestDriver {
         ScanSpec spec = new ScanSpec("students", Optional.empty(), Optional.empty(), Optional.of("s"));
         TableScanOperator scanOp = new TableScanOperator(storage, spec, schema);
         assertEquals("s", scanOp.getRelationId(), "TableScanOperator must expose alias as relationId when present");
-        ExecutionContext ctx = ExecutionContext.of(101L);
+        ExecutionContext ctx = grantedContext(101L);
 
         boolean threwBeforeOpen = false;
         try {
@@ -213,7 +219,7 @@ public class QP3TestDriver {
                 IndexOperator.GE, intVal(21), Optional.empty(), true, false);
         IndexScanSpec spec = new IndexScanSpec("students", "idx_students_age", Optional.of(cond));
         IndexScanOperator indexOp = new IndexScanOperator(storage, spec, schema);
-        ExecutionContext ctx = ExecutionContext.of(102L);
+        ExecutionContext ctx = grantedContext(102L);
 
         indexOp.open(ctx);
         Optional<RowEnvelope> row1 = indexOp.next();
@@ -307,7 +313,7 @@ public class QP3TestDriver {
 
         IExpressionEvaluator evaluator = new ExpressionEvaluator(new ValueComparator());
         FilterOperator filterOp = new FilterOperator(scanOp, new FilterSpec(predicate), evaluator);
-        ExecutionContext ctx = ExecutionContext.of(103L);
+        ExecutionContext ctx = grantedContext(103L);
 
         filterOp.open(ctx);
         List<RowEnvelope> filtered = new ArrayList<>();
@@ -375,7 +381,7 @@ public class QP3TestDriver {
                 new ColumnSchema("id", DataType.INTEGER, Optional.empty())));
 
         ProjectOperator projectOp = new ProjectOperator(scanOp, projectSpec, projectedSchema);
-        ExecutionContext ctx = ExecutionContext.of(104L);
+        ExecutionContext ctx = grantedContext(104L);
 
         projectOp.open(ctx);
         Optional<RowEnvelope> first = projectOp.next();
@@ -422,7 +428,7 @@ public class QP3TestDriver {
                 storage, new ScanSpec("students", Optional.empty(), Optional.empty()), baseSchema);
 
         LimitOperator limit2 = new LimitOperator(scanOp, new sqlike.shared.LimitSpec(2));
-        ExecutionContext ctx = ExecutionContext.of(1041L);
+        ExecutionContext ctx = grantedContext(1041L);
         limit2.open(ctx);
         Optional<RowEnvelope> r1 = limit2.next();
         Optional<RowEnvelope> r2 = limit2.next();
@@ -448,7 +454,7 @@ public class QP3TestDriver {
                 storage, new ScanSpec("students", Optional.empty(), Optional.empty()), schema);
 
         MutationTargetCollector collector = new MutationTargetCollector(storage);
-        ExecutionContext ctx = ExecutionContext.of(105L);
+        ExecutionContext ctx = grantedContext(105L);
 
         List<StoredRecord> collected = collector.collect(scanOp, "students", ctx);
         assertEquals(3, collected.size(), "Collector must materialize all 3 records from scan");
@@ -547,7 +553,7 @@ public class QP3TestDriver {
 
         // Verify withQpStorage factory works seamlessly with StorageAdapter
         MutationTargetCollector qpCollector = MutationTargetCollector.withQpStorage(new StorageAdapter(storage));
-        List<StoredRecord> viaAdapter = qpCollector.collect(scanOp, new TableId("students"), ExecutionContext.of(1051L));
+        List<StoredRecord> viaAdapter = qpCollector.collect(scanOp, new TableId("students"), grantedContext(1051L));
         assertEquals(3, viaAdapter.size(), "MutationTargetCollector.withQpStorage must collect all 3 records");
     }
 
@@ -592,7 +598,7 @@ public class QP3TestDriver {
                 collector,
                 mutations);
 
-        ExecutionContext ctx = ExecutionContext.of(106L);
+        ExecutionContext ctx = grantedContext(106L);
         long deletedCount = deleteExec.execute(ctx);
         assertEquals(1L, deletedCount, "DeleteExecutor should delete exactly 1 matching row (Bob)");
         assertEquals(2, storage.recordCount("students"), "2 records (Alice & Charlie) must remain in storage");
@@ -633,7 +639,7 @@ public class QP3TestDriver {
                 new DeleteSpec("students"),
                 collector,
                 mutations);
-        long deletedAll = deleteAllExec.execute(ExecutionContext.of(1062L));
+        long deletedAll = deleteAllExec.execute(grantedContext(1062L));
         assertEquals(2L, deletedAll, "Unfiltered DELETE must delete all remaining 2 rows");
         assertEquals(0, storage.recordCount("students"), "Table must have 0 rows after unfiltered DELETE");
         deleteAllExec.close();

@@ -246,9 +246,9 @@ public final class QueryProcessor implements IQueryProcessor {
                 session.getCurrentTxId().ifPresent(this::abortQuietly);
                 session.clearTransaction();
             }
+            sessions.removeClosed(sessionId);
         } finally {
             session.unlockExecution();
-            sessions.removeClosed(sessionId);
         }
     }
 
@@ -336,7 +336,14 @@ public final class QueryProcessor implements IQueryProcessor {
             if (concurrencyAdapter != null) {
                 concurrencyAdapter.registerExternalTransaction(txId);
             }
-            if (access != null && plan != null && access.isTransactionActive(new TxId(txId))) {
+            if (access != null) {
+                if (!access.isTransactionActive(new TxId(txId))) {
+                    throw new QpException(ErrorCode.INVALID_STATE, "Execution requires an active transaction");
+                }
+                context = new ExecutionContext(txId, Optional.empty(), true,
+                        new java.util.concurrent.atomic.AtomicLong(), access.cancellationToken(new TxId(txId)));
+                translator.validate(PreparedStatement.of(plan));
+                access.acquireCatalog(isSchemaStatement(plan.root().kind().name()), context);
                 access.acquireAll(PreparedStatement.of(plan), context);
             }
             return planExecutor.execute(plan, context);
@@ -370,10 +377,18 @@ public final class QueryProcessor implements IQueryProcessor {
             if (parsed.transactionCommand().isPresent()) {
                 return runTransactionCommand(session, parsed.transactionCommand().get().action());
             }
+            boolean schemaStatement = isSchemaStatement(parsed.statementType().name());
+            if (schemaStatement && session.isExplicitTransaction()) {
+                throw new QpException(ErrorCode.INVALID_STATE, "DDL is not allowed within an explicit transaction");
+            }
+            ExecutionContext ctx = transactions.ensureTransaction(session);
+            context = Optional.of(ctx);
+            access.acquireCatalog(schemaStatement, ctx);
+            // Binding errors leave explicit transactions usable; implicit transactions still need cleanup.
+            if (!ctx.implicit) context = Optional.empty();
             QueryPlan plan = optimizer.optimizeQuery(parsed);
             PreparedStatement prepared = PreparedStatement.of(sql, plan);
             validateStatementPolicy(prepared, session);
-            ExecutionContext ctx = transactions.ensureTransaction(session);
             context = Optional.of(ctx);
             ExecutionSummary summary = executePrepared(prepared, ctx, sink);
             transactions.finishImplicit(session, ctx);
@@ -394,6 +409,9 @@ public final class QueryProcessor implements IQueryProcessor {
             case COMMIT: {
                 long txId = requireExplicitTransaction(session, "COMMIT");
                 TransactionState st = transactions.commit(session);
+                if (st == TransactionState.PARTIALLY_COMMITTED) {
+                    throw new QpException(ErrorCode.INVALID_STATE, "Commit outcome unknown. Recovery required.");
+                }
                 if (st != TransactionState.COMMITTED) {
                     return new Outcome(ExecutionSummary.failure(new ErrorInfo(
                             ErrorCode.TRANSACTION_ABORTED, ComponentType.CCM,
@@ -405,6 +423,9 @@ public final class QueryProcessor implements IQueryProcessor {
             default: {
                 long txId = requireExplicitTransaction(session, "ABORT");
                 TransactionState st = transactions.abort(session, "User ABORT");
+                if (st == TransactionState.PARTIALLY_COMMITTED) {
+                    throw new QpException(ErrorCode.INVALID_STATE, "Commit outcome unknown. Recovery required.");
+                }
                 if (st != TransactionState.ABORTED) {
                     return new Outcome(ExecutionSummary.failure(new ErrorInfo(
                             ErrorCode.INVALID_STATE, ComponentType.CCM,
@@ -413,6 +434,10 @@ public final class QueryProcessor implements IQueryProcessor {
                 return transactionOutcome(txId, TransactionStatus.ABORTED, "ABORT: ABORTED");
             }
         }
+    }
+
+    private static boolean isSchemaStatement(String kind) {
+        return kind.equals("CREATE_INDEX") || kind.equals("CREATE_TABLE") || kind.equals("DROP_TABLE");
     }
 
     private Outcome transactionOutcome(long txId, TransactionStatus status, String message) {
