@@ -3,6 +3,7 @@ package sqlike.frm;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -42,7 +43,9 @@ public class RecoveryTest {
         run("AC-6 no-force and steal data states", RecoveryTest::testAC6_DataCorrectnessOnDisk);
         run("AC-7 torn tail and middle corruption", RecoveryTest::testAC7_LogDamageHandling);
         run("AC-8 repeated restart idempotence", RecoveryTest::testAC8_IdempotentRestart);
+        run("recovery retry after interrupted undo", RecoveryTest::testInterruptedUndoRetry);
         run("AC-9 fail-stop after recovery failure", RecoveryTest::testAC9_FailStopOnError);
+        run("WAL failure keeps WAL_FAILURE code", RecoveryTest::testWalFailureCode);
 
         System.out.printf("%n=== HASIL AKHIR: %d PASSED, %d FAILED ===%n", passed, failed);
         if (failed > 0) {
@@ -346,10 +349,14 @@ public class RecoveryTest {
             RecoveryPlan plan = new RecoveryAnalyzer().analyze(beforeCrash);
             check(plan.committedTx.contains(1L),
                     "AC-3 committed state", "COMMIT record classifies T1 as committed");
-            check(plan.needsAbortTx.contains(2L) && !plan.committedTx.contains(2L),
+            check(plan.uncommittedTx.contains(2L)
+                            && plan.needsAbortTx.contains(2L)
+                            && !plan.committedTx.contains(2L),
                     "AC-3 unfinished state", "T2 has no terminal record and needs recovery abort");
             check(countType(beforeCrash, 3, LogType.ABORT) == 1
                             && countType(beforeCrash, 3, LogType.COMPENSATION) == 1
+                            && plan.abortedTx.contains(3L)
+                            && !plan.uncommittedTx.contains(3L)
                             && !plan.needsAbortTx.contains(3L),
                     "AC-3 completed-abort state", "T3 has durable compensation and ABORT, unlike T2");
 
@@ -661,30 +668,151 @@ public class RecoveryTest {
         }
     }
 
+    private static void testInterruptedUndoRetry() throws Exception {
+        Path dir = createTempDir();
+        FailureRecoveryManager writer = null;
+        FailureRecoveryManager interrupted = null;
+        FailureRecoveryManager restarted = null;
+        try {
+            MockStorageManager sm = new MockStorageManager(dir);
+            writer = open(sm, new MockCCM(), dir.resolve("wal.log"));
+            writer.recover();
+
+            RID firstRid = new RID(new PageId("account", 0), 0);
+            RID secondRid = new RID(new PageId("account", 0), 1);
+            writer.logBegin(1);
+            logAndApply(writer, sm, 1, insert(firstRid, 1));
+            logAndApply(writer, sm, 1, insert(secondRid, 2));
+            sm.flushAll();
+            close(writer);
+            writer = null;
+
+            FailingWriteStorageManager failingSm = new FailingWriteStorageManager(dir, 2);
+            interrupted = open(failingSm, new MockCCM(), dir.resolve("wal.log"));
+            boolean failedDuringUndo = false;
+            try {
+                interrupted.recover();
+            } catch (FrmException error) {
+                failedDuringUndo = error.getCode() == ErrorCode.RECOVERY_FAILURE
+                        && error.getMessage().contains("UNDO_FAILED");
+            }
+            List<LogRecord> partialLogs = interrupted.readLogs(Optional.of(1L));
+            check(failedDuringUndo && interrupted.getState() == RecoveryState.FAILED,
+                    "mid-undo interruption", "a write failure stops recovery and marks the facade FAILED");
+            check(countType(partialLogs, 1, LogType.COMPENSATION) == 2
+                            && countType(partialLogs, 1, LogType.ABORT) == 0,
+                    "mid-undo durable progress", "both CLR records are durable but ABORT is not yet logged");
+            close(interrupted);
+            interrupted = null;
+
+            MockStorageManager sm2 = new MockStorageManager(dir);
+            restarted = open(sm2, new MockCCM(), dir.resolve("wal.log"));
+            restarted.recover();
+            List<LogRecord> recoveredLogs = restarted.readLogs(Optional.of(1L));
+            check(integerAt(sm2, firstRid) == null && integerAt(sm2, secondRid) == null,
+                    "mid-undo retry result", "restart completes every undo despite the prior interruption");
+            check(countType(recoveredLogs, 1, LogType.COMPENSATION) == 2
+                            && countType(recoveredLogs, 1, LogType.ABORT) == 1,
+                    "mid-undo retry log", "retry reuses existing CLRs and writes exactly one ABORT");
+        } finally {
+            close(restarted);
+            close(interrupted);
+            close(writer);
+            cleanup(dir);
+        }
+    }
+
     private static void testAC9_FailStopOnError() throws Exception {
         Path dir = createTempDir();
-        FailureRecoveryManager frm = null;
+        FailureRecoveryManager writer = null;
+        FailureRecoveryManager failedRecovery = null;
+        FailureRecoveryManager restarted = null;
         try {
-            FailingFlushStorageManager sm = new FailingFlushStorageManager(dir);
-            frm = open(sm, new MockCCM(), dir.resolve("wal.log"));
-            FailureRecoveryManager manager = frm;
+            Path walPath = dir.resolve("wal.log");
+            MockStorageManager sm = new MockStorageManager(dir);
+            writer = open(sm, new MockCCM(), walPath);
+            writer.recover();
+            RID rid = new RID(new PageId("account", 0), 0);
+            writer.logBegin(1);
+            logAndApply(writer, sm, 1, insert(rid, 1));
+            sm.flushAll();
+            close(writer);
+            writer = null;
 
-            boolean recoveryFailed = false;
+            FailingFlushStorageManager failingSm = new FailingFlushStorageManager(dir);
+            failedRecovery = open(failingSm, new MockCCM(), walPath);
+            FailureRecoveryManager manager = failedRecovery;
+            FrmException failure = null;
             try {
-                frm.recover();
+                failedRecovery.recover();
             } catch (FrmException error) {
-                recoveryFailed = error.getCode() == ErrorCode.RECOVERY_FAILURE;
+                failure = error;
             }
-            check(recoveryFailed, "AC-9 injected recovery error",
-                    "an injected Storage Manager flush failure makes recover() fail");
-            check(frm.getState() == RecoveryState.FAILED,
+            check(failure != null && failure.getCode() == ErrorCode.RECOVERY_FAILURE
+                            && failure.getMessage().contains("FLUSH_FAILED"),
+                    "AC-9 injected recovery error",
+                    "a final Storage Manager flush error is reported with its phase and recovery code");
+            check(failedRecovery.getState() == RecoveryState.FAILED,
                     "AC-9 failed state", "FRM remains FAILED after recovery failure");
-            check(rejectedAsNotReady(() -> manager.logBegin(1)),
+            check(rejectedAsNotReady(() -> manager.logBegin(2)),
                     "AC-9 BEGIN rejected", "new transactions cannot begin after recovery failure");
             check(rejectedAsNotReady(() -> manager.logCommit(1)),
                     "AC-9 COMMIT rejected", "COMMIT is rejected after recovery failure too");
+            List<LogRecord> failedLogs = failedRecovery.readLogs(Optional.of(1L));
+            check(countType(failedLogs, 1, LogType.COMPENSATION) == 1
+                            && countType(failedLogs, 1, LogType.ABORT) == 1,
+                    "AC-9 durable partial progress", "failure occurs after CLR and ABORT are durable");
+            close(failedRecovery);
+            failedRecovery = null;
+
+            MockStorageManager sm2 = new MockStorageManager(dir);
+            restarted = open(sm2, new MockCCM(), walPath);
+            restarted.recover();
+            List<LogRecord> recoveredLogs = restarted.readLogs(Optional.of(1L));
+            check(integerAt(sm2, rid) == null
+                            && countType(recoveredLogs, 1, LogType.COMPENSATION) == 1
+                            && countType(recoveredLogs, 1, LogType.ABORT) == 1,
+                    "AC-9 restart after failure",
+                    "a fresh recovery completes the durable abort without duplicate log records");
+        } finally {
+            close(restarted);
+            close(failedRecovery);
+            close(writer);
+            cleanup(dir);
+        }
+    }
+
+    private static void testWalFailureCode() throws Exception {
+        Path dir = createTempDir();
+        FailureRecoveryManager frm = null;
+        LogManager closedLog = null;
+        try {
+            Path walPath = dir.resolve("wal.log");
+            closedLog = new LogManager(walPath.toString());
+            closedLog.close();
+
+            MockStorageManager sm = new MockStorageManager(dir);
+            FrmConfig config = FrmConfig.defaults(walPath)
+                    .withCheckpointInterval(Duration.ZERO);
+            frm = new FailureRecoveryManager(sm, new MockCCM(), config, closedLog);
+            sm.setWal(frm::ensureDurable);
+
+            FrmException failure = null;
+            try {
+                frm.recover();
+            } catch (FrmException error) {
+                failure = error;
+            }
+            check(failure != null && failure.getCode() == ErrorCode.WAL_FAILURE,
+                    "WAL failure code", "a WAL access failure during recovery remains WAL_FAILURE");
+            check(failure != null && failure.getMessage().contains("LOG_READ_FAILED")
+                            && frm.getState() == RecoveryState.FAILED,
+                    "WAL failure context", "the public error includes the failed recovery phase");
         } finally {
             close(frm);
+            if (closedLog != null) {
+                closedLog.close();
+            }
             cleanup(dir);
         }
     }
@@ -697,6 +825,26 @@ public class RecoveryTest {
         @Override
         public synchronized void flushAll() {
             throw new IllegalStateException("injected flush failure for AC-9");
+        }
+    }
+
+    private static final class FailingWriteStorageManager extends MockStorageManager {
+        private final int failOnWrite;
+        private int writes;
+
+        private FailingWriteStorageManager(Path dataDir, int failOnWrite) {
+            super(dataDir);
+            this.failOnWrite = failOnWrite;
+        }
+
+        @Override
+        public synchronized void writeAt(
+                String table, RID rid, RecordImage image, long lsn) {
+            writes++;
+            if (writes == failOnWrite) {
+                throw new IllegalStateException("injected recovery write failure");
+            }
+            super.writeAt(table, rid, image, lsn);
         }
     }
 
