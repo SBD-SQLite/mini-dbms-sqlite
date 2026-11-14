@@ -137,9 +137,11 @@ public final class StorageManager implements IStorageManager {
     @Override
     public synchronized void createTable(TableSchema schema) throws StorageException {
         if (schema == null) throw new StorageException(StorageErrorCode.INVALID_VALUE, "Schema must not be null");
-        if (schema.tableId() == null || !FILE_ID.matcher(schema.tableId()).matches()) {
-            throw new StorageException(StorageErrorCode.INVALID_VALUE,
-                    "tableId must contain only letters, digits, '_' or '-': " + schema.tableId());
+        if (schema.tableId() == null || schema.tableId().isBlank()) {
+            schema = new TableSchema(catalog.generateTableId(schema.tableName()), schema.tableName(), schema.columns(), schema.primaryKey(), schema.foreignKeys());
+        }
+        if (!FILE_ID.matcher(schema.tableId()).matches()) {
+            throw new StorageException(StorageErrorCode.INVALID_VALUE,  "tableId must contain only letters, digits, '_' or '-': " + schema.tableId());
         }
         catalog.checkForeignKeyTargets(schema);
         Map<String, TableSchema> savedSchemas = catalog.snapshotSchemas();
