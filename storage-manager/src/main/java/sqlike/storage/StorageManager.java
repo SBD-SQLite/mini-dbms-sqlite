@@ -56,17 +56,17 @@ public final class StorageManager implements IStorageManager {
 
     @Override
     public RecordCursor scan(String table) throws StorageException {
-        return null;
+        return records.scan(table);
     }
 
     @Override
     public Optional<Record> fetch(String table, RID rid) throws StorageException {
-        return Optional.empty();
+        return records.fetch(table, rid);
     }
 
     @Override
     public InsertReservation reserveInsert(String table, List<Value> values) throws StorageException {
-        return null;
+        return records.reserveInsert(table, values);
     }
 
     @Override
@@ -90,6 +90,7 @@ public final class StorageManager implements IStorageManager {
 
     @Override
     public void releaseReservation(InsertReservation reservation) throws StorageException {
+        records.releaseReservation(reservation);
     }
 
     @Override
@@ -115,6 +116,7 @@ public final class StorageManager implements IStorageManager {
 
     @Override
     public void createIndex(IndexMetadata definition) throws StorageException {
+        indexes.createIndex(definition);
     }
 
     @Override
@@ -129,7 +131,7 @@ public final class StorageManager implements IStorageManager {
 
     @Override
     public List<RID> lookupIndex(String name, IndexCondition condition) throws StorageException {
-        return List.of();
+        return indexes.lookup(name, condition);
     }
 
     public void setBlockManager(BlockManager blocks) {
@@ -222,9 +224,14 @@ public final class StorageManager implements IStorageManager {
 
     @Override
     public void flushAll() throws StorageException {
+        indexes.flushAll();
+        buffer.flushAll();
+        catalog.save();
     }
 
     @Override
     public void close() throws StorageException {
+        flushAll();
+        buffer.close();
     }
 }
