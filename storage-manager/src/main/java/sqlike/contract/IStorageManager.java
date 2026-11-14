@@ -30,6 +30,8 @@ public interface IStorageManager {
 
     void delete(String table, RID rid, long lsn) throws StorageException;
 
+    int clearTable(String table) throws StorageException;
+
     void releaseReservation(InsertReservation reservation) throws StorageException;
 
     void restoreRecord(String table, RID rid, RecordImage image, long lsn) throws StorageException;
