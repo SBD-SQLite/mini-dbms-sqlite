@@ -209,6 +209,7 @@ public final class QO1Test {
                 check(text.contains("LIMIT " + n), text);
             }
         });
+        runDdlTests();
         test("empty input is rejected", () -> error(ErrorCode.SYNTAX_ERROR, () -> QO.parseQuery("   ")));
         test("syntax errors never reach the catalog", () -> {
             int[] calls = {0};
@@ -282,6 +283,120 @@ public final class QO1Test {
     }
 
     /** {before, after} costs parsed from explainQuery output (the first two "Estimated cost:" lines). */
+    // ---- DdlValidator (CREATE TABLE / DROP TABLE); the parser for these does not exist yet, so plans are built by hand ----
+
+    private static final ColumnSchema INT_ID = new ColumnSchema("id", DataType.INTEGER, Optional.empty());
+
+    private static ColumnSchema col(String name, DataType type, Integer length) {
+        return new ColumnSchema(name, type, Optional.ofNullable(length));
+    }
+
+    /** Catalog with PK/FK: dept(PK dept_id), Students(PK id, FK dept_id -> dept), emp(PK id, FK boss -> emp.id). Only listTables/getSchema are allowed. */
+    private static sqlike.contract.IStorageManager ddlCatalog() {
+        List<TableSchema> tables = List.of(
+                new TableSchema("t1", "dept", List.of(col("dept_id", DataType.INTEGER, null), col("dname", DataType.CHAR, 10)),
+                        List.of("dept_id"), List.of()),
+                new TableSchema("t2", "Students", List.of(INT_ID, col("name", DataType.VARCHAR, 20), col("dept_id", DataType.INTEGER, null)),
+                        List.of("id"), List.of(new ForeignKeySpec(List.of("dept_id"), "dept", List.of("dept_id")))),
+                new TableSchema("t3", "emp", List.of(INT_ID, col("boss", DataType.INTEGER, null)),
+                        List.of("id"), List.of(new ForeignKeySpec(List.of("boss"), "emp", List.of("id")))));
+        return (sqlike.contract.IStorageManager) java.lang.reflect.Proxy.newProxyInstance(
+                QO1Test.class.getClassLoader(), new Class<?>[] { sqlike.contract.IStorageManager.class },
+                (proxy, method, args) -> switch (method.getName()) {
+                    case "listTables" -> tables.stream().map(TableSchema::tableName).toList();
+                    case "getSchema" -> tables.stream().filter(t -> t.tableName().equalsIgnoreCase((String) args[0])).findFirst().orElseThrow();
+                    default -> throw new UnsupportedOperationException("DDL validation must not call " + method.getName());
+                });
+    }
+
+    private static PlanNode create(String table, List<ColumnSchema> columns, List<String> pk, List<ForeignKeySpec> fks) {
+        return PlanNodes.createTable(new CreateTableSpec(table, columns, pk, fks));
+    }
+
+    private static PlanNode drop(String table, DropBehavior behavior) {
+        return PlanNodes.dropTable(new DropTableSpec(table, behavior));
+    }
+
+    private static void runDdlTests() {
+        QueryOptimizer ddl = new QueryOptimizer(ddlCatalog());
+        DdlValidator validator = new DdlValidator();
+        List<ColumnSchema> ok = List.of(INT_ID, col("name", DataType.VARCHAR, 30), col("score", DataType.FLOAT, null), col("code", DataType.CHAR, 4));
+        ForeignKeySpec toDept = new ForeignKeySpec(List.of("id"), "DEPT", List.of("dept_id"));
+
+        test("DDL: valid CREATE TABLE (plain, PK, FK incl. other-case and self reference) passes through at cost 0", () -> {
+            List<PlanNode> valid = List.of(
+                    create("courses", ok, List.of(), List.of()),
+                    create("courses", ok, List.of("ID", "code"), List.of()),
+                    create("courses", ok, List.of("id"), List.of(toDept)),
+                    create("courses", ok, List.of("id"), List.of(new ForeignKeySpec(List.of("id"), "Students", List.of("id")))),
+                    create("tree", List.of(INT_ID, col("up", DataType.INTEGER, null)), List.of("id"),
+                            List.of(new ForeignKeySpec(List.of("up"), "TREE", List.of("id")))));
+            for (PlanNode plan : valid) {
+                QueryPlan result = ddl.optimizeQuery(new ParsedQuery(StatementType.CREATE_TABLE, Optional.of(plan), Optional.empty()));
+                eq(PlanNodeKind.CREATE_TABLE, result.root().kind());
+                eq(plan.createTable(), result.root().createTable());
+                eq(0.0, result.estimatedCost());
+                eq(0.0, ddl.getCost(result));
+            }
+        });
+        Object[][] bad = {
+                { "table already exists", create("dept", ok, List.of(), List.of()) },
+                { "table already exists, other case", create("STUDENTS", ok, List.of(), List.of()) },
+                { "no columns", create("t", List.of(), List.of(), List.of()) },
+                { "duplicate column", create("t", List.of(INT_ID, col("name", DataType.CHAR, 5), col("id", DataType.FLOAT, null)), List.of(), List.of()) },
+                { "duplicate column, other case", create("t", List.of(INT_ID, col("ID", DataType.INTEGER, null)), List.of(), List.of()) },
+                { "CHAR without length", create("t", List.of(col("c", DataType.CHAR, null)), List.of(), List.of()) },
+                { "VARCHAR without length", create("t", List.of(col("c", DataType.VARCHAR, null)), List.of(), List.of()) },
+                { "VARCHAR length 0", create("t", List.of(col("c", DataType.VARCHAR, 0)), List.of(), List.of()) },
+                { "CHAR negative length", create("t", List.of(col("c", DataType.CHAR, -3)), List.of(), List.of()) },
+                { "INTEGER with length", create("t", List.of(col("c", DataType.INTEGER, 4)), List.of(), List.of()) },
+                { "FLOAT with length", create("t", List.of(col("c", DataType.FLOAT, 8)), List.of(), List.of()) },
+                { "PK column missing", create("t", ok, List.of("nope"), List.of()) },
+                { "PK column duplicated", create("t", ok, List.of("id", "ID"), List.of()) },
+                { "FK local column missing", create("t", ok, List.of(), List.of(new ForeignKeySpec(List.of("nope"), "dept", List.of("dept_id")))) },
+                { "FK column count mismatch", create("t", ok, List.of(), List.of(new ForeignKeySpec(List.of("id", "code"), "dept", List.of("dept_id")))) },
+                { "FK referenced table missing", create("t", ok, List.of(), List.of(new ForeignKeySpec(List.of("id"), "ghost", List.of("id")))) },
+                { "FK referenced column missing", create("t", ok, List.of(), List.of(new ForeignKeySpec(List.of("id"), "dept", List.of("nope")))) },
+                { "FK type mismatch", create("t", ok, List.of(), List.of(new ForeignKeySpec(List.of("name"), "dept", List.of("dept_id")))) },
+                { "self FK referenced column missing", create("t", ok, List.of(), List.of(new ForeignKeySpec(List.of("id"), "t", List.of("nope")))) },
+        };
+        for (Object[] violation : bad) {
+            PlanNode plan = (PlanNode) violation[1];
+            test("DDL: CREATE TABLE rejected - " + violation[0], () -> {
+                error(ErrorCode.SEMANTIC_ERROR, () -> validator.validate(plan, ddlCatalog()));
+                error(ErrorCode.SEMANTIC_ERROR, () -> ddl.optimizeQuery(new ParsedQuery(StatementType.CREATE_TABLE, Optional.of(plan), Optional.empty())));
+            });
+        }
+
+        test("DDL: DROP TABLE of an unknown table is rejected, for RESTRICT and CASCADE", () -> {
+            for (DropBehavior b : DropBehavior.values())
+                error(ErrorCode.SEMANTIC_ERROR, () -> validator.validate(drop("ghost", b), ddlCatalog()));
+        });
+        test("DDL: DROP RESTRICT is rejected when another table's FK references it; CASCADE is accepted", () -> {
+            error(ErrorCode.SEMANTIC_ERROR, () -> validator.validate(drop("dept", DropBehavior.RESTRICT), ddlCatalog()));
+            error(ErrorCode.SEMANTIC_ERROR, () -> validator.validate(drop("DEPT", DropBehavior.RESTRICT), ddlCatalog()));
+            error(ErrorCode.SEMANTIC_ERROR, () -> ddl.optimizeQuery(new ParsedQuery(StatementType.DROP_TABLE,
+                    Optional.of(drop("dept", DropBehavior.RESTRICT)), Optional.empty())));
+            eq(DropBehavior.CASCADE, validator.validate(drop("dept", DropBehavior.CASCADE), ddlCatalog()).dropTable().orElseThrow().behavior());
+        });
+        test("DDL: DROP RESTRICT of an unreferenced or only self-referenced table passes, at cost 0 with the catalog spelling", () -> {
+            for (String name : new String[] { "students", "STUDENTS", "Students" }) {
+                QueryPlan result = ddl.optimizeQuery(new ParsedQuery(StatementType.DROP_TABLE,
+                        Optional.of(drop(name, DropBehavior.RESTRICT)), Optional.empty()));
+                eq(PlanNodeKind.DROP_TABLE, result.root().kind());
+                eq("Students", result.root().dropTable().orElseThrow().tableName());
+                eq(0.0, result.estimatedCost());
+                eq(0.0, ddl.getCost(result));
+            }
+            eq("emp", validator.validate(drop("EMP", DropBehavior.RESTRICT), ddlCatalog()).dropTable().orElseThrow().tableName());
+        });
+        test("DDL: DdlValidator rejects non-DDL plans and the Binder still reports DDL as unsupported", () -> {
+            error(ErrorCode.INVALID_STATE, () -> validator.validate(PlanNodes.scan("dept"), ddlCatalog()));
+            error(ErrorCode.UNSUPPORTED_OPERATION, () -> new Binder(ddlCatalog()).bind(
+                    new ParsedQuery(StatementType.DROP_TABLE, Optional.of(drop("dept", DropBehavior.CASCADE)), Optional.empty())));
+        });
+    }
+
     private static void collectAliases(PlanNode node, List<String> out) {
         node.scan().flatMap(ScanSpec::alias).ifPresent(out::add);
         node.children().forEach(child -> collectAliases(child, out));

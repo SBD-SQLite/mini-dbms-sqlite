@@ -2,6 +2,7 @@ package sqlike.qo;
 
 import sqlike.contract.IQueryOptimizer;
 import sqlike.contract.IStorageManager;
+import java.util.Optional;
 import sqlike.shared.*;
 
 public class QueryOptimizer implements IQueryOptimizer {
@@ -14,6 +15,8 @@ public class QueryOptimizer implements IQueryOptimizer {
     private final CostModel costModel;
     private final PlanPrinter printer;
     private final PlanAnnotator annotator;
+    private final IStorageManager storage;
+    private final DdlValidator ddlValidator;
 
     public QueryOptimizer(IStorageManager storage) {
         this(storage, 3);
@@ -24,6 +27,8 @@ public class QueryOptimizer implements IQueryOptimizer {
         ExpressionParser expr = new ExpressionParser();
         this.lexer = new Lexer();
         this.queryParser = new QueryParser(new SelectParser(expr), new StatementParser());
+        this.storage = storage;
+        this.ddlValidator = new DdlValidator();
         this.binder = new Binder(storage);
         this.selectionProjectionRewriter = new SelectionProjectionRewriter();
         this.costModel = new CostModel(storage, bufferBlocks);
@@ -45,6 +50,9 @@ public class QueryOptimizer implements IQueryOptimizer {
         StatementType st = query.statementType();
         if (st == StatementType.BEGIN || st == StatementType.COMMIT || st == StatementType.ABORT)
             throw QoErrors.invalidState("transaction statements are not optimized (" + st + ")");
+        // CREATE/DROP TABLE: validated against the catalog by DdlValidator (the Binder does not bind DDL), then passed through at cost 0.
+        Optional<PlanNode> ddl = query.root().filter(QueryOptimizer::isPassThrough);
+        if (ddl.isPresent()) return new QueryPlan(ddlValidator.validate(ddl.get(), storage), 0.0);
         PlanNode bound = binder.bind(query);
         if (isPassThrough(bound)) return new QueryPlan(bound, 0.0);
         PlanNode rewritten = selectionProjectionRewriter.rewrite(bound);
@@ -75,8 +83,8 @@ public class QueryOptimizer implements IQueryOptimizer {
         if (parsed.transactionCommand().isPresent())
             return "TRANSACTION " + parsed.transactionCommand().get().action() + " (not optimized)\n";
         QueryPlan plan = optimizeQuery(parsed);
-        PlanNode bound = binder.bind(parsed);
         if (isPassThrough(plan.root())) return printer.printNotOptimized(plan.root(), plan.estimatedCost());
+        PlanNode bound = binder.bind(parsed);
         // "Before" is the Binder result (qualified, catalog-checked), not the raw parser tree.
         double costBefore = costModel.getCost(bound);
         return printer.printBeforeAfter(annotator.annotate(bound), costBefore,
