@@ -58,12 +58,12 @@ public class SampleDatabaseLoader {
 
     public void loadSampleData() throws StorageException {
         Map<String, List<List<Value>>> rows = sampleRows();
-        long lsn = 1; // offline load: no WAL, LSN only needs to be positive and increasing
+        final long lsn = 1;
         for (TableSchema schema : sampleSchemas()) {
             if (storage.getStatistics(schema.tableName()).recordCount() > 0) continue;
             for (List<Value> row : rows.get(schema.tableName())) {
                 InsertReservation reservation = storage.reserveInsert(schema.tableName(), row);
-                storage.insert(reservation, lsn++);
+                storage.insert(reservation, lsn);
             }
         }
     }

@@ -252,8 +252,18 @@ public final class StorageManager implements IStorageManager {
 
         if (statistics != null) statistics.forget(root.tableName());
         BlockManager files = blocks != null ? blocks : statistics == null ? null : statistics.getBlocks();
-        if (files == null) return;
         StorageException failure = null;
+        if (buffer != null) {
+            try {
+                buffer.truncateTable(root.tableId());
+            } catch (StorageException e) {
+                failure = e;
+            }
+        }
+        if (files == null) {
+            if (failure != null) throw failure;
+            return;
+        }
         List<String> ids = new ArrayList<>(indexFileIds);
         ids.add(root.tableId());
         for (String id : ids) {
@@ -274,6 +284,7 @@ public final class StorageManager implements IStorageManager {
 
     public synchronized void onSnapshotRestored() throws StorageException {
         catalog.load();
+        if (buffer != null) buffer.invalidateAll();
         if (statistics != null) {
             statistics.reset();
             statistics.recomputeAll();
