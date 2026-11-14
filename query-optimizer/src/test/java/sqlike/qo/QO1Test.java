@@ -138,7 +138,7 @@ public final class QO1Test {
         errorAt("SELEC * FROM t", ErrorCode.SYNTAX_ERROR, 0);
         errorAt("SELECT * FORM t", ErrorCode.SYNTAX_ERROR, 9);
         errorAt("SELECT a FROM t WHERE x = 1 2", ErrorCode.SYNTAX_ERROR, 28);
-        errorAt("SELECT a FROM t alias", ErrorCode.UNSUPPORTED_OPERATION, 16);
+        errorAt("SELECT a FROM t alias", ErrorCode.SYNTAX_ERROR, 16);
         errorAt("SELECT * FROM a LEFT JOIN b ON a.x = b.x", ErrorCode.UNSUPPORTED_OPERATION, 16);
         errorAt("SELECT * FROM a RIGHT JOIN b ON a.x = b.x", ErrorCode.UNSUPPORTED_OPERATION, 16);
         errorAt("SELECT * FROM a LEFT OUTER JOIN b ON a.x = b.x", ErrorCode.UNSUPPORTED_OPERATION, 16);
@@ -154,11 +154,61 @@ public final class QO1Test {
                 }
             }
         });
-        test("table alias message is unchanged", () -> {
+        test("alias without AS is a syntax error that says AS is required", () -> {
             try { QO.parseQuery("SELECT a FROM t alias"); throw new AssertionError("expected error"); }
-            catch (QoException e) { check(e.getMessage().contains("table alias"), e.getMessage()); }
+            catch (QoException e) { eq(ErrorCode.SYNTAX_ERROR, e.getInfo().code()); check(e.getMessage().contains("requires AS"), e.getMessage()); }
         });
         errorAt("SELECT a FROM t WHERE x = 1 OR y = 2", ErrorCode.UNSUPPORTED_OPERATION, 28);
+        test("LIMIT parses to LIMIT(PROJECT(SORT(FILTER(SCAN)))) and LIMIT 0 is valid", () -> {
+            PlanNode root = QO.parseQuery("SELECT name FROM students WHERE id > 1 ORDER BY name LIMIT 5").root().orElseThrow();
+            PlanNodes.validate(root);
+            eq(PlanNodeKind.LIMIT, root.kind());
+            eq(5L, root.limit().orElseThrow().count());
+            eq(PlanNodeKind.PROJECT, root.children().get(0).kind());
+            eq(PlanNodeKind.SORT, root.children().get(0).children().get(0).kind());
+            eq(PlanNodeKind.FILTER, root.children().get(0).children().get(0).children().get(0).kind());
+            eq(0L, QO.parseQuery("SELECT * FROM students LIMIT 0").root().orElseThrow().limit().orElseThrow().count());
+            eq(7L, QO.parseQuery("SELECT * FROM students limit 7;").root().orElseThrow().limit().orElseThrow().count());
+        });
+        errorAt("SELECT * FROM students LIMIT -1", ErrorCode.SYNTAX_ERROR, 29);
+        errorAt("SELECT * FROM students LIMIT 1.5", ErrorCode.SYNTAX_ERROR, 29);
+        errorAt("SELECT * FROM students LIMIT x", ErrorCode.SYNTAX_ERROR, 29);
+        errorAt("SELECT * FROM students LIMIT", ErrorCode.SYNTAX_ERROR, 28);
+        errorAt("SELECT * FROM students LIMIT 5 6", ErrorCode.SYNTAX_ERROR, 31);
+        errorAt("SELECT * FROM students LIMIT 99999999999999999999", ErrorCode.INVALID_VALUE, 29);
+        errorAt("SELECT * FROM students LIMIT 5 ORDER BY id", ErrorCode.SYNTAX_ERROR, 31);
+        errorAt("INSERT INTO students VALUES (1, 'a', 1.0, 1) LIMIT 1", ErrorCode.SYNTAX_ERROR, 45);
+        test("table alias with AS fills ScanSpec.alias in every FROM form", () -> {
+            for (String sql : new String[] {
+                    "SELECT * FROM students AS s",
+                    "SELECT * FROM students AS s, dept AS d",
+                    "SELECT * FROM students AS s JOIN dept AS d ON s.dept_id = d.dept_id",
+                    "SELECT * FROM students AS s NATURAL JOIN dept AS d" }) {
+                List<String> aliases = new ArrayList<>();
+                collectAliases(QO.parseQuery(sql).root().orElseThrow(), aliases);
+                check(aliases.contains("s"), sql + " -> " + aliases);
+                if (!sql.endsWith("AS s")) check(aliases.equals(List.of("s", "d")), sql + " -> " + aliases);
+            }
+            eq(List.of("s"), aliasesOf("SELECT s.id FROM students AS s WHERE s.id = 1"));
+        });
+        test("PlanPrinter shows LIMIT and table alias for parsed queries", () -> {
+            String text = new PlanPrinter().print(QO.parseQuery("SELECT s.id FROM students AS s LIMIT 3").root().orElseThrow());
+            eq("LIMIT 3\n  PROJECT [s.id]\n    SCAN students AS s [full scan]\n", text);
+        });
+        errorAt("SELECT id AS x FROM students", ErrorCode.UNSUPPORTED_OPERATION, 10);
+        errorAt("SELECT * FROM students AS", ErrorCode.SYNTAX_ERROR, 25);
+        errorAt("SELECT * FROM students AS WHERE", ErrorCode.SYNTAX_ERROR, 26);
+        test("LIMIT works end-to-end through optimizeQuery (LIMIT 5 and LIMIT 0)", () -> {
+            for (long n : new long[] { 5, 0 }) {
+                QueryPlan plan = QO.optimizeQuery(QO.parseQuery("SELECT name FROM students WHERE id > 10 ORDER BY name LIMIT " + n));
+                PlanNodes.validate(plan.root());
+                eq(PlanNodeKind.LIMIT, plan.root().kind());
+                eq(n, plan.root().limit().orElseThrow().count());
+                check(plan.estimatedCost() > 0 && plan.estimatedCost() == QO.getCost(plan), "cost=" + plan.estimatedCost());
+                String text = QO.explainQuery("SELECT name FROM students WHERE id > 10 ORDER BY name LIMIT " + n);
+                check(text.contains("LIMIT " + n), text);
+            }
+        });
         test("empty input is rejected", () -> error(ErrorCode.SYNTAX_ERROR, () -> QO.parseQuery("   ")));
         test("syntax errors never reach the catalog", () -> {
             int[] calls = {0};
@@ -232,6 +282,17 @@ public final class QO1Test {
     }
 
     /** {before, after} costs parsed from explainQuery output (the first two "Estimated cost:" lines). */
+    private static void collectAliases(PlanNode node, List<String> out) {
+        node.scan().flatMap(ScanSpec::alias).ifPresent(out::add);
+        node.children().forEach(child -> collectAliases(child, out));
+    }
+
+    private static List<String> aliasesOf(String sql) {
+        List<String> aliases = new ArrayList<>();
+        collectAliases(QO.parseQuery(sql).root().orElseThrow(), aliases);
+        return aliases;
+    }
+
     private static double[] explainCosts(String text) {
         java.util.regex.Matcher m = java.util.regex.Pattern.compile("Estimated cost: (\\S+)").matcher(text);
         double[] costs = new double[2];
