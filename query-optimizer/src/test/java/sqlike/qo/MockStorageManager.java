@@ -6,6 +6,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.OptionalLong;
 import sqlike.contract.IStorageManager;
 import sqlike.shared.*;
 
@@ -15,6 +17,10 @@ final class MockStorageManager {
     static IStorageManager create() { return create(List.of()); }
 
     static IStorageManager create(List<IndexMetadata> indexes) {
+        return create(indexes, Map.of());
+    }
+
+    static IStorageManager create(List<IndexMetadata> indexes, Map<String, IndexStatistics> indexStats) {
         Map<String, TableSchema> schemas = new LinkedHashMap<>();
         Map<String, TableStatistics> stats = new LinkedHashMap<>();
         add(schemas, stats, "students", List.of(
@@ -34,6 +40,13 @@ final class MockStorageManager {
                     case "getSchema" -> schemas.get(((String) args[0]).toLowerCase());
                     case "getStatistics" -> stats.get(((String) args[0]).toLowerCase());
                     case "getIndexes" -> indexes.stream().filter(i -> i.tableName().equalsIgnoreCase((String) args[0])).toList();
+                    case "getIndexStatistics" -> {
+                        String indexName = ((String) args[0]).toLowerCase();
+                        IndexMetadata definition = indexes.stream()
+                                .filter(i -> i.indexName().equalsIgnoreCase(indexName)).findFirst()
+                                .orElseThrow(() -> new IllegalArgumentException("unknown index " + indexName));
+                        yield indexStats.getOrDefault(indexName, defaultIndexStatistics(definition));
+                    }
                     default -> throw new UnsupportedOperationException(method.getName());
                 });
     }
@@ -42,6 +55,14 @@ final class MockStorageManager {
                             List<ColumnSchema> columns, TableStatistics statistics) {
         schemas.put(name, new TableSchema("t_" + name, name, columns));
         stats.put(name, statistics);
+    }
+
+    private static IndexStatistics defaultIndexStatistics(IndexMetadata definition) {
+        return definition.indexType() == IndexType.BPLUS_TREE
+                ? new IndexStatistics(OptionalInt.of(2), OptionalInt.empty(),
+                        OptionalLong.of(1), OptionalLong.empty(), false)
+                : new IndexStatistics(OptionalInt.empty(), OptionalInt.of(1), OptionalLong.empty(),
+                        OptionalLong.of(0), false);
     }
 
     private static ColumnSchema col(String name, DataType type, Integer maxLength) {

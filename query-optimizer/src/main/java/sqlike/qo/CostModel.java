@@ -3,11 +3,16 @@ package sqlike.qo;
 import sqlike.contract.IStorageManager;
 import sqlike.shared.Expression;
 import sqlike.shared.ExpressionKind;
+import sqlike.shared.IndexCondition;
 import sqlike.shared.IndexMetadata;
+import sqlike.shared.IndexOperator;
+import sqlike.shared.IndexStatistics;
+import sqlike.shared.IndexType;
 import sqlike.shared.JoinSpec;
 import sqlike.shared.MutationSpec;
 import sqlike.shared.PlanNode;
 import sqlike.shared.SubquerySpec;
+import sqlike.shared.ScanSpec;
 
 import java.util.function.Supplier;
 import sqlike.shared.TableStatistics;
@@ -106,11 +111,59 @@ public final class CostModel {
     }
 
     private double costIndexScan(PlanNode node) {
-        long dataBlocks = estimator.estimateBlocks(node);
-        // The contract has no index height/page count. Model one index-page access,
-        // then a random heap-page access for each distinct qualifying data page.
-        return SEEK_TIME_MS + TRANSFER_TIME_MS
-                + dataBlocks * (SEEK_TIME_MS + TRANSFER_TIME_MS);
+        ScanSpec scan = node.scan().orElseThrow();
+        String indexName = scan.indexName().orElseThrow();
+        IndexMetadata definition = storage.getIndexes(scan.tableName()).stream()
+                .filter(index -> index.indexName().equalsIgnoreCase(indexName))
+                .findFirst()
+                .orElseThrow(() -> QoErrors.semantic("unknown index '" + indexName + "'"));
+        IndexStatistics statistics = storage.getIndexStatistics(indexName);
+        if (statistics == null) throw QoErrors.invalidState("SM returned null statistics for index '" + indexName + "'");
+
+        long qualifyingRows = estimator.estimateRows(node);
+        double indexPages = estimateIndexPages(definition, statistics, scan, qualifyingRows);
+        long heapPages = statistics.clustered()
+                ? estimateClusteredHeapPages(scan.tableName(), qualifyingRows)
+                : estimator.estimateBlocks(node);
+        double heapCost = heapPages == 0 ? 0.0 : statistics.clustered()
+                ? SEEK_TIME_MS + heapPages * TRANSFER_TIME_MS
+                : heapPages * (SEEK_TIME_MS + TRANSFER_TIME_MS);
+        return indexPages * (SEEK_TIME_MS + TRANSFER_TIME_MS) + heapCost;
+    }
+
+    private double estimateIndexPages(IndexMetadata definition, IndexStatistics statistics,
+                                      ScanSpec scan, long qualifyingRows) {
+        if (definition.indexType() == IndexType.HASH) {
+            IndexCondition condition = scan.condition().orElseThrow();
+            if (condition.operator() != IndexOperator.EQ)
+                throw QoErrors.invalidState("HASH index scan only supports equality lookups");
+            int buckets = statistics.bucketCount().orElseThrow(
+                    () -> QoErrors.invalidState("SM omitted HASH bucket count for index '" + definition.indexName() + "'"));
+            if (buckets <= 0) throw QoErrors.invalidState("SM returned invalid HASH bucket count for index '" + definition.indexName() + "'");
+            double overflowPagesPerBucket = statistics.overflowPageCount().orElse(0L) / (double) buckets;
+            // One descriptor, one directory page, the target bucket, and average overflow chain.
+            return 3.0 + overflowPagesPerBucket;
+        }
+
+        int height = statistics.height().orElseThrow(
+                () -> QoErrors.invalidState("SM omitted B+Tree height for index '" + definition.indexName() + "'"));
+        long totalLeafPages = statistics.leafPageCount().orElseThrow(
+                () -> QoErrors.invalidState("SM omitted B+Tree leaf-page count for index '" + definition.indexName() + "'"));
+        if (height <= 0 || totalLeafPages <= 0)
+            throw QoErrors.invalidState("SM returned invalid B+Tree statistics for index '" + definition.indexName() + "'");
+
+        long tableRows = estimator.statisticsForTable(scan.tableName()).recordCount();
+        double fraction = tableRows <= 0 ? 0.0 : Math.min(1.0, qualifyingRows / (double) tableRows);
+        long leafPagesRead = qualifyingRows <= 0 ? 1
+                : Math.min(totalLeafPages, Math.max(1, (long) Math.ceil(totalLeafPages * fraction)));
+        // Height includes the first leaf reached; range scans continue across sibling leaves.
+        return 1.0 + height + Math.max(0, leafPagesRead - 1);
+    }
+
+    private long estimateClusteredHeapPages(String table, long qualifyingRows) {
+        if (qualifyingRows <= 0) return 0;
+        TableStatistics stats = estimator.statisticsForTable(table);
+        return ceilDiv(qualifyingRows, Math.max(1, stats.blockingFactor()));
     }
 
     private double costFilter(PlanNode node) {
