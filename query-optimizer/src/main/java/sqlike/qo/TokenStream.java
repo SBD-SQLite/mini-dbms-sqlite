@@ -39,7 +39,6 @@ public final class TokenStream {
     public void expectEndOfStatement() {
         matchSymbol(";");
         Token t = peek();
-        if (t.isKeyword(Keyword.LIMIT)) throw QoErrors.unsupported("LIMIT is not part of the agreed contract", t.offset());
         if (!t.isEof()) throw unexpected("unexpected token at end of statement");
     }
 

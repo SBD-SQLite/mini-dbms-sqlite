@@ -21,8 +21,10 @@ public class SelectParser {
         if (ts.peek().isKeyword(Keyword.ORDER)) node = PlanNodes.sort(node, parseOrderBy(ts));
         if (ts.peek().isKeyword(Keyword.GROUP) || ts.peek().isKeyword(Keyword.HAVING))
             throw QoErrors.unsupported("GROUP BY/HAVING are not part of the agreed contract", ts.peek().offset());
+        Optional<LimitSpec> limit = parseLimit(ts);
         ts.expectEndOfStatement();
         node = PlanNodes.project(node, columns);
+        if (limit.isPresent()) node = PlanNodes.limit(node, limit.get());
         return new ParsedQuery(StatementType.SELECT, Optional.of(node), Optional.empty());
     }
 
@@ -84,13 +86,27 @@ public class SelectParser {
         Token p = ts.peek();
         if (p.type() == TokenType.IDENTIFIER && isOuterJoinWord(p.text()))
             throw QoErrors.unsupported("LEFT/RIGHT/FULL/OUTER JOIN is not supported", p.offset());
-        if (p.isKeyword(Keyword.AS) || p.type() == TokenType.IDENTIFIER)
-            throw QoErrors.unsupported("table alias is not part of the agreed contract", p.offset());
+        if (ts.matchKeyword(Keyword.AS)) return PlanNodes.scan(name.text(), ts.expectIdentifier("table alias").text());
+        if (p.type() == TokenType.IDENTIFIER)
+            throw QoErrors.syntax("table alias requires AS, found '" + p.text() + "'", p.offset());
         return PlanNodes.scan(name.text());
     }
 
-    // LEFT/RIGHT/FULL/OUTER are not lexer keywords (they stay usable as names), but right after a
-    // table name they can only start an outer join, never an alias.
+    // LIMIT n (non-negative integer literal) adalah last clause, LIMIT 0 valid
+    private Optional<LimitSpec> parseLimit(TokenStream ts) {
+        if (!ts.matchKeyword(Keyword.LIMIT)) return Optional.empty();
+        Token n = ts.peek();
+        if (n.type() != TokenType.INTEGER) throw ts.unexpected("LIMIT requires a non-negative integer");
+        try {
+            long count = Long.parseLong(n.text());
+            ts.next();
+            return Optional.of(new LimitSpec(count));
+        } catch (NumberFormatException exception) {
+            throw QoErrors.syntax("LIMIT value is out of range", n.offset());
+        }
+    }
+
+    // LEFT/RIGHT/FULL/OUTER bkn lexer keywords tp setelah a table name they can only start an outer join, bukan sbg alias
     private static boolean isOuterJoinWord(String word) {
         return word.equalsIgnoreCase("LEFT") || word.equalsIgnoreCase("RIGHT")
                 || word.equalsIgnoreCase("FULL") || word.equalsIgnoreCase("OUTER");

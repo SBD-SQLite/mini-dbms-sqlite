@@ -17,6 +17,10 @@ public final class PlanNodes {
         return node(PlanNodeKind.SCAN, List.of(), List.of(), Optional.of(new ScanSpec(table, Optional.empty(), Optional.empty())),
                 Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
     }
+    public static PlanNode scan(String table, String alias) {
+        return node(PlanNodeKind.SCAN, List.of(), List.of(), Optional.of(new ScanSpec(table, Optional.empty(), Optional.empty(), Optional.of(alias))),
+                Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
+    }
     public static PlanNode indexScan(String table, String indexName, IndexCondition cond) {
         return node(PlanNodeKind.INDEX_SCAN, List.of(), List.of(), Optional.of(new ScanSpec(table, Optional.of(indexName), Optional.of(cond))),
                 Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
