@@ -5,5 +5,6 @@ public enum RecoveryError {
     LOG_INCONSISTENT,
     UNDO_FAILED,
     REDO_FAILED,
+    FINALIZE_FAILED,
     FLUSH_FAILED
 }
