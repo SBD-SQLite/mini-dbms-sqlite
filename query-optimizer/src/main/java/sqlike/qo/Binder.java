@@ -6,12 +6,14 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Supplier;
 
 import sqlike.contract.IStorageManager;
 import sqlike.shared.*;
 
 public final class Binder {
     private final IStorageManager storage;
+    private final ThreadLocal<List<Relation>> outerScope = ThreadLocal.withInitial(List::of);
 
     public Binder(IStorageManager storage) {
         if (storage == null) throw new IllegalArgumentException("storage is required");
@@ -22,7 +24,12 @@ public final class Binder {
         if (query == null) throw QoErrors.invalidValue("ParsedQuery is null", 0);
         PlanNode root = query.root().orElseThrow(() -> QoErrors.invalidState("statement has no plan root"));
         PlanNodes.validate(root);
-        return bindNode(root);
+        outerScope.set(List.of());
+        try {
+            return bindNode(root);
+        } finally {
+            outerScope.remove();
+        }
     }
 
     private PlanNode bindNode(PlanNode node) {
@@ -50,16 +57,19 @@ public final class Binder {
                     .orElseThrow(() -> QoErrors.semantic("unknown index '" + scan.indexName().orElseThrow() + "'"));
             indexName = Optional.of(index.indexName());
         }
+        // TODO(QO1): Have the SELECT parser populate ScanSpec.alias for FROM t AS a; Binder already resolves it here.
         ScanSpec boundScan = new ScanSpec(schema.tableName(), indexName, scan.condition(), scan.alias());
+        String qualifier = scan.alias().orElse(schema.tableName());
         List<ResultColumn> outputs = schema.columns().stream()
-                .map(c -> new ResultColumn(c.name(), Optional.of(Refs.column(schema.tableName(), c.name())), c.dataType()))
+                .map(c -> new ResultColumn(c.name(), Optional.of(Refs.column(qualifier, c.name())), c.dataType()))
                 .toList();
         return copy(node, List.of(), outputs, Optional.of(boundScan), node.predicate(), node.projection(), node.join(), node.sort(), node.mutation(), node.createIndex());
     }
 
     private PlanNode bindFilter(PlanNode node) {
         PlanNode child = bindNode(node.children().get(0));
-        Expression predicate = bindExpression(node.predicate().orElseThrow(), scope(child));
+        List<Relation> relations = scope(child);
+        Expression predicate = bindExpression(node.predicate().orElseThrow(), relations);
         if (!isBoolean(predicate))
             throw QoErrors.semantic("WHERE condition must be boolean; found " + expressionContext(predicate));
         return copy(node, List.of(child), child.outputColumns(), node.scan(), Optional.of(predicate), node.projection(), node.join(), node.sort(), node.mutation(), node.createIndex());
@@ -72,7 +82,8 @@ public final class Binder {
         for (ColumnRef ref : node.projection()) {
             if (ref.columnName().equals("*")) {
                 int expandedBefore = outputs.size();
-                if (ref.tableName().isPresent() && scope(child).stream().noneMatch(t -> same(t.tableName(), ref.tableName().get())))
+                List<Relation> relations = scope(child);
+                if (ref.tableName().isPresent() && relations.stream().noneMatch(r -> same(r.qualifier(), ref.tableName().get())))
                     throw QoErrors.semantic("unknown table '" + ref.tableName().get() + "' in wildcard");
                 for (ResultColumn output : child.outputColumns()) {
                     if (ref.tableName().isPresent() && (output.source().isEmpty() ||
@@ -85,7 +96,7 @@ public final class Binder {
                     throw QoErrors.semantic("table '" + ref.tableName().get() + "' has no visible columns");
             } else {
                 ColumnRef resolved = resolve(ref, scope(child));
-                ColumnSchema column = columnSchema(resolved);
+                ColumnSchema column = columnSchema(resolved, scope(child));
                 bound.add(resolved);
                 outputs.add(new ResultColumn(resolved.columnName(), Optional.of(resolved), column.dataType()));
             }
@@ -98,20 +109,24 @@ public final class Binder {
         PlanNode left = bindNode(node.children().get(0));
         PlanNode right = bindNode(node.children().get(1));
         JoinSpec spec = node.join().orElseThrow();
+        validateUniqueAliases(left, right);
         List<String> common = spec.commonColumns();
         Optional<Expression> condition = spec.condition();
         if (spec.joinType() == JoinType.NATURAL) {
-            Map<String, ColumnSchema> leftNames = uniqueOutputNames(left.outputColumns());
-            Map<String, ColumnSchema> rightNames = uniqueOutputNames(right.outputColumns());
+            Map<String, DataType> leftNames = uniqueOutputNames(left.outputColumns());
+            Map<String, DataType> rightNames = uniqueOutputNames(right.outputColumns());
             common = leftNames.keySet().stream().filter(rightNames::containsKey).toList();
             if (common.isEmpty()) throw QoErrors.semantic("NATURAL JOIN has no columns in common");
             for (String name : common) {
-                if (!compatible(leftNames.get(key(name)).dataType(), rightNames.get(key(name)).dataType()))
+                if (!compatible(leftNames.get(key(name)), rightNames.get(key(name))))
                     throw QoErrors.semantic("incompatible types for NATURAL JOIN column '" + name + "'");
             }
-        } else if (condition.isPresent()) {
-            condition = Optional.of(bindExpression(condition.get(), mergeScope(scope(left), scope(right))));
-            validateComparisonTree(condition.get());
+        } else {
+            List<Relation> joinRelations = mergeScope(scope(left), scope(right));
+            if (condition.isPresent()) {
+                condition = Optional.of(bindExpression(condition.get(), joinRelations));
+                validateComparisonTree(condition.get(), joinRelations);
+            }
         }
         List<ResultColumn> outputs = new ArrayList<>(left.outputColumns());
         for (ResultColumn col : right.outputColumns()) {
@@ -152,7 +167,8 @@ public final class Binder {
         if (node.kind() == PlanNodeKind.UPDATE) {
             ColumnRef target = resolve(mutation.updateColumn().orElseThrow(), scope(child));
             Expression value = bindExpression(mutation.updateExpression().orElseThrow(), scope(child));
-            if (!compatible(columnSchema(target).dataType(), expressionType(value)))
+            List<Relation> relations = scope(child);
+            if (!compatible(columnSchema(target, relations).dataType(), expressionType(value, relations)))
                 throw QoErrors.semantic("UPDATE expression type does not match column '" + render(target) + "'");
             mutation = new MutationSpec(schema.tableName(), mutation.insertValues(), Optional.of(target), Optional.of(value));
         } else {
@@ -169,24 +185,57 @@ public final class Binder {
         return copy(node, node.children(), node.outputColumns(), node.scan(), node.predicate(), node.projection(), node.join(), node.sort(), node.mutation(), Optional.of(boundIndex));
     }
 
-    private Expression bindExpression(Expression expression, List<TableSchema> tables) {
-        if (expression.kind() == ExpressionKind.SUBQUERY)
-            throw QoErrors.unsupported("subqueries are not supported by the Binder", 0);
+    private Expression bindExpression(Expression expression, List<Relation> relations) {
+        // TODO(QO2): Emit SUBQUERY expressions with their parsed SELECT plan; Binder handles catalog binding here.
+        // TODO(QO): Resolve correlated-subquery metadata as part of SQL subquery integration.
+        if (expression.kind() == ExpressionKind.SUBQUERY) {
+            SubquerySpec spec = expression.subquery()
+                    .orElseThrow(() -> QoErrors.invalidState("subquery expression is missing its plan"));
+            List<Relation> correlationScope = spec.correlated()
+                    ? concatScope(relations, outerScope.get()) : List.of();
+            PlanNode boundRoot = withOuterScope(correlationScope, () -> bindNode(spec.root()));
+            int outputCount = boundRoot.outputColumns().size();
+            if ((spec.type() == SubqueryType.IN || spec.type() == SubqueryType.SCALAR) && outputCount != 1)
+                throw QoErrors.semantic(spec.type() + " subquery must return exactly one column");
+
+            List<Expression> operands = expression.operands().stream()
+                    .map(operand -> bindExpression(operand, relations)).toList();
+            if (spec.type() == SubqueryType.IN) {
+                DataType leftType = expressionType(operands.get(0), relations);
+                DataType subqueryType = boundRoot.outputColumns().get(0).dataType();
+                if (!compatible(leftType, subqueryType))
+                    throw QoErrors.semantic("IN operand type is incompatible with subquery result column");
+            }
+            SubquerySpec boundSpec = new SubquerySpec(spec.type(), boundRoot, spec.correlated());
+            return new Expression(expression.kind(), expression.literal(), expression.column(), expression.operator(),
+                    operands, Optional.of(boundSpec));
+        }
         if (expression.kind() == ExpressionKind.COLUMN) {
-            ColumnRef resolved = resolve(expression.column().orElseThrow(), tables);
+            ColumnRef resolved = resolve(expression.column().orElseThrow(), relations);
             return new Expression(expression.kind(), expression.literal(), Optional.of(resolved), expression.operator(), expression.operands());
         }
-        List<Expression> operands = expression.operands().stream().map(e -> bindExpression(e, tables)).toList();
+        List<Expression> operands = expression.operands().stream().map(e -> bindExpression(e, relations)).toList();
         Expression bound = new Expression(expression.kind(), expression.literal(), expression.column(), expression.operator(), operands);
-        expressionType(bound);
+        expressionType(bound, relations);
         return bound;
     }
 
-    private DataType expressionType(Expression expression) {
+    private DataType expressionType(Expression expression, List<Relation> relations) {
         if (expression.kind() == ExpressionKind.LITERAL) return expression.literal().orElseThrow().type();
-        if (expression.kind() == ExpressionKind.COLUMN) return columnSchema(expression.column().orElseThrow()).dataType();
-        if (expression.kind() == ExpressionKind.SUBQUERY)
-            throw QoErrors.unsupported("subqueries are not supported by the Binder", 0);
+        if (expression.kind() == ExpressionKind.COLUMN) return columnSchema(expression.column().orElseThrow(), relations).dataType();
+        if (expression.kind() == ExpressionKind.SUBQUERY) {
+            SubquerySpec spec = expression.subquery()
+                    .orElseThrow(() -> QoErrors.invalidState("subquery expression is missing its plan"));
+            return switch (spec.type()) {
+                case EXISTS, IN -> DataType.INTEGER;
+                case SCALAR -> {
+                    List<ResultColumn> outputs = spec.root().outputColumns();
+                    if (outputs.size() != 1)
+                        throw QoErrors.semantic("SCALAR subquery must return exactly one column");
+                    yield outputs.get(0).dataType();
+                }
+            };
+        }
         ExpressionOperator op = expression.operator()
                 .orElseThrow(() -> QoErrors.invalidState("expression is missing an operator"));
         if (op == ExpressionOperator.AND) {
@@ -195,12 +244,12 @@ public final class Binder {
             return DataType.INTEGER;
         }
         if (op == ExpressionOperator.NEGATE) {
-            DataType type = expressionType(expression.operands().get(0));
+            DataType type = expressionType(expression.operands().get(0), relations);
             if (!numeric(type)) throw QoErrors.semantic("unary minus requires a numeric operand; found " + expressionContext(expression));
             return type;
         }
-        DataType left = expressionType(expression.operands().get(0));
-        DataType right = expressionType(expression.operands().get(1));
+        DataType left = expressionType(expression.operands().get(0), relations);
+        DataType right = expressionType(expression.operands().get(1), relations);
         if (op == ExpressionOperator.ADD || op == ExpressionOperator.SUBTRACT || op == ExpressionOperator.MULTIPLY || op == ExpressionOperator.DIVIDE) {
             if (!numeric(left) || !numeric(right))
                 throw QoErrors.semantic("arithmetic requires numeric operands; found " + expressionContext(expression));
@@ -212,6 +261,10 @@ public final class Binder {
     }
 
     private boolean isBoolean(Expression expression) {
+        if (expression.kind() == ExpressionKind.SUBQUERY) {
+            return expression.subquery().map(spec -> spec.type() == SubqueryType.EXISTS || spec.type() == SubqueryType.IN)
+                    .orElse(false);
+        }
         if (expression.kind() == ExpressionKind.BINARY) {
             ExpressionOperator op = expression.operator().orElse(null);
             if (op == ExpressionOperator.AND || isComparison(op)) return true;
@@ -219,54 +272,96 @@ public final class Binder {
         return false;
     }
 
-    private void validateComparisonTree(Expression expression) {
+    private void validateComparisonTree(Expression expression, List<Relation> relations) {
         if (expression.kind() == ExpressionKind.BINARY && isComparison(expression.operator().orElse(null))) {
-            DataType left = expressionType(expression.operands().get(0));
-            DataType right = expressionType(expression.operands().get(1));
+            DataType left = expressionType(expression.operands().get(0), relations);
+            DataType right = expressionType(expression.operands().get(1), relations);
             if (!compatible(left, right))
                 throw QoErrors.semantic("comparison operands have incompatible types; found " + expressionContext(expression));
         }
-        expression.operands().forEach(this::validateComparisonTree);
+        expression.operands().forEach(operand -> validateComparisonTree(operand, relations));
     }
 
-    private ColumnRef resolve(ColumnRef ref, List<TableSchema> tables) {
-        List<TableSchema> candidates = tables.stream()
-                .filter(t -> ref.tableName().isEmpty() || same(t.tableName(), ref.tableName().get()))
-                .filter(t -> t.columns().stream().anyMatch(c -> same(c.name(), ref.columnName())))
-                .toList();
+    private ColumnRef resolve(ColumnRef ref, List<Relation> relations) {
+        List<Relation> candidates = matchingRelations(ref, relations);
+        if (candidates.isEmpty()) candidates = matchingRelations(ref, outerScope.get());
         if (candidates.isEmpty()) throw QoErrors.semantic("unknown column '" + render(ref) + "'");
         if (candidates.size() > 1) throw QoErrors.semantic("ambiguous column '" + ref.columnName() + "'");
-        ColumnSchema col = column(candidates.get(0), ref.columnName());
-        return Refs.column(candidates.get(0).tableName(), col.name());
+        ColumnSchema col = column(candidates.get(0).schema(), ref.columnName());
+        return Refs.column(candidates.get(0).qualifier(), col.name());
     }
 
-    private List<TableSchema> scope(PlanNode node) {
-        Map<String, TableSchema> found = new LinkedHashMap<>();
-        collectSchemas(node, found);
-        return List.copyOf(found.values());
+    private List<Relation> scope(PlanNode node) {
+        List<Relation> found = new ArrayList<>();
+        collectRelations(node, found);
+        return List.copyOf(found);
     }
 
-    private void collectSchemas(PlanNode node, Map<String, TableSchema> found) {
-        node.scan().ifPresent(s -> {
-            TableSchema schema = table(s.tableName());
-            found.putIfAbsent(schema.tableId(), schema);
+    private void collectRelations(PlanNode node, List<Relation> found) {
+        node.scan().ifPresent(scan -> {
+            TableSchema schema = table(scan.tableName());
+            String qualifier = scan.alias().orElse(schema.tableName());
+            if (found.stream().anyMatch(r -> same(r.qualifier(), qualifier)))
+                throw QoErrors.semantic("duplicate table alias or qualifier '" + qualifier + "'");
+            found.add(new Relation(schema, qualifier));
         });
-        node.children().forEach(child -> collectSchemas(child, found));
+        node.children().forEach(child -> collectRelations(child, found));
     }
 
-    private List<TableSchema> mergeScope(List<TableSchema> left, List<TableSchema> right) {
-        Map<String, TableSchema> merged = new LinkedHashMap<>();
-        left.forEach(t -> merged.put(t.tableId(), t));
-        right.forEach(t -> merged.put(t.tableId(), t));
-        return List.copyOf(merged.values());
+    private void validateUniqueAliases(PlanNode left, PlanNode right) {
+        List<String> aliases = new ArrayList<>();
+        collectAliases(left, aliases);
+        collectAliases(right, aliases);
     }
 
-    private Map<String, ColumnSchema> uniqueOutputNames(List<ResultColumn> columns) {
-        Map<String, ColumnSchema> result = new LinkedHashMap<>();
+    private void collectAliases(PlanNode node, List<String> aliases) {
+        node.scan().flatMap(ScanSpec::alias).ifPresent(alias -> {
+            if (aliases.stream().anyMatch(existing -> same(existing, alias)))
+                throw QoErrors.semantic("duplicate table alias or qualifier '" + alias + "'");
+            aliases.add(alias);
+        });
+        node.children().forEach(child -> collectAliases(child, aliases));
+    }
+
+    private List<Relation> mergeScope(List<Relation> left, List<Relation> right) {
+        List<Relation> merged = new ArrayList<>(left);
+        for (Relation relation : right) {
+            if (merged.stream().anyMatch(existing -> same(existing.qualifier(), relation.qualifier())))
+                throw QoErrors.semantic("duplicate table alias or qualifier '" + relation.qualifier() + "'");
+            merged.add(relation);
+        }
+        return List.copyOf(merged);
+    }
+
+    private List<Relation> concatScope(List<Relation> left, List<Relation> right) {
+        List<Relation> result = new ArrayList<>(left);
+        result.addAll(right);
+        return List.copyOf(result);
+    }
+
+    private <T> T withOuterScope(List<Relation> scope, Supplier<T> action) {
+        List<Relation> previous = outerScope.get();
+        outerScope.set(scope);
+        try {
+            return action.get();
+        } finally {
+            outerScope.set(previous);
+        }
+    }
+
+    private List<Relation> matchingRelations(ColumnRef ref, List<Relation> relations) {
+        return relations.stream()
+                .filter(r -> ref.tableName().isEmpty() || same(r.qualifier(), ref.tableName().get()))
+                .filter(r -> r.schema().columns().stream().anyMatch(c -> same(c.name(), ref.columnName())))
+                .toList();
+    }
+
+    private Map<String, DataType> uniqueOutputNames(List<ResultColumn> columns) {
+        Map<String, DataType> result = new LinkedHashMap<>();
         for (ResultColumn output : columns) {
-            ColumnRef source = output.source().orElseThrow(() -> QoErrors.semantic("NATURAL JOIN requires resolved columns"));
+            output.source().orElseThrow(() -> QoErrors.semantic("NATURAL JOIN requires resolved columns"));
             String name = key(output.name());
-            if (result.putIfAbsent(name, columnSchema(source)) != null)
+            if (result.putIfAbsent(name, output.dataType()) != null)
                 throw QoErrors.semantic("ambiguous natural join column '" + output.name() + "'");
         }
         return result;
@@ -280,9 +375,12 @@ public final class Binder {
         return storage.getSchema(actualName);
     }
 
-    private ColumnSchema columnSchema(ColumnRef ref) {
-        TableSchema schema = table(ref.tableName().orElseThrow(() -> QoErrors.semantic("unqualified column is not bound")));
-        return column(schema, ref.columnName());
+    private ColumnSchema columnSchema(ColumnRef ref, List<Relation> relations) {
+        String qualifier = ref.tableName().orElseThrow(() -> QoErrors.semantic("unqualified column is not bound"));
+        Relation relation = relations.stream().filter(r -> same(r.qualifier(), qualifier)).findFirst()
+                .or(() -> outerScope.get().stream().filter(r -> same(r.qualifier(), qualifier)).findFirst())
+                .orElseThrow(() -> QoErrors.semantic("unknown table or alias '" + qualifier + "'"));
+        return column(relation.schema(), ref.columnName());
     }
 
     private ColumnSchema column(TableSchema schema, String name) {
@@ -318,6 +416,8 @@ public final class Binder {
 
     private static String key(String value) { return value.toLowerCase(Locale.ROOT); }
     private static boolean same(String a, String b) { return a.equalsIgnoreCase(b); }
+
+    private record Relation(TableSchema schema, String qualifier) { }
 
     private PlanNode copy(PlanNode n, List<PlanNode> children, List<ResultColumn> outputs, Optional<ScanSpec> scan,
                           Optional<Expression> predicate, List<ColumnRef> projection, Optional<JoinSpec> join,
