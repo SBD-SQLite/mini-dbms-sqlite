@@ -1,8 +1,13 @@
 package sqlike.qo;
 
 import sqlike.contract.IStorageManager;
+import sqlike.shared.Expression;
+import sqlike.shared.ExpressionKind;
 import sqlike.shared.IndexMetadata;
+import sqlike.shared.JoinSpec;
+import sqlike.shared.MutationSpec;
 import sqlike.shared.PlanNode;
+import sqlike.shared.SubquerySpec;
 
 import java.util.function.Supplier;
 import sqlike.shared.TableStatistics;
@@ -42,7 +47,8 @@ public final class CostModel {
 
     private double costNode(PlanNode node) {
         double childCost = node.children().stream().mapToDouble(this::costNode).sum();
-        return childCost + switch (node.kind()) {
+        double subqueryCost = expressionSubqueryCost(node);
+        return childCost + subqueryCost + switch (node.kind()) {
             case SCAN -> costScan(node);
             case INDEX_SCAN -> costIndexScan(node);
             case FILTER -> costFilter(node);
@@ -55,6 +61,42 @@ public final class CostModel {
             case CREATE_INDEX -> costCreateIndex(node);
             // These operators are passed through or pipelined; they add no modeled page I/O.
             case LIMIT, CREATE_TABLE, DROP_TABLE -> 0.0;
+        };
+    }
+
+    private double expressionSubqueryCost(PlanNode node) {
+        double evaluations = estimatedExpressionEvaluations(node);
+        double cost = 0.0;
+        if (node.predicate().isPresent()) cost += expressionSubqueryCost(node.predicate().get(), evaluations);
+        if (node.join().flatMap(JoinSpec::condition).isPresent())
+            cost += expressionSubqueryCost(node.join().flatMap(JoinSpec::condition).orElseThrow(), evaluations);
+        if (node.mutation().flatMap(MutationSpec::updateExpression).isPresent())
+            cost += expressionSubqueryCost(node.mutation().flatMap(MutationSpec::updateExpression).orElseThrow(), evaluations);
+        return cost;
+    }
+
+    private double expressionSubqueryCost(Expression expression, double evaluations) {
+        double cost = 0.0;
+        if (expression.kind() == ExpressionKind.SUBQUERY) {
+            SubquerySpec subquery = expression.subquery().orElseThrow();
+            double executions = subquery.correlated() ? evaluations : 1.0;
+            // Model a full evaluation; short-circuit behavior (notably EXISTS) is unknown.
+            cost += executions * costNode(subquery.root());
+        }
+        for (Expression operand : expression.operands())
+            cost += expressionSubqueryCost(operand, evaluations);
+        return cost;
+    }
+
+    private double estimatedExpressionEvaluations(PlanNode node) {
+        return switch (node.kind()) {
+            case FILTER, UPDATE, DELETE -> node.children().isEmpty() ? 0.0 : estimator.estimateRows(node.children().get(0));
+            case JOIN, CARTESIAN -> {
+                if (node.children().size() != 2) yield 0.0;
+                yield (double) estimator.estimateRows(node.children().get(0))
+                        * estimator.estimateRows(node.children().get(1));
+            }
+            default -> 1.0;
         };
     }
 
