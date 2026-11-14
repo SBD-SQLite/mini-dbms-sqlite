@@ -2,7 +2,7 @@ Storage Manager
 
 ## Kompilasi dengan Maven
 
-Semua komponen terdaftar sebagai modul Maven di `pom.xml` root, dan SM bergantung pada modul `shared`. Jalankan dari **root repositori** (butuh JDK 17+ dan Maven 3.9+):
+Semua komponen terdaftar sebagai modul Maven di `pom.xml` root, dan SM bergantung pada modul `shared`. Jalankan dari **root repositori** (butuh JDK 21+ dan Maven 3.9+):
 
 ```bash
 mvn -pl storage-manager -am compile        # kompilasi SM beserta modul shared
@@ -19,3 +19,8 @@ java -cp "storage-manager/target/classes:shared/target/classes" sqlike.storage.S
 # Windows (ganti : dengan ;)
 java -cp "storage-manager/target/classes;shared/target/classes" sqlike.storage.StorageDriver
 ```
+
+Driver SM-15 memuat database contoh di direktori sementara. Skenario mencakup katalog dan statistik,
+operasi CRUD, pencarian indeks Hash dan B+Tree, buffer, flush, dan pembacaan ulang setelah storage dibuka kembali.
+Driver memakai stub FRM melalui `IWalDurability` untuk menguji penolakan dan percobaan ulang flush.
+Setiap skenario menampilkan `[PASS]` atau `[FAIL]`. Exit code adalah `0` jika semua skenario lulus dan `1` jika ada kegagalan.
