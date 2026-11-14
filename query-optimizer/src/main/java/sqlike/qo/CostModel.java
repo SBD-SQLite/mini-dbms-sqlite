@@ -11,15 +11,22 @@ import sqlike.shared.TableStatistics;
 public final class CostModel {
     private static final double SEEK_TIME_MS = 4.0;
     private static final double TRANSFER_TIME_MS = 0.1;
-    // Temporary assumption: one outer block, one input block, and one output block.
-    private static final int BUFFER_BLOCKS = 3;
+    // Default assumption: one outer block, one input block, and one output block.
+    private static final int DEFAULT_BUFFER_BLOCKS = 3;
 
     private final IStorageManager storage;
+    private final int bufferBlocks;
     private final CardinalityEstimator estimator;
 
     public CostModel(IStorageManager storage) {
+        this(storage, DEFAULT_BUFFER_BLOCKS);
+    }
+
+    public CostModel(IStorageManager storage, int bufferBlocks) {
         if (storage == null) throw new IllegalArgumentException("storage is required");
+        if (bufferBlocks < 3) throw new IllegalArgumentException("bufferBlocks must be at least 3");
         this.storage = storage;
+        this.bufferBlocks = bufferBlocks;
         this.estimator = new CardinalityEstimator(storage);
     }
 
@@ -82,7 +89,7 @@ public final class CostModel {
         long innerBlocks = estimator.estimateBlocks(node.children().get(1));
         if (outerBlocks == 0 || innerBlocks == 0) return 0.0;
 
-        int outerCapacity = Math.max(1, BUFFER_BLOCKS - 2);
+        int outerCapacity = bufferBlocks - 2;
         long batches = ceilDiv(outerBlocks, outerCapacity);
         long innerRescans = Math.max(0, batches - 1);
 
@@ -100,23 +107,27 @@ public final class CostModel {
 
     private double costSort(PlanNode node) {
         long blocks = estimator.estimateBlocks(node.children().get(0));
-        if (blocks <= BUFFER_BLOCKS) return 0.0;
+        if (blocks <= bufferBlocks) return 0.0;
 
-        long runs = ceilDiv(blocks, BUFFER_BLOCKS);
+        int fanIn = bufferBlocks - 1;
+        long runs = ceilDiv(blocks, bufferBlocks);
         long mergePasses = 0;
-        long seeks = runs; // one sequential seek per initial run written
-        int fanIn = Math.max(2, BUFFER_BLOCKS - 1);
         while (runs > 1) {
-            long mergedRuns = ceilDiv(runs, fanIn);
-            seeks += runs + mergedRuns; // input-run seeks plus output-run seeks
-            runs = mergedRuns;
+            runs = ceilDiv(runs, fanIn);
             mergePasses++;
         }
 
-        // The child plan already accounts for producing/reading its input. Charge
-        // initial run writes, then one read and write of all blocks per merge pass.
-        double transfers = blocks + 2.0 * blocks * mergePasses;
-        return seeks * SEEK_TIME_MS + transfers * TRANSFER_TIME_MS;
+        // Course formula assumes one buffer block per run (b_b = 1).
+        long totalSeeks = 2 * ceilDiv(blocks, bufferBlocks)
+                + blocks * (2 * mergePasses - 1);
+        long totalTransfers = blocks * (2 * mergePasses + 1);
+
+        // The child plan already charges the initial sequential input read. Remove
+        // its one seek and b transfers from the full external-sort formula so that
+        // SORT(SCAN ...) matches the textbook total without double-counting input.
+        long sortSeeks = Math.max(0, totalSeeks - 1);
+        long sortTransfers = Math.max(0, totalTransfers - blocks);
+        return sortSeeks * SEEK_TIME_MS + sortTransfers * TRANSFER_TIME_MS;
     }
 
     private double costInsert(PlanNode node) {

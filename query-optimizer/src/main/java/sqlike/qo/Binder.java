@@ -170,6 +170,8 @@ public final class Binder {
     }
 
     private Expression bindExpression(Expression expression, List<TableSchema> tables) {
+        if (expression.kind() == ExpressionKind.SUBQUERY)
+            throw QoErrors.unsupported("subqueries are not supported by the Binder", 0);
         if (expression.kind() == ExpressionKind.COLUMN) {
             ColumnRef resolved = resolve(expression.column().orElseThrow(), tables);
             return new Expression(expression.kind(), expression.literal(), Optional.of(resolved), expression.operator(), expression.operands());
@@ -183,7 +185,10 @@ public final class Binder {
     private DataType expressionType(Expression expression) {
         if (expression.kind() == ExpressionKind.LITERAL) return expression.literal().orElseThrow().type();
         if (expression.kind() == ExpressionKind.COLUMN) return columnSchema(expression.column().orElseThrow()).dataType();
-        ExpressionOperator op = expression.operator().orElseThrow();
+        if (expression.kind() == ExpressionKind.SUBQUERY)
+            throw QoErrors.unsupported("subqueries are not supported by the Binder", 0);
+        ExpressionOperator op = expression.operator()
+                .orElseThrow(() -> QoErrors.invalidState("expression is missing an operator"));
         if (op == ExpressionOperator.AND) {
             for (Expression child : expression.operands()) if (!isBoolean(child))
                 throw QoErrors.semantic("AND operands must be boolean; found " + expressionContext(child));
@@ -260,7 +265,9 @@ public final class Binder {
         Map<String, ColumnSchema> result = new LinkedHashMap<>();
         for (ResultColumn output : columns) {
             ColumnRef source = output.source().orElseThrow(() -> QoErrors.semantic("NATURAL JOIN requires resolved columns"));
-            result.putIfAbsent(key(output.name()), columnSchema(source));
+            String name = key(output.name());
+            if (result.putIfAbsent(name, columnSchema(source)) != null)
+                throw QoErrors.semantic("ambiguous natural join column '" + output.name() + "'");
         }
         return result;
     }

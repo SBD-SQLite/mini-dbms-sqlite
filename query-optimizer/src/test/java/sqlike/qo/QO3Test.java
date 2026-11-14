@@ -12,7 +12,16 @@ import sqlike.shared.JoinAlgorithm;
 import sqlike.shared.JoinSpec;
 import sqlike.shared.QoException;
 import sqlike.shared.JoinType;
+import sqlike.shared.Expression;
+import sqlike.shared.ExpressionKind;
 import sqlike.shared.PlanNode;
+import sqlike.shared.ParsedQuery;
+import sqlike.shared.SubquerySpec;
+import sqlike.shared.SubqueryType;
+import sqlike.shared.StatementType;
+import sqlike.shared.SortDirection;
+import sqlike.shared.SortSpec;
+import sqlike.shared.TableStatistics;
 
 /** QO3 regressions for catalog binding, type compatibility, and cost estimation. */
 public final class QO3Test {
@@ -71,6 +80,56 @@ public final class QO3Test {
                     JoinAlgorithm.BLOCK_NESTED_LOOP, List.of());
             PlanNode plan = PlanNodes.join(PlanNodes.scan("students"), PlanNodes.scan("dept"), cartesian);
             close(410.0, new CostModel(storage).getCost(plan));
+        });
+        test("CostModel accepts a configurable buffer budget", () -> {
+            JoinSpec cartesian = new JoinSpec(JoinType.CARTESIAN, Optional.empty(),
+                    JoinAlgorithm.BLOCK_NESTED_LOOP, List.of());
+            PlanNode plan = PlanNodes.join(PlanNodes.scan("students"), PlanNodes.scan("dept"), cartesian);
+            close(207.5, new CostModel(storage, 4).getCost(plan));
+            try {
+                new CostModel(storage, 2);
+                throw new AssertionError("expected invalid buffer budget to be rejected");
+            } catch (IllegalArgumentException expected) { }
+        });
+        test("external-sort cost matches the course oracle for 100 blocks", () -> {
+            IStorageManager sortStorage = (IStorageManager) Proxy.newProxyInstance(
+                    QO3Test.class.getClassLoader(), new Class<?>[] { IStorageManager.class },
+                    (proxy, method, args) -> {
+                        if (method.getName().equals("getStatistics")
+                                && ((String) args[0]).equalsIgnoreCase("students"))
+                            return new TableStatistics(5000, 100, 40, 50, Map.of("id", 5000L));
+                        try {
+                            return method.invoke(storage, args);
+                        } catch (InvocationTargetException error) {
+                            throw error.getCause();
+                        }
+                    });
+            PlanNode sorted = PlanNodes.sort(PlanNodes.scan("students"),
+                    new SortSpec(Refs.column("students", "id"), SortDirection.ASC));
+            close(4802.0, new CostModel(sortStorage, 3).getCost(sorted));
+        });
+        test("ambiguous NATURAL JOIN input column reports semantic error", () -> {
+            try {
+                binder.bind(optimizer.parseQuery("SELECT * FROM students JOIN dept ON students.dept_id = dept.dept_id NATURAL JOIN dept"));
+                throw new AssertionError("expected ambiguous natural join error");
+            } catch (QoException error) {
+                if (error.getInfo().code() != ErrorCode.SEMANTIC_ERROR
+                        || !error.getMessage().toLowerCase().contains("ambiguous natural join column"))
+                    throw error;
+            }
+        });
+        test("unimplemented subquery plans fail with a QO domain error", () -> {
+            Expression subquery = new Expression(ExpressionKind.SUBQUERY, Optional.empty(), Optional.empty(),
+                    Optional.empty(), List.of(), Optional.of(new SubquerySpec(
+                            SubqueryType.EXISTS, PlanNodes.scan("dept"), false)));
+            ParsedQuery parsed = new ParsedQuery(StatementType.SELECT,
+                    Optional.of(PlanNodes.filter(PlanNodes.scan("students"), subquery)), Optional.empty());
+            try {
+                binder.bind(parsed);
+                throw new AssertionError("expected unsupported-operation error");
+            } catch (QoException error) {
+                if (error.getInfo().code() != ErrorCode.UNSUPPORTED_OPERATION) throw error;
+            }
         });
         test("Binder normalizes table names in scans and DML", () -> {
             PlanNode select = binder.bind(optimizer.parseQuery("SELECT * FROM STUDENTS"));
