@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 import sqlike.contract.IConcurrencyControlManager;
 import sqlike.qo.PlanNodes;
+import sqlike.qo.QoException;
 import sqlike.shared.*;
 import sqlike.qp.port.ConcurrencyAdapter;
 import sqlike.qp.port.QpContracts.*;
@@ -23,12 +24,18 @@ public final class Qp5AcceptanceTest {
     private static int failed;
 
     public static void main(String[] args) throws Exception {
+        if (args.length == 1 && args[0].equals("--qo-integration")) {
+            runQoIntegrationChecks();
+            reportResults();
+            return;
+        }
         if (args.length == 2) {
             restartPhase(args[0], Path.of(args[1]));
             return;
         }
-        if (args.length != 0) throw new IllegalArgumentException("Expected no arguments or a restart phase and snapshot");
-        System.out.println("Real QO; stub QP1/QP2/QP3, SM, CCM/FRM.");
+        if (args.length != 0) throw new IllegalArgumentException("Expected no arguments, --qo-integration, or a restart phase and snapshot");
+        System.out.println("QP acceptance checks with stub SM and CCM/FRM.");
+        runQoIntegrationChecks();
         test("QP-10 INSERT and QP-12 ABORT", Qp5AcceptanceTest::insertAndAbort);
         test("QP-11 SET, arithmetic, WHERE, and counts", Qp5AcceptanceTest::updateRows);
         test("QP-11 committed UPDATE survives restart", Qp5AcceptanceTest::updateSurvivesRestart);
@@ -54,8 +61,100 @@ public final class Qp5AcceptanceTest {
         test("QP-16* LIMIT and AS table alias (including self-join)", Qp5AcceptanceTest::limitAndTableAlias);
         test("QP-16* Subquery in WHERE (SCALAR, IN, EXISTS, correlated, 0-row NULL, >1-row error)", Qp5AcceptanceTest::subqueriesInWhere);
         test("QP-01/QP-14 TCP QueryServer, CliClient, QpBootstrap, and disconnect auto-abort", Qp5AcceptanceTest::tcpServerMultiClientAndDisconnectAbort);
+        reportResults();
+    }
+
+    private static void runQoIntegrationChecks() {
+        test("QP-03 QO plans execute through the public QP facade", Qp5AcceptanceTest::qoCorePipeline);
+        test("QP-01 QO errors retain code, component, position, and transaction", Qp5AcceptanceTest::qoErrorsPreserved);
+    }
+
+    private static void reportResults() {
         System.out.println("RESULT: " + passed + " passed, " + failed + " failed");
         if (failed > 0) throw new AssertionError("Acceptance checks failed");
+    }
+
+    private static void qoCorePipeline() throws Exception {
+        StubQpRuntime runtime = StubQpRuntime.open(Files.createTempDirectory("qp-qo-core-"), QpConfiguration.defaults());
+        runtime.recover();
+        var processor = runtime.processor;
+        var session = processor.openSession();
+        try {
+            var joined = processor.execute("SELECT student.name, enrollment.course FROM student JOIN enrollment ON student.id = enrollment.student_id WHERE enrollment.course = 'IF3140' ORDER BY student.name DESC;", session);
+            assertEquals(ResultKind.ROWS, joined.kind());
+            assertEquals(List.of("name", "course"), joined.columns().stream().map(ResultColumn::name).toList());
+            assertEquals(List.of(List.of("Budi", "IF3140"), List.of("Ani", "IF3140")),
+                    joined.rows().stream().map(row -> row.stream().map(value -> payload(value)).toList()).toList());
+
+            var begin = processor.execute("BEGIN;", session);
+            assertEquals(ResultKind.TRANSACTION, begin.kind());
+            var updated = processor.execute("UPDATE student SET gpa = gpa + 0.5 WHERE id = 1;", session);
+            assertEquals(ResultKind.AFFECTED_ROWS, updated.kind());
+            assertEquals(1L, updated.affectedRows());
+            var visible = processor.execute("SELECT gpa FROM student WHERE id = 1;", session);
+            assertEquals(4.0, visible.rows().get(0).get(0).floatValue().orElseThrow());
+
+            var parsed = runtime.runner.optimizer.parseQuery("SELECT name FROM student ORDER BY name;");
+            var planned = processor.executePlan(runtime.runner.optimizer.optimizeQuery(parsed), begin.transaction().orElseThrow().txId());
+            assertEquals(ResultKind.ROWS, planned.kind());
+            assertEquals(List.of("Ani", "Budi", "Cici"), planned.rows().stream().map(row -> row.get(0).textValue().orElseThrow()).toList());
+            assertEquals(ResultKind.TRANSACTION, processor.execute("ABORT;", session).kind());
+            var restored = processor.execute("SELECT gpa FROM student WHERE id = 1;", session);
+            assertEquals(3.5, restored.rows().get(0).get(0).floatValue().orElseThrow());
+        } finally {
+            processor.closeSession(session.sessionId());
+            processor.shutdown();
+        }
+    }
+
+    private static void qoErrorsPreserved() throws Exception {
+        StubQpRuntime runtime = StubQpRuntime.open(Files.createTempDirectory("qp-qo-errors-"), QpConfiguration.defaults());
+        runtime.recover();
+        var processor = runtime.processor;
+        var session = processor.openSession();
+        try {
+            for (var scenario : List.of(
+                    Map.entry("SELEC * FROM student;", ErrorCode.SYNTAX_ERROR),
+                    Map.entry("SELECT missing FROM student;", ErrorCode.SEMANTIC_ERROR),
+                    Map.entry("SELECT DISTINCT * FROM student;", ErrorCode.UNSUPPORTED_OPERATION))) {
+                ErrorInfo expected;
+                try {
+                    runtime.runner.optimizer.optimizeQuery(runtime.runner.optimizer.parseQuery(scenario.getKey()));
+                    throw new AssertionError("Invalid SQL was accepted by QO");
+                } catch (QoException error) {
+                    expected = error.getInfo();
+                }
+                assertEquals(scenario.getValue(), expected.code());
+                assertEquals(ComponentType.QO, expected.component());
+                if (scenario.getValue() == ErrorCode.SYNTAX_ERROR) assertEquals(Optional.of(0), expected.position());
+
+                var begin = processor.execute("BEGIN;", session);
+                long txId = begin.transaction().orElseThrow().txId();
+                var result = processor.execute(scenario.getKey(), session);
+                assertEquals(ResultKind.ERROR, result.kind());
+                assertEquals(expected, result.error().orElseThrow());
+                assertTrue(ResultPrinter.format(result).contains("ERROR [QO " + expected.code() + "]"), "CLI lost QO error details");
+
+                List<ExecutionSummary> summaries = new ArrayList<>();
+                var sink = new ResultSink() {
+                    @Override public void onSchema(Schema schema) {throw new AssertionError("Failed query emitted a schema");}
+                    @Override public void onRow(Row row) {throw new AssertionError("Failed query emitted a row");}
+                    @Override public void onFinish(ExecutionSummary summary) {summaries.add(summary);}
+                };
+                var summary = processor.execute(new SessionId(UUID.fromString(session.sessionId())), scenario.getKey(), sink);
+                assertTrue(!summary.success(), "Streaming facade accepted invalid SQL");
+                assertEquals(expected, summary.getErrorInfo().orElseThrow());
+                assertEquals(List.of(summary), summaries);
+                assertEquals(ResultKind.ROWS, processor.execute("SELECT * FROM student;", session).kind());
+                var commit = processor.execute("COMMIT;", session);
+                assertEquals(ResultKind.TRANSACTION, commit.kind());
+                assertEquals(txId, commit.transaction().orElseThrow().txId());
+                assertEquals(TransactionStatus.COMMITTED, commit.transaction().orElseThrow().status());
+            }
+        } finally {
+            processor.closeSession(session.sessionId());
+            processor.shutdown();
+        }
     }
 
     private static void insertAndAbort() throws Exception {

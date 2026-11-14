@@ -21,7 +21,7 @@ import sqlike.shared.ErrorInfo;
 import sqlike.shared.ParsedQuery;
 import sqlike.shared.PlanNode;
 import sqlike.shared.PlanNodeKind;
-import sqlike.shared.QoException;
+import sqlike.qo.QoException;
 import sqlike.shared.QueryPlan;
 import sqlike.shared.QueryResult;
 import sqlike.shared.RecoveryResult;
