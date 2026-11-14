@@ -114,6 +114,29 @@ public class LockBasedProtocol implements IConcurrencyProtocol {
     }
 
     @Override
+    public String leftoverState() {
+        mutex.lock();
+        try {
+            StringBuilder left = new StringBuilder();
+            if (!lockTable.isEmpty()) {
+                left.append("lockTable=").append(lockTable.keySet()).append(' ');
+            }
+            if (!transactions.isEmpty()) {
+                left.append("registered=").append(transactions.keySet()).append(' ');
+            }
+            if (!aborting.isEmpty()) {
+                left.append("aborting=").append(aborting).append(' ');
+            }
+            if (!deadlockHandler.isEmpty()) {
+                left.append("waitForEdges ");
+            }
+            return left.toString().trim();
+        } finally {
+            mutex.unlock();
+        }
+    }
+
+    @Override
     public void reset() {
         mutex.lock();
         try {

@@ -23,4 +23,10 @@ public interface IConcurrencyProtocol {
 
     /** Clears protocol state before transactions resume after recovery. */
     void reset();
+
+    /**
+     * Describes protocol data that belongs to unfinished transactions (held or queued locks,
+     * wait-for edges, uncommitted writers, reader marks). Returns an empty string when none is left.
+     */
+    String leftoverState();
 }
