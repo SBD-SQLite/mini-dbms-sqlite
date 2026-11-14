@@ -92,15 +92,52 @@ public class StatisticsManager {
         CatalogManager source;
         synchronized (this) { source = catalog; }
         if (source == null) throw new StorageException(INVALID_STATE, "Statistics requires a catalog");
-        String name = source.getSchema(table).tableName();
+        TableSchema schema = source.getSchema(table);
+        String name = schema.tableName();
+        TableStatistics cached;
+        boolean invalid;
+        BlockManager sourceBlocks;
+        BlockCountProvider sourceCounter;
         synchronized (this) {
-            TableStatistics cached = cachedStats.get(name);
-            if (cached != null && !invalidTables.contains(name)) return cached;
+            cached = cachedStats.get(name);
+            invalid = invalidTables.contains(name);
+            sourceBlocks = blocks;
+            sourceCounter = blockCountProvider;
         }
+        if (cached != null && !invalid && !blockCountChanged(schema, cached, sourceBlocks, sourceCounter)) return cached;
         return refresh(name);
     }
 
+    private static boolean blockCountChanged(TableSchema schema, TableStatistics cached, BlockManager sourceBlocks,
+                                             BlockCountProvider sourceCounter) {
+        try {
+            if (sourceCounter != null) return sourceCounter.countBlocks(schema.tableId()) != cached.blockCount();
+            if (sourceBlocks != null) return sourceBlocks.getPageCount(schema.tableId()) != cached.blockCount();
+            return false;
+        } catch (RuntimeException e) { 
+            return true; 
+        }
+    }
+
+    private static final int MAX_REFRESH_ATTEMPTS = 5;
+
+    private static final class ChangedWhileRefreshing extends StorageException {
+        ChangedWhileRefreshing(String message, Throwable cause) {
+            super(INVALID_STATE, message, cause);
+        }
+    }
+
     public TableStatistics refresh(String table) throws StorageException {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return refreshOnce(table);
+            } catch (ChangedWhileRefreshing e) {
+                if (attempt >= MAX_REFRESH_ATTEMPTS) throw e;
+            }
+        }
+    }
+
+    private TableStatistics refreshOnce(String table) throws StorageException {
         CatalogManager sourceCatalog;
         RecordManager sourceRecords;
         BlockCountProvider sourceCounter;
@@ -156,7 +193,7 @@ public class StatisticsManager {
             throw new StorageException(INVALID_STATE, "RecordManager.scan is not implemented yet", e);
         } catch (ConcurrentModificationException e) {
             failRefresh(name);
-            throw new StorageException(INVALID_STATE, "Table changed during statistics scan: " + name, e);
+            throw new ChangedWhileRefreshing("Table changed during statistics scan: " + name, e);
         } catch (StorageException e) {
             failRefresh(name);
             throw e;
@@ -199,7 +236,7 @@ public class StatisticsManager {
             if (observedRevision != revision) {
                 cachedStats.remove(name);
                 invalidTables.add(name);
-                throw new StorageException(INVALID_STATE, "Statistics configuration or table changed while refreshing");
+                throw new ChangedWhileRefreshing("Statistics configuration or table changed while refreshing", null);
             }
             cachedStats.put(name, result);
             invalidTables.remove(name);
