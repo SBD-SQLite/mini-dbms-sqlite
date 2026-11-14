@@ -9,6 +9,7 @@ public class RecoveryPlan {
     public Long checkpointLsn;
     public Set<Long> committedTx;
     public Set<Long> uncommittedTx;
+    public Set<Long> abortedTx;
     public Set<Long> needsAbortTx;
     public List<LogRecord> undoChanges;
     public List<LogRecord> redoChanges;

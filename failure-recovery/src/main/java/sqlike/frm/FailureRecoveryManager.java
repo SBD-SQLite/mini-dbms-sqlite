@@ -20,6 +20,7 @@ import sqlike.frm.maintenance.WalRecoveryLog;
 import sqlike.frm.port.CcmPort;
 import sqlike.frm.port.RollbackPort;
 import sqlike.frm.port.SmPort;
+import sqlike.frm.recovery.RecoveryException;
 import sqlike.frm.recovery.RecoveryManager;
 import sqlike.frm.rollback.RollbackManager;
 import sqlike.shared.DataChange;
@@ -227,36 +228,29 @@ public class FailureRecoveryManager
             throw new FrmException(ErrorCode.INVALID_STATE, "recovery is already running");
         }
         state = RecoveryState.RUNNING;
-        RecoveryResult result;
         try {
-            result = recoveryManager.recover();
-        } catch (Exception error) {
-            state = RecoveryState.FAILED;
-            throw new FrmException(ErrorCode.RECOVERY_FAILURE,
-                    "crash recovery failed: " + error.getMessage(), error);
-        }
-        if (result == null) {
-            state = RecoveryState.FAILED;
-            throw new FrmException(ErrorCode.RECOVERY_FAILURE, "crash recovery returned no result");
-        }
-        // FR5 only reads the active epoch; after PITR the old txIds live in archived epochs,
-        // so take FR2's max over every epoch too (txIds must never be reused).
-        long lastTxId = Math.max(Math.max(0L, result.lastTxId()), logManager.getMaxTxId());
-        // PRD §14: one generator, logical timestamp = txId (not the wall-clock time of the log).
-        lastRecovery = new RecoveryResult(lastTxId, lastTxId,
-                Math.max(0L, result.lastRecoveredLSN()), result.checkpointLSN());
-        try {
+            RecoveryResult result = recoveryManager.recover();
+            if (result == null) {
+                throw new IllegalStateException("recovery returned no result");
+            }
+
+            // FR5 only reads the active epoch; after PITR the old txIds live in archived epochs,
+            // so take FR2's max over every epoch too (txIds must never be reused).
+            long lastTxId = Math.max(Math.max(0L, result.lastTxId()), logManager.getMaxTxId());
+            // PRD §14: one generator, logical timestamp = txId (not the wall-clock time of the log).
+            lastRecovery = new RecoveryResult(lastTxId, lastTxId,
+                    Math.max(0L, result.lastRecoveredLSN()), result.checkpointLSN());
+
             ensureBaselineSnapshot();
+            if (!config.checkpointInterval().isZero()) {
+                maintenance.startPeriodicCheckpoints();
+            }
+            state = RecoveryState.READY;
+            return lastRecovery;
         } catch (RuntimeException error) {
             state = RecoveryState.FAILED;
-            throw new FrmException(ErrorCode.RECOVERY_FAILURE,
-                    "cannot create the baseline snapshot for PITR: " + error.getMessage(), error);
+            throw recoveryFailure(error);
         }
-        state = RecoveryState.READY;
-        if (!config.checkpointInterval().isZero()) {
-            maintenance.startPeriodicCheckpoints();
-        }
-        return lastRecovery;
     }
 
     // ------------------------------------------------------------------ maintenance (FR4)
@@ -384,6 +378,37 @@ public class FailureRecoveryManager
     private void failStop() {
         state = RecoveryState.FAILED;
         maintenance.stopPeriodicCheckpoints();
+    }
+
+    private static FrmException recoveryFailure(RuntimeException error) {
+        RecoveryException phaseFailure = findCause(error, RecoveryException.class);
+        WalException walFailure = findCause(error, WalException.class);
+        FrmException frmFailure = findCause(error, FrmException.class);
+        ErrorCode code = walFailure != null
+                || (frmFailure != null && frmFailure.getCode() == ErrorCode.WAL_FAILURE)
+                ? ErrorCode.WAL_FAILURE
+                : ErrorCode.RECOVERY_FAILURE;
+
+        String message = "crash recovery failed";
+        if (phaseFailure != null) {
+            message += " during " + phaseFailure.getRecoveryError();
+        }
+        if (error.getMessage() != null) {
+            message += ": " + error.getMessage();
+        }
+        boolean commitUnknown = walFailure != null
+                ? walFailure.isCommitUnknown()
+                : frmFailure != null && frmFailure.isCommitUnknown();
+        return new FrmException(code, message, error, commitUnknown);
+    }
+
+    private static <T extends Throwable> T findCause(Throwable error, Class<T> type) {
+        for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+            if (type.isInstance(cause)) {
+                return type.cast(cause);
+            }
+        }
+        return null;
     }
 
     private boolean hasLogRecord(long txId, LogType type) {
