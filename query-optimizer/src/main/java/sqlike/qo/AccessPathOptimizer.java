@@ -17,6 +17,7 @@ public class AccessPathOptimizer {
     private final IStorageManager storage;
     private final int maxCandidates;
     private final PlanSelector selector = new PlanSelector();
+    private final CardinalityEstimator estimator;
 
     public AccessPathOptimizer(IStorageManager storage) { this(storage, 64); }
 
@@ -25,12 +26,16 @@ public class AccessPathOptimizer {
         if (maxCandidates < 2) throw new IllegalArgumentException("at least two candidates are required");
         this.storage = storage;
         this.maxCandidates = maxCandidates;
+        this.estimator = new CardinalityEstimator(storage);
     }
 
-    /** The unchanged input wins cost ties; residual predicates and ordered output metadata survive. */
+    /** The scan baseline wins cost ties; residual predicates and ordered output metadata survive. */
     public PlanNode chooseAccessPath(PlanNode plan, CostModel cost) {
         if (cost == null) throw QoErrors.invalidState("chooseAccessPath requires a cost model");
-        return selector.pickCheapest(enumerateAccessPaths(plan), cost);
+        // Compare the shapes actually returned to QP, not wrappers that final cleanup would remove.
+        List<PlanNode> candidates = enumerateAccessPaths(plan).stream()
+                .map(QO5Plans::simplifyIdentityProjects).toList();
+        return selector.pickCheapest(candidates, cost);
     }
 
     /** Package-private for the QO5 pipeline/tests; catalog snapshots are local to this invocation. */
@@ -111,6 +116,12 @@ public class AccessPathOptimizer {
     private boolean add(Set<PlanNode> candidates, PlanNode original, IndexMetadata index, Lookup lookup) {
         PlanNode candidate = replace(original, index, lookup);
         PlanNodes.validate(candidate);
+        // QO3 owns selectivity. Until its two-bound filter and BETWEEN models agree, retain the
+        // baseline/single-bound alternatives rather than rank equivalent forms on different row counts.
+        // No duplicate formula or artificial residual predicate is added to compensate for the gap.
+        if (lookup.condition().operator() == IndexOperator.BETWEEN
+                && !estimator.withCatalogCache(() -> estimator.estimateRows(original) == estimator.estimateRows(candidate)))
+            return false;
         candidates.add(candidate);
         return candidates.size() >= maxCandidates;
     }
