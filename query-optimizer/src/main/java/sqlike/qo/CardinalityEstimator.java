@@ -55,9 +55,9 @@ public final class CardinalityEstimator {
             long qualifyingRows = estimateRows(node);
             if (tableBlocks <= 0 || qualifyingRows <= 0) return 0;
 
-            // Assume qualifying RIDs are uniformly scattered across table pages.
-            // Expected distinct pages = b * (1 - (1 - 1/b)^n). This is an
-            // unclustered-index heuristic until SM exposes clustering metadata.
+            // SM reports its secondary indexes as unclustered. Assume qualifying
+            // RIDs are uniformly scattered across table pages: expected distinct
+            // pages = b * (1 - (1 - 1/b)^n).
             double expectedPages = -((double) tableBlocks) *
                     Math.expm1(qualifyingRows * Math.log1p(-1.0 / tableBlocks));
             long roundedPages = (long) Math.ceil(expectedPages);
@@ -228,6 +228,10 @@ public final class CardinalityEstimator {
             try { return firstStats(child); } catch (IllegalStateException ignored) { }
         }
         return new TableStatistics(0, 0, 0, 1, java.util.Map.of());
+    }
+
+    TableStatistics statisticsForTable(String table) {
+        return withCatalogCache(() -> stats(table));
     }
 
     private TableStatistics stats(String table) {

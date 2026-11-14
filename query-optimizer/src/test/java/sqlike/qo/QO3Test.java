@@ -15,6 +15,11 @@ import sqlike.shared.JoinType;
 import sqlike.shared.Expression;
 import sqlike.shared.ExpressionKind;
 import sqlike.shared.ExpressionOperator;
+import sqlike.shared.IndexCondition;
+import sqlike.shared.IndexMetadata;
+import sqlike.shared.IndexOperator;
+import sqlike.shared.IndexStatistics;
+import sqlike.shared.IndexType;
 import sqlike.shared.PlanNode;
 import sqlike.shared.PlanNodeKind;
 import sqlike.shared.ScanSpec;
@@ -25,6 +30,8 @@ import sqlike.shared.StatementType;
 import sqlike.shared.SortDirection;
 import sqlike.shared.SortSpec;
 import sqlike.shared.TableStatistics;
+import java.util.OptionalInt;
+import java.util.OptionalLong;
 
 /** QO3 regressions for catalog binding, type compatibility, and cost estimation. */
 public final class QO3Test {
@@ -83,6 +90,25 @@ public final class QO3Test {
                     JoinAlgorithm.BLOCK_NESTED_LOOP, List.of());
             PlanNode plan = PlanNodes.join(PlanNodes.scan("students"), PlanNodes.scan("dept"), cartesian);
             close(410.0, new CostModel(storage).getCost(plan));
+        });
+        test("index scan costs use SM B+Tree and HASH statistics", () -> {
+            IndexMetadata tree = new IndexMetadata("ix_students_id_tree", "students", "id", IndexType.BPLUS_TREE);
+            IndexStatistics treeStats = new IndexStatistics(OptionalInt.of(3), OptionalInt.empty(),
+                    OptionalLong.of(10), OptionalLong.empty(), false);
+            IStorageManager treeStorage = MockStorageManager.create(List.of(tree), Map.of("ix_students_id_tree", treeStats));
+            PlanNode treeLookup = PlanNodes.indexScan("students", tree.indexName(),
+                    new IndexCondition(IndexOperator.EQ, integerValue(1), Optional.empty(), true, true));
+            // Descriptor + 3 B+Tree levels + one unclustered heap page.
+            close(20.5, new CostModel(treeStorage).getCost(treeLookup));
+
+            IndexMetadata hash = new IndexMetadata("ix_students_id_hash", "students", "id", IndexType.HASH);
+            IndexStatistics hashStats = new IndexStatistics(OptionalInt.empty(), OptionalInt.of(10),
+                    OptionalLong.empty(), OptionalLong.of(4), false);
+            IStorageManager hashStorage = MockStorageManager.create(List.of(hash), Map.of("ix_students_id_hash", hashStats));
+            PlanNode hashLookup = PlanNodes.indexScan("students", hash.indexName(),
+                    new IndexCondition(IndexOperator.EQ, integerValue(1), Optional.empty(), true, true));
+            // Descriptor + directory + bucket + average 0.4 overflow page + one heap page.
+            close(18.04, new CostModel(hashStorage).getCost(hashLookup));
         });
         test("CostModel accepts a configurable buffer budget", () -> {
             JoinSpec cartesian = new JoinSpec(JoinType.CARTESIAN, Optional.empty(),
@@ -278,6 +304,11 @@ public final class QO3Test {
 
     private static Expression columnExpression(sqlike.shared.ColumnRef column) {
         return new Expression(ExpressionKind.COLUMN, Optional.empty(), Optional.of(column), Optional.empty(), List.of());
+    }
+
+    private static sqlike.shared.Value integerValue(int value) {
+        return new sqlike.shared.Value(sqlike.shared.DataType.INTEGER,
+                Optional.of(value), Optional.empty(), Optional.empty());
     }
 
     private static Expression intLiteral(int value) {
