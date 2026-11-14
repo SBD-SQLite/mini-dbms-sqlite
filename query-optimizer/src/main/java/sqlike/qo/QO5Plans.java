@@ -157,7 +157,7 @@ final class QO5Plans {
         return current;
     }
 
-    private static boolean isIdentityProject(PlanNode plan) {
+    static boolean isIdentityProject(PlanNode plan) {
         if (plan.kind() != PlanNodeKind.PROJECT || plan.children().size() != 1) return false;
         List<ResultColumn> outputs = plan.children().get(0).outputColumns();
         if (outputs.isEmpty() || !plan.outputColumns().equals(outputs)

@@ -67,7 +67,8 @@ public class JoinAccessPathOptimizer {
         // Include the incoming baseline too; equivalent rewritten plans win equal-cost ties.
         candidates.add(QO5Plans.simplifyIdentityProjects(plan));
         PlanNode candidate = planSelector.pickCheapest(List.copyOf(candidates), costModel);
-        PlanNode result = QO5Plans.simplifyIdentityProjects(restoreOutputSchema(candidate, plan));
+        // Final shape: join reordering can leave PROJECT over PROJECT or a PROJECT equal to its input.
+        PlanNode result = ProjectionCleanup.normalize(QO5Plans.simplifyIdentityProjects(restoreOutputSchema(candidate, plan)));
         PlanNodes.validate(result);
         double heuristicCost = costModel.getCost(result);
         if (geneticOptimizer == null)
@@ -75,7 +76,8 @@ public class JoinAccessPathOptimizer {
 
         GeneticJoinOrderOptimizer.Result genetic = geneticOptimizer.optimize(rewritten, costModel,
                 raw -> prepareGeneticCandidate(raw, plan));
-        PlanNode selected = planSelector.pickCheapest(List.of(result, genetic.plan()), costModel);
+        PlanNode selected = ProjectionCleanup.normalize(planSelector.pickCheapest(List.of(result, genetic.plan()), costModel));
+        PlanNodes.validate(selected);
         return new OptimizationComparison(selected, costModel.getCost(selected), heuristicCost,
                 OptionalDouble.of(genetic.estimatedCost()), genetic.evaluatedIndividuals());
     }

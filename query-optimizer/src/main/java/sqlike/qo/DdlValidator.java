@@ -1,5 +1,6 @@
 package sqlike.qo;
 
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -14,16 +15,14 @@ public final class DdlValidator {
         if (plan == null) throw QoErrors.invalidValue("plan is null", 0);
         if (storage == null) throw new IllegalArgumentException("storage is required");
         return switch (plan.kind()) {
-            case CREATE_TABLE -> {
-                validateCreate(plan.createTable().orElseThrow(), storage);
-                yield plan;
-            }
+            case CREATE_TABLE -> PlanNodes.createTable(validateCreate(plan.createTable().orElseThrow(), storage));
             case DROP_TABLE -> PlanNodes.dropTable(validateDrop(plan.dropTable().orElseThrow(), storage));
             default -> throw QoErrors.invalidState("DdlValidator only handles CREATE_TABLE and DROP_TABLE, got " + plan.kind());
         };
     }
 
-    private void validateCreate(CreateTableSpec spec, IStorageManager storage) {
+    /** Returns the spec with every foreign-key target spelled as the catalog (or, for a self-reference, this table) spells it. */
+    private CreateTableSpec validateCreate(CreateTableSpec spec, IStorageManager storage) {
         String table = spec.tableName();
         if (table == null || table.isBlank()) throw QoErrors.semantic("table name is empty");
         if (catalogName(storage, table).isPresent())
@@ -49,7 +48,9 @@ public final class DdlValidator {
                 throw QoErrors.semantic("duplicate primary key column '" + name + "'");
         }
 
-        for (ForeignKeySpec fk : spec.foreignKeys()) validateForeignKey(spec, fk, storage);
+        List<ForeignKeySpec> foreignKeys = new ArrayList<>();
+        for (ForeignKeySpec fk : spec.foreignKeys()) foreignKeys.add(validateForeignKey(spec, fk, storage));
+        return new CreateTableSpec(spec.tableName(), spec.columns(), spec.primaryKey(), List.copyOf(foreignKeys));
     }
 
     private static void checkLength(ColumnSchema column) {
@@ -68,7 +69,7 @@ public final class DdlValidator {
         }
     }
 
-    private void validateForeignKey(CreateTableSpec spec, ForeignKeySpec fk, IStorageManager storage) {
+    private ForeignKeySpec validateForeignKey(CreateTableSpec spec, ForeignKeySpec fk, IStorageManager storage) {
         String table = spec.tableName();
         for (String name : fk.columnNames()) {
             if (column(spec.columns(), name).isEmpty())
@@ -80,12 +81,14 @@ public final class DdlValidator {
 
         // The table being created may reference itself.
         List<ColumnSchema> referenced;
+        String referencedTable;
         if (fk.referencedTable().equalsIgnoreCase(table)) {
             referenced = spec.columns();
+            referencedTable = table;
         } else {
-            String actual = catalogName(storage, fk.referencedTable()).orElseThrow(() ->
+            referencedTable = catalogName(storage, fk.referencedTable()).orElseThrow(() ->
                     QoErrors.semantic("foreign key references unknown table '" + fk.referencedTable() + "'"));
-            referenced = storage.getSchema(actual).columns();
+            referenced = storage.getSchema(referencedTable).columns();
         }
         for (int i = 0; i < fk.columnNames().size(); i++) {
             ColumnSchema local = column(spec.columns(), fk.columnNames().get(i)).orElseThrow();
@@ -97,6 +100,7 @@ public final class DdlValidator {
                         + ") does not match referenced column '" + fk.referencedTable() + "." + target.name()
                         + "' (" + target.dataType() + ")");
         }
+        return new ForeignKeySpec(fk.columnNames(), referencedTable, fk.referencedColumns());
     }
 
     private DropTableSpec validateDrop(DropTableSpec spec, IStorageManager storage) {

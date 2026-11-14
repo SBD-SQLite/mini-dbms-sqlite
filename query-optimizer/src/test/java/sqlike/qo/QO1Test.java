@@ -92,8 +92,10 @@ public final class QO1Test {
             check(c[1] <= c[0], "after " + c[1] + " must not exceed before " + c[0]);
         });
         test("explainQuery with an index shows INDEX_SCAN and IndexCondition; cost does not increase", () -> {
+            // students needs enough blocks for a 3-page hash lookup to beat a full scan under CostModel (the default mock has 50 blocks).
             QueryOptimizer indexed = new QueryOptimizer(MockStorageManager.create(
-                    List.of(new IndexMetadata("idx_id", "students", "id", IndexType.HASH))));
+                    List.of(new IndexMetadata("idx_id", "students", "id", IndexType.HASH)),
+                    java.util.Map.of(), java.util.Map.of("students", MockStorageManager.largeStatistics("students"))));
             String text = indexed.explainQuery("SELECT name FROM students WHERE id = 5");
             String after = text.substring(text.indexOf("== After =="));
             check(after.contains("INDEX_SCAN students [index scan] using idx_id IndexCondition(EQ, key=5"), text);
@@ -331,10 +333,21 @@ public final class QO1Test {
                     create("courses", ok, List.of("id"), List.of(new ForeignKeySpec(List.of("id"), "Students", List.of("id")))),
                     create("tree", List.of(INT_ID, col("up", DataType.INTEGER, null)), List.of("id"),
                             List.of(new ForeignKeySpec(List.of("up"), "TREE", List.of("id")))));
-            for (PlanNode plan : valid) {
+            // Foreign-key targets come back spelled as the catalog (or, for a self reference, the new table) spells them.
+            List<List<String>> expectedTargets = List.of(List.of(), List.of(), List.of("dept"), List.of("Students"), List.of("tree"));
+            for (int i = 0; i < valid.size(); i++) {
+                PlanNode plan = valid.get(i);
                 QueryPlan result = ddl.optimizeQuery(new ParsedQuery(StatementType.CREATE_TABLE, Optional.of(plan), Optional.empty()));
                 eq(PlanNodeKind.CREATE_TABLE, result.root().kind());
-                eq(plan.createTable(), result.root().createTable());
+                CreateTableSpec given = plan.createTable().orElseThrow(), returned = result.root().createTable().orElseThrow();
+                eq(given.tableName(), returned.tableName());
+                eq(given.columns(), returned.columns());
+                eq(given.primaryKey(), returned.primaryKey());
+                eq(expectedTargets.get(i), returned.foreignKeys().stream().map(ForeignKeySpec::referencedTable).toList());
+                eq(given.foreignKeys().stream().map(ForeignKeySpec::columnNames).toList(),
+                        returned.foreignKeys().stream().map(ForeignKeySpec::columnNames).toList());
+                eq(given.foreignKeys().stream().map(ForeignKeySpec::referencedColumns).toList(),
+                        returned.foreignKeys().stream().map(ForeignKeySpec::referencedColumns).toList());
                 eq(0.0, result.estimatedCost());
                 eq(0.0, ddl.getCost(result));
             }
@@ -368,6 +381,31 @@ public final class QO1Test {
             });
         }
 
+        test("DDL: definition errors written as SQL are SEMANTIC_ERROR; grammar errors stay SYNTAX_ERROR", () -> {
+            for (String sql : List.of("CREATE TABLE t (a INTEGER, a INTEGER)", "CREATE TABLE t (a INTEGER, A FLOAT)",
+                    "CREATE TABLE t (s CHAR)", "CREATE TABLE t (s VARCHAR)", "CREATE TABLE t (s CHAR(0))",
+                    "CREATE TABLE t (s VARCHAR(-3))", "CREATE TABLE t (n INTEGER(4))", "CREATE TABLE t (n FLOAT(8))",
+                    "CREATE TABLE t (id INTEGER, FOREIGN KEY (id) REFERENCES dept(dept_id, dname))",
+                    "CREATE TABLE t (PRIMARY KEY (a))"))
+                error(ErrorCode.SEMANTIC_ERROR, () -> ddl.optimizeQuery(ddl.parseQuery(sql)));
+            for (String sql : List.of("CREATE TABLE t (a INTEGER", "CREATE TABLE t (s CHAR(", "CREATE TABLE t (s CHAR(x))",
+                    "CREATE TABLE t (s CHAR(5)", "CREATE TABLE t (a UNKNOWNTYPE)"))
+                error(ErrorCode.SYNTAX_ERROR, () -> ddl.optimizeQuery(ddl.parseQuery(sql)));
+        });
+        test("DDL: foreign-key targets written in another case come back in catalog spelling, DROP too, cost 0", () -> {
+            QueryPlan other = ddl.optimizeQuery(ddl.parseQuery(
+                    "CREATE TABLE Kid (id INTEGER, d INTEGER, PRIMARY KEY (id), FOREIGN KEY (d) REFERENCES DEPT(Dept_Id))"));
+            eq("dept", other.root().createTable().orElseThrow().foreignKeys().get(0).referencedTable());
+            eq(List.of("Dept_Id"), other.root().createTable().orElseThrow().foreignKeys().get(0).referencedColumns());
+            eq("Kid", other.root().createTable().orElseThrow().tableName());
+            eq(0.0, other.estimatedCost());
+            QueryPlan self = ddl.optimizeQuery(ddl.parseQuery(
+                    "CREATE TABLE Staff (id INTEGER, boss INTEGER, FOREIGN KEY (boss) REFERENCES STAFF(id))"));
+            eq("Staff", self.root().createTable().orElseThrow().foreignKeys().get(0).referencedTable());
+            QueryPlan drop = ddl.optimizeQuery(ddl.parseQuery("DROP TABLE STUDENTS CASCADE"));
+            eq("Students", drop.root().dropTable().orElseThrow().tableName());
+            eq(0.0, drop.estimatedCost());
+        });
         test("DDL: DROP TABLE of an unknown table is rejected, for RESTRICT and CASCADE", () -> {
             for (DropBehavior b : DropBehavior.values())
                 error(ErrorCode.SEMANTIC_ERROR, () -> validator.validate(drop("ghost", b), ddlCatalog()));

@@ -2,10 +2,12 @@ package sqlike.qo;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Supplier;
 
 import sqlike.contract.IStorageManager;
@@ -13,7 +15,10 @@ import sqlike.shared.*;
 
 public final class Binder {
     private final IStorageManager storage;
-    private final ThreadLocal<List<Relation>> outerScope = ThreadLocal.withInitial(List::of);
+    /** Enclosing query levels visible to the subquery being bound, nearest level first. */
+    private final ThreadLocal<List<List<Relation>>> outerScope = ThreadLocal.withInitial(List::of);
+    /** One probe per subquery currently being bound; records whether it referenced a relation from outside itself. */
+    private final ThreadLocal<List<CorrelationProbe>> probes = ThreadLocal.withInitial(ArrayList::new);
 
     public Binder(IStorageManager storage) {
         if (storage == null) throw new IllegalArgumentException("storage is required");
@@ -25,10 +30,12 @@ public final class Binder {
         PlanNode root = query.root().orElseThrow(() -> QoErrors.invalidState("statement has no plan root"));
         PlanNodes.validate(root);
         outerScope.set(List.of());
+        probes.get().clear();
         try {
             return bindNode(root);
         } finally {
             outerScope.remove();
+            probes.remove();
         }
     }
 
@@ -113,13 +120,16 @@ public final class Binder {
         List<String> common = spec.commonColumns();
         Optional<Expression> condition = spec.condition();
         if (spec.joinType() == JoinType.NATURAL) {
-            Map<String, DataType> leftNames = uniqueOutputNames(left.outputColumns());
-            Map<String, DataType> rightNames = uniqueOutputNames(right.outputColumns());
+            Map<String, List<ResultColumn>> leftNames = outputsByName(left.outputColumns());
+            Map<String, List<ResultColumn>> rightNames = outputsByName(right.outputColumns());
             common = leftNames.keySet().stream().filter(rightNames::containsKey).toList();
             if (common.isEmpty()) throw QoErrors.semantic("NATURAL JOIN has no columns in common");
             for (String name : common) {
-                if (!compatible(leftNames.get(key(name)), rightNames.get(key(name))))
-                    throw QoErrors.semantic("incompatible types for NATURAL JOIN column '" + name + "'");
+                // Only a column name shared by both sides must be unique on each side; other repeated names are irrelevant.
+                if (leftNames.get(name).size() > 1 || rightNames.get(name).size() > 1)
+                    throw QoErrors.semantic("ambiguous natural join column '" + leftNames.get(name).get(0).name() + "'");
+                if (!compatible(leftNames.get(name).get(0).dataType(), rightNames.get(name).get(0).dataType()))
+                    throw QoErrors.semantic("incompatible types for NATURAL JOIN column '" + leftNames.get(name).get(0).name() + "'");
             }
         } else {
             List<Relation> joinRelations = mergeScope(scope(left), scope(right));
@@ -186,14 +196,21 @@ public final class Binder {
     }
 
     private Expression bindExpression(Expression expression, List<Relation> relations) {
-
-        // TODO(QO): Resolve correlated-subquery metadata as part of SQL subquery integration.
         if (expression.kind() == ExpressionKind.SUBQUERY) {
             SubquerySpec spec = expression.subquery()
                     .orElseThrow(() -> QoErrors.invalidState("subquery expression is missing its plan"));
-            List<Relation> correlationScope = spec.correlated()
-                    ? concatScope(relations, outerScope.get()) : List.of();
-            PlanNode boundRoot = withOuterScope(correlationScope, () -> bindNode(spec.root()));
+            // The subquery sees its own FROM first, then this query's relations, then the levels above this query.
+            List<List<Relation>> levels = new ArrayList<>();
+            levels.add(relations);
+            levels.addAll(outerScope.get());
+            CorrelationProbe probe = new CorrelationProbe(levels.stream().flatMap(List::stream).toList());
+            probes.get().add(probe);
+            PlanNode boundRoot;
+            try {
+                boundRoot = withOuterScope(List.copyOf(levels), () -> bindNode(spec.root()));
+            } finally {
+                probes.get().remove(probes.get().size() - 1);
+            }
             int outputCount = boundRoot.outputColumns().size();
             if ((spec.type() == SubqueryType.IN || spec.type() == SubqueryType.SCALAR) && outputCount != 1)
                 throw QoErrors.semantic(spec.type() + " subquery must return exactly one column");
@@ -206,7 +223,8 @@ public final class Binder {
                 if (!compatible(leftType, subqueryType))
                     throw QoErrors.semantic("IN operand type is incompatible with subquery result column");
             }
-            SubquerySpec boundSpec = new SubquerySpec(spec.type(), boundRoot, spec.correlated());
+            // correlated is derived from what the subquery actually referenced, not from the flag it arrived with.
+            SubquerySpec boundSpec = new SubquerySpec(spec.type(), boundRoot, probe.hit);
             return new Expression(expression.kind(), expression.literal(), expression.column(), expression.operator(),
                     operands, Optional.of(boundSpec));
         }
@@ -284,9 +302,17 @@ public final class Binder {
 
     private ColumnRef resolve(ColumnRef ref, List<Relation> relations) {
         List<Relation> candidates = matchingRelations(ref, relations);
-        if (candidates.isEmpty()) candidates = matchingRelations(ref, outerScope.get());
+        boolean outer = false;
+        if (candidates.isEmpty()) {
+            // Nearest enclosing level wins; ambiguity is only judged inside one level.
+            for (List<Relation> level : outerScope.get()) {
+                candidates = matchingRelations(ref, level);
+                if (!candidates.isEmpty()) { outer = true; break; }
+            }
+        }
         if (candidates.isEmpty()) throw QoErrors.semantic("unknown column '" + render(ref) + "'");
         if (candidates.size() > 1) throw QoErrors.semantic("ambiguous column '" + ref.columnName() + "'");
+        if (outer) for (CorrelationProbe probe : probes.get()) probe.note(candidates.get(0));
         ColumnSchema col = column(candidates.get(0).schema(), ref.columnName());
         return Refs.column(candidates.get(0).qualifier(), col.name());
     }
@@ -303,9 +329,25 @@ public final class Binder {
             String qualifier = scan.alias().orElse(schema.tableName());
             if (found.stream().anyMatch(r -> same(r.qualifier(), qualifier)))
                 throw QoErrors.semantic("duplicate table alias or qualifier '" + qualifier + "'");
-            found.add(new Relation(schema, qualifier));
+            found.add(new Relation(schema, qualifier, Set.of()));
         });
-        node.children().forEach(child -> collectRelations(child, found));
+        boolean natural = node.join().filter(spec -> spec.joinType() == JoinType.NATURAL).isPresent() && node.children().size() == 2;
+        if (!natural) {
+            node.children().forEach(child -> collectRelations(child, found));
+            return;
+        }
+        // The common columns of a NATURAL JOIN appear once, as the left side's column; the right side's copy is hidden
+        // from unqualified references (it can still be named with its own qualifier).
+        collectRelations(node.children().get(0), found);
+        int rightStart = found.size();
+        collectRelations(node.children().get(1), found);
+        Set<String> merged = new HashSet<>(node.join().orElseThrow().commonColumns().stream().map(Binder::key).toList());
+        for (int i = rightStart; i < found.size(); i++) {
+            Relation relation = found.get(i);
+            Set<String> hidden = new HashSet<>(relation.hiddenColumns());
+            hidden.addAll(merged);
+            found.set(i, new Relation(relation.schema(), relation.qualifier(), Set.copyOf(hidden)));
+        }
     }
 
     private void validateUniqueAliases(PlanNode left, PlanNode right) {
@@ -333,14 +375,8 @@ public final class Binder {
         return List.copyOf(merged);
     }
 
-    private List<Relation> concatScope(List<Relation> left, List<Relation> right) {
-        List<Relation> result = new ArrayList<>(left);
-        result.addAll(right);
-        return List.copyOf(result);
-    }
-
-    private <T> T withOuterScope(List<Relation> scope, Supplier<T> action) {
-        List<Relation> previous = outerScope.get();
+    private <T> T withOuterScope(List<List<Relation>> scope, Supplier<T> action) {
+        List<List<Relation>> previous = outerScope.get();
         outerScope.set(scope);
         try {
             return action.get();
@@ -353,16 +389,16 @@ public final class Binder {
         return relations.stream()
                 .filter(r -> ref.tableName().isEmpty() || same(r.qualifier(), ref.tableName().get()))
                 .filter(r -> r.schema().columns().stream().anyMatch(c -> same(c.name(), ref.columnName())))
+                .filter(r -> ref.tableName().isPresent() || !r.hiddenColumns().contains(key(ref.columnName())))
                 .toList();
     }
 
-    private Map<String, DataType> uniqueOutputNames(List<ResultColumn> columns) {
-        Map<String, DataType> result = new LinkedHashMap<>();
+    /** Output columns grouped by lower-case name, in first-occurrence order. */
+    private Map<String, List<ResultColumn>> outputsByName(List<ResultColumn> columns) {
+        Map<String, List<ResultColumn>> result = new LinkedHashMap<>();
         for (ResultColumn output : columns) {
             output.source().orElseThrow(() -> QoErrors.semantic("NATURAL JOIN requires resolved columns"));
-            String name = key(output.name());
-            if (result.putIfAbsent(name, output.dataType()) != null)
-                throw QoErrors.semantic("ambiguous natural join column '" + output.name() + "'");
+            result.computeIfAbsent(key(output.name()), name -> new ArrayList<>()).add(output);
         }
         return result;
     }
@@ -378,7 +414,7 @@ public final class Binder {
     private ColumnSchema columnSchema(ColumnRef ref, List<Relation> relations) {
         String qualifier = ref.tableName().orElseThrow(() -> QoErrors.semantic("unqualified column is not bound"));
         Relation relation = relations.stream().filter(r -> same(r.qualifier(), qualifier)).findFirst()
-                .or(() -> outerScope.get().stream().filter(r -> same(r.qualifier(), qualifier)).findFirst())
+                .or(() -> outerScope.get().stream().flatMap(List::stream).filter(r -> same(r.qualifier(), qualifier)).findFirst())
                 .orElseThrow(() -> QoErrors.semantic("unknown table or alias '" + qualifier + "'"));
         return column(relation.schema(), ref.columnName());
     }
@@ -417,7 +453,18 @@ public final class Binder {
     private static String key(String value) { return value.toLowerCase(Locale.ROOT); }
     private static boolean same(String a, String b) { return a.equalsIgnoreCase(b); }
 
-    private record Relation(TableSchema schema, String qualifier) { }
+    /** {@code hiddenColumns}: lower-case names merged away by a NATURAL JOIN; unqualified references skip this relation for them. */
+    private record Relation(TableSchema schema, String qualifier, Set<String> hiddenColumns) { }
+
+    /** {@code outside} = every relation visible from outside the subquery; a hit on one of them makes the subquery correlated. */
+    private static final class CorrelationProbe {
+        private final List<Relation> outside;
+        private boolean hit;
+
+        CorrelationProbe(List<Relation> outside) { this.outside = outside; }
+
+        void note(Relation relation) { if (outside.contains(relation)) hit = true; }
+    }
 
     private PlanNode copy(PlanNode n, List<PlanNode> children, List<ResultColumn> outputs, Optional<ScanSpec> scan,
                           Optional<Expression> predicate, List<ColumnRef> projection, Optional<JoinSpec> join,

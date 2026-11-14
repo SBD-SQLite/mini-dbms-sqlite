@@ -21,6 +21,12 @@ final class MockStorageManager {
     }
 
     static IStorageManager create(List<IndexMetadata> indexes, Map<String, IndexStatistics> indexStats) {
+        return create(indexes, indexStats, Map.of());
+    }
+
+    /** {@code tableStats} replaces the default statistics of the named tables (lower-case keys). */
+    static IStorageManager create(List<IndexMetadata> indexes, Map<String, IndexStatistics> indexStats,
+                                  Map<String, TableStatistics> tableStats) {
         Map<String, TableSchema> schemas = new LinkedHashMap<>();
         Map<String, TableStatistics> stats = new LinkedHashMap<>();
         add(schemas, stats, "students", List.of(
@@ -34,6 +40,7 @@ final class MockStorageManager {
                 col("id", DataType.INTEGER, null), col("course_id", DataType.INTEGER, null),
                 col("grade", DataType.CHAR, 2)),
                 new TableStatistics(10000, 40, 16, 256, Map.of("id", 4500L, "course_id", 200L, "grade", 10L)));
+        stats.putAll(tableStats);
         return (IStorageManager) Proxy.newProxyInstance(MockStorageManager.class.getClassLoader(),
                 new Class<?>[] { IStorageManager.class }, (proxy, method, args) -> switch (method.getName()) {
                     case "listTables" -> new ArrayList<>(schemas.keySet());
@@ -57,7 +64,17 @@ final class MockStorageManager {
         stats.put(name, statistics);
     }
 
-    private static IndexStatistics defaultIndexStatistics(IndexMetadata definition) {
+    /** Tables large enough (thousands of blocks) that an index lookup is a reasonable alternative to a full scan under CostModel. */
+    static TableStatistics largeStatistics(String table) {
+        return switch (table.toLowerCase(java.util.Locale.ROOT)) {
+            case "students" -> new TableStatistics(100000, 2000, 40, 50, Map.of("id", 100000L, "name", 90000L, "gpa", 400L, "dept_id", 20L));
+            case "takes" -> new TableStatistics(200000, 4000, 16, 50, Map.of("id", 100000L, "course_id", 200L, "grade", 10L));
+            default -> null;
+        };
+    }
+
+    /** Statistics SM would report for a small index: B+Tree height 2 / 1 leaf, HASH with 1 bucket and no overflow; never clustered. */
+    static IndexStatistics defaultIndexStatistics(IndexMetadata definition) {
         return definition.indexType() == IndexType.BPLUS_TREE
                 ? new IndexStatistics(OptionalInt.of(2), OptionalInt.empty(),
                         OptionalLong.of(1), OptionalLong.empty(), false)
