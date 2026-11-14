@@ -124,12 +124,88 @@ public final class QO2Test {
                 "INSERT INTO employees VALUES (id)", "CREATE INDEX ix ON employees(id, salary)",
                 "CREATE INDEX ix ON employees(id) USING unknown", "DELETE FROM employees WHERE (id = 1"))
             test("reject " + sql, () -> error(ErrorCode.SYNTAX_ERROR, () -> parse(sql)));
-        for (String sql : List.of("DELETE FROM employees WHERE NOT id = 1", "DELETE FROM employees WHERE id = NULL",
-                "UPDATE employees SET salary = (SELECT salary FROM employees)", "CREATE TABLE employees (id INTEGER)", "DROP TABLE employees"))
+        for (String sql : List.of("DELETE FROM employees WHERE NOT id = 1", "DELETE FROM employees WHERE id = NULL"))
             test("unsupported " + sql, () -> error(ErrorCode.UNSUPPORTED_OPERATION, () -> parse(sql)));
         test("integer overflow", () -> error(ErrorCode.INVALID_VALUE, () -> expr("2147483648")));
         test("unsupported OR", () -> error(ErrorCode.UNSUPPORTED_OPERATION, () -> expr("a = 1 OR b = 2")));
         test("unsupported OR inside parentheses", () -> error(ErrorCode.UNSUPPORTED_OPERATION, () -> expr("(a = 1 OR b = 2)")));
+        test("QO17 DDL specs", () -> {
+            ParsedQuery query = parse("CREATE TABLE child (id INTEGER PRIMARY KEY, score FLOAT, code CHAR(4), label VARCHAR(80), parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES parent(id));");
+            eq(StatementType.CREATE_TABLE, query.statementType());
+            PlanNode root = query.root().orElseThrow();
+            PlanNodes.validate(root);
+            eq(PlanNodeKind.CREATE_TABLE, root.kind());
+            CreateTableSpec spec = root.createTable().orElseThrow();
+            eq("child", spec.tableName());
+            eq(List.of(new ColumnSchema("id", DataType.INTEGER, Optional.empty()),
+                    new ColumnSchema("score", DataType.FLOAT, Optional.empty()),
+                    new ColumnSchema("code", DataType.CHAR, Optional.of(4)),
+                    new ColumnSchema("label", DataType.VARCHAR, Optional.of(80)),
+                    new ColumnSchema("parent_id", DataType.INTEGER, Optional.empty())), spec.columns());
+            eq(List.of("id"), spec.primaryKey());
+            eq(List.of(new ForeignKeySpec(List.of("parent_id"), "parent", List.of("id"))), spec.foreignKeys());
+            eq(List.of("a", "b"), parse("create table t (a integer, b integer, primary key (a,b), foreign key (a,b) references p(x,y))")
+                    .root().orElseThrow().createTable().orElseThrow().primaryKey());
+            eq(List.of(), parse("CREATE TABLE t (id INTEGER)").root().orElseThrow().createTable().orElseThrow().primaryKey());
+            eq(List.of(new ForeignKeySpec(List.of("a", "b"), "p", List.of("x", "y"))),
+                    parse("CREATE TABLE t (a INTEGER, b INTEGER, FOREIGN KEY (a,b) REFERENCES p(x,y))")
+                            .root().orElseThrow().createTable().orElseThrow().foreignKeys());
+            for (String suffix : List.of("", " CASCADE", " RESTRICT")) {
+                ParsedQuery drop = parse("DROP TABLE child" + suffix + ";");
+                eq(StatementType.DROP_TABLE, drop.statementType());
+                PlanNodes.validate(drop.root().orElseThrow());
+                eq(new DropTableSpec("child", suffix.contains("CASCADE") ? DropBehavior.CASCADE : DropBehavior.RESTRICT),
+                        drop.root().orElseThrow().dropTable().orElseThrow());
+            }
+
+        });
+
+        for (String sql : List.of("CREATE TABLE t ()", "CREATE TABLE t (id INT)", "CREATE TABLE t (s CHAR)",
+                "CREATE TABLE t (s VARCHAR(0))", "CREATE TABLE t (s CHAR(-1))", "CREATE TABLE t (s VARCHAR(1.5))",
+                "CREATE TABLE t (s CHAR(2147483648))", "CREATE TABLE t (id INTEGER,)", "CREATE TABLE t (id INTEGER",
+                "CREATE TABLE t (id INTEGER, PRIMARY (id))", "CREATE TABLE t (id INTEGER, PRIMARY KEY ())",
+                "CREATE TABLE t (id INTEGER, FOREIGN KEY (id) parent(id))",
+                "CREATE TABLE t (id INTEGER, FOREIGN KEY (id) REFERENCES p())",
+                "CREATE TABLE t (id INTEGER, FOREIGN KEY (id) REFERENCES p(a,b))",
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, PRIMARY KEY (id))",
+                "CREATE TABLE t (id INTEGER, ID FLOAT)", "CREATE TABLE t (id INTEGER(4))",
+                "CREATE TABLE t (id INTEGER); DROP TABLE t",
+                "DROP t", "DROP TABLE", "DROP TABLE t CASCADE RESTRICT", "DROP TABLE t junk")) {
+            test("QO17 reject " + sql, () -> error(ErrorCode.SYNTAX_ERROR, () -> parse(sql)));
+
+        }
+        test("QO17 subquery payloads and nesting", () -> {
+            Expression in = predicate("id IN (SELECT id FROM child WHERE score > 2) AND id > 0").operands().get(0);
+            eq(ExpressionKind.SUBQUERY, in.kind());
+            eq(SubqueryType.IN, in.subquery().orElseThrow().type());
+            eq("id", in.operands().get(0).column().orElseThrow().columnName());
+            eq(PlanNodeKind.PROJECT, in.subquery().orElseThrow().root().kind());
+            eq(false, in.subquery().orElseThrow().correlated());
+            Expression exists = predicate("EXISTS (SELECT * FROM child WHERE id = 1)");
+            eq(SubqueryType.EXISTS, exists.subquery().orElseThrow().type());
+            eq(List.of(), exists.operands());
+            for (String op : List.of("=", "<>", "!=", ">", ">=", "<", "<=")) {
+                Expression cmp = predicate("id " + op + " (SELECT id FROM child)");
+                eq(ExpressionKind.BINARY, cmp.kind());
+                Expression scalar = cmp.operands().get(1);
+                eq(ExpressionKind.SUBQUERY, scalar.kind());
+                eq(SubqueryType.SCALAR, scalar.subquery().orElseThrow().type());
+                eq(List.of(), scalar.operands());
+            }
+            Expression nested = predicate("EXISTS (SELECT id FROM child WHERE id IN (SELECT id FROM parent))");
+            eq(SubqueryType.IN, nested.subquery().orElseThrow().root().children().get(0)
+                    .predicate().orElseThrow().subquery().orElseThrow().type());
+            predicate("id IN (SELECT id FROM child ORDER BY id) AND EXISTS (SELECT * FROM parent)");
+            predicate("EXISTS (SELECT * FROM child WHERE child.id = outer_table.id)");
+
+        });
+        for (String condition : List.of("id IN (SELECT FROM child)", "id IN (SELECT id FROM child",
+                "EXISTS SELECT id FROM child", "EXISTS ()", "id = (SELECT id FROM)",
+                "id IN (SELECT id FROM child;)", "id = (SELECT id FROM child) = 2",
+                "id IN (SELECT id FROM child) garbage")) {
+            test("QO17 reject " + condition, () -> error(ErrorCode.SYNTAX_ERROR, () -> predicate(condition)));
+
+        }
         System.out.printf("QO2: %d passed, %d failed%n", passed, failed);
         return failed;
     }
@@ -150,5 +226,13 @@ public final class QO2Test {
     static void test(String name, Runnable action) {
         try { action.run(); passed++; System.out.println("PASS " + name); }
         catch (Throwable e) { failed++; System.out.println("FAIL " + name + ": " + e); }
+    }
+
+
+
+    private static Expression predicate(String condition) {
+        PlanNode root = parse("SELECT id FROM outer_table WHERE " + condition).root().orElseThrow();
+        PlanNodes.validate(root);
+        return root.children().get(0).predicate().orElseThrow();
     }
 }
