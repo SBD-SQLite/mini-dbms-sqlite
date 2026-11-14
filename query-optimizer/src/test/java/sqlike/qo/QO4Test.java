@@ -12,13 +12,19 @@ public final class QO4Test {
     public static int run() {
         passed = failed = 0;
         test("splits AND and pushes table-local filters", QO4Test::selectionPushdown);
+        test("orders simple filters by estimated selectivity", QO4Test::selectivityOrder);
         test("keeps cross-input predicates above joins", QO4Test::crossPredicateStays);
         test("swaps adjacent filters and preserves results", QO4Test::filterSwap);
         test("moves filters through sort and safe projection", QO4Test::filterMovement);
         test("keeps columns needed by SELECT, WHERE, ORDER BY and join", QO4Test::projectionRequirements);
         test("pushes projection to the useful join side", QO4Test::oneSidedProjection);
         test("flattens projection chains and preserves output order", QO4Test::projectionShape);
+        test("removes identity projections", QO4Test::identityProjection);
         test("maintains NATURAL JOIN metadata and unique output names", QO4Test::naturalJoinMetadata);
+        test("leaves projection above an ambiguously mapped NATURAL JOIN", QO4Test::ambiguousNaturalProjection);
+        test("handles aliased relations during pushdown", QO4Test::aliasPushdown);
+        test("keeps LIMIT and correlated subqueries as rewrite boundaries", QO4Test::rewriteBoundaries);
+        test("keeps parsed subquery predicates at their original scope", QO4Test::parsedSubqueryBoundary);
         test("preserves result rows across representative rewrite", QO4Test::rewriteIsEquivalent);
         test("does not mutate the input plan and preserves metadata", QO4Test::inputAndMetadata);
         System.out.printf("QO4: %d passed, %d failed%n", passed, failed);
@@ -35,6 +41,13 @@ public final class QO4Test {
         eq(2, filters.size());
         for (PlanNode f : filters) check(f.predicate().orElseThrow().operator().orElse(null) != ExpressionOperator.AND,
                 "AND was not decomposed");
+    }
+
+    private static void selectivityOrder() {
+        PlanNode root = rewrite("SELECT name FROM students WHERE gpa >= 3.0 AND id = 5");
+        PlanNode first = find(root, PlanNodeKind.FILTER);
+        eq("(students.gpa >= 3.0)", PlanPrinter.expr(first.predicate().orElseThrow()));
+        eq("(students.id = 5)", PlanPrinter.expr(first.children().get(0).predicate().orElseThrow()));
     }
 
     private static void crossPredicateStays() {
@@ -104,6 +117,13 @@ public final class QO4Test {
         eq(List.of("dname", "name"), query.outputColumns().stream().map(ResultColumn::name).toList());
     }
 
+    private static void identityProjection() {
+        PlanNode root = rewrite("SELECT * FROM students WHERE id = 5");
+        eq(0, ofKind(root, PlanNodeKind.PROJECT).size());
+        eq(PlanNodeKind.FILTER, root.kind());
+        eq(PlanNodeKind.SCAN, root.children().get(0).kind());
+    }
+
     private static void naturalJoinMetadata() {
         IStorageManager storage = MockStorageManager.create();
         ParsedQuery query = new QueryOptimizer(storage).parseQuery(
@@ -117,6 +137,80 @@ public final class QO4Test {
         }
         check(new CardinalityEstimator(storage).estimateRows(plan.children().get(0)) > 0,
                 "estimator cannot read rewritten NATURAL JOIN metadata");
+        PlanNode narrow = rewrite("SELECT students.name FROM students NATURAL JOIN dept NATURAL JOIN takes");
+        check(narrow.outputColumns().size() == 1, "narrow projection was lost on a multi-table NATURAL JOIN");
+    }
+
+    private static void ambiguousNaturalProjection() {
+        PlanNode students = scanWithColumns("students",
+                new ResultColumn("id", Optional.of(Refs.column("students", "id")), DataType.INTEGER),
+                new ResultColumn("name", Optional.of(Refs.column("students", "name")), DataType.VARCHAR));
+        PlanNode dept = scanWithColumns("dept",
+                new ResultColumn("id", Optional.of(Refs.column("dept", "id")), DataType.INTEGER));
+        PlanNode left = withOutputs(PlanNodes.join(students, dept,
+                new JoinSpec(JoinType.THETA, Optional.empty(), JoinAlgorithm.BLOCK_NESTED_LOOP, List.of())),
+                List.of(students.outputColumns().get(0), students.outputColumns().get(1), dept.outputColumns().get(0)));
+        PlanNode takes = scanWithColumns("takes",
+                new ResultColumn("id", Optional.of(Refs.column("takes", "id")), DataType.INTEGER));
+        PlanNode natural = withOutputs(PlanNodes.join(left, takes,
+                new JoinSpec(JoinType.NATURAL, Optional.empty(), JoinAlgorithm.BLOCK_NESTED_LOOP, List.of("id"))),
+                left.outputColumns());
+        PlanNode input = PlanNodes.project(natural, List.of(Refs.column("students", "name")));
+        PlanNode output = new SelectionProjectionRewriter().rewrite(input);
+        eq(PlanNodeKind.PROJECT, output.kind());
+        eq(List.of("students.name"), output.projection().stream().map(PlanPrinter::col).toList());
+    }
+
+    private static void aliasPushdown() {
+        PlanNode root = rewrite("SELECT s.name FROM students AS s, dept AS d "
+                + "WHERE s.id > 1 AND s.dept_id = d.dept_id");
+        PlanNode cart = find(root, PlanNodeKind.CARTESIAN);
+        check(cart != null, "Cartesian product disappeared");
+        check(hasFilter(cart.children().get(0), "(s.id > 1)"), "alias filter was not pushed to its input");
+        check(!hasFilter(cart.children().get(1), "(s.id > 1)"), "alias filter reached the wrong input");
+        check(findProjectAboveScan(root, "students") != null, "projection was not pushed to aliased scan");
+    }
+
+    private static void rewriteBoundaries() {
+        IStorageManager storage = MockStorageManager.create();
+        PlanNode bound = new Binder(storage).bind(new QueryOptimizer(storage).parseQuery("SELECT * FROM students"));
+        PlanNode scan = bound.children().get(0);
+        PlanNode limit = PlanNodes.limit(scan, new LimitSpec(1));
+        PlanNode filtered = new SelectionProjectionRewriter().rewrite(
+                PlanNodes.filter(limit, expr("students.id > 1")));
+        eq(PlanNodeKind.FILTER, filtered.kind());
+        eq(PlanNodeKind.LIMIT, filtered.children().get(0).kind());
+        PlanNode projected = new SelectionProjectionRewriter().rewrite(
+                PlanNodes.project(limit, List.of(Refs.column("students", "name"))));
+        eq(PlanNodeKind.PROJECT, projected.kind());
+        eq(PlanNodeKind.LIMIT, projected.children().get(0).kind());
+
+        ParsedQuery parsed = new QueryOptimizer(storage).parseQuery("SELECT students.name, dept.dname FROM students "
+                + "JOIN dept ON students.dept_id = dept.dept_id");
+        PlanNode boundJoin = new Binder(storage).bind(parsed).children().get(0);
+        PlanNode subqueryRoot = PlanNodes.filter(PlanNodes.scan("takes"), expr("takes.id = students.id"));
+        Expression exists = new Expression(ExpressionKind.SUBQUERY, Optional.empty(), Optional.empty(),
+                Optional.empty(), List.of(), Optional.of(new SubquerySpec(SubqueryType.EXISTS, subqueryRoot, true)));
+        PlanNode filteredJoin = PlanNodes.filter(boundJoin, exists);
+        PlanNode correlated = new SelectionProjectionRewriter().rewrite(
+                PlanNodes.project(filteredJoin, List.of(Refs.column("students", "name"))));
+        eq(PlanNodeKind.PROJECT, correlated.kind());
+        eq(PlanNodeKind.FILTER, correlated.children().get(0).kind());
+        eq(PlanNodeKind.JOIN, correlated.children().get(0).children().get(0).kind());
+    }
+
+    private static void parsedSubqueryBoundary() {
+        IStorageManager storage = MockStorageManager.create();
+        ParsedQuery parsed = new QueryOptimizer(storage).parseQuery(
+                "SELECT name FROM students WHERE EXISTS (SELECT dept_id FROM dept)");
+        PlanNode bound = new Binder(storage).bind(parsed);
+        PlanNode rewritten = new SelectionProjectionRewriter(new CardinalityEstimator(storage)).rewrite(bound);
+        PlanNode filter = find(rewritten, PlanNodeKind.FILTER);
+        check(filter != null, "subquery filter disappeared");
+        eq(ExpressionKind.SUBQUERY, filter.predicate().orElseThrow().kind());
+        eq(SubqueryType.EXISTS, filter.predicate().orElseThrow().subquery().orElseThrow().type());
+        eq(PlanNodeKind.SCAN, filter.children().get(0).kind());
+        PlanNodes.validate(rewritten);
     }
 
     private static void rewriteIsEquivalent() {
@@ -146,7 +240,16 @@ public final class QO4Test {
 
     private static PlanNode rewrite(String sql) {
         IStorageManager s = MockStorageManager.create();
-        return new SelectionProjectionRewriter().rewrite(new Binder(s).bind(new QueryOptimizer(s).parseQuery(sql)));
+        return new SelectionProjectionRewriter(new CardinalityEstimator(s))
+                .rewrite(new Binder(s).bind(new QueryOptimizer(s).parseQuery(sql)));
+    }
+    private static PlanNode scanWithColumns(String table, ResultColumn... columns) {
+        return withOutputs(PlanNodes.scan(table), List.of(columns));
+    }
+    private static PlanNode withOutputs(PlanNode node, List<ResultColumn> outputs) {
+        return new PlanNode(node.kind(), node.children(), outputs, node.estimatedRows(), node.scan(), node.predicate(),
+                node.projection(), node.join(), node.sort(), node.mutation(), node.createIndex(), node.limit(),
+                node.createTable(), node.dropTable());
     }
     private static Expression expr(String sql) {
         TokenStream ts = new Lexer().tokenize(sql);
