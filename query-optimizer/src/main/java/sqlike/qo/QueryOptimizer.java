@@ -30,11 +30,12 @@ public class QueryOptimizer implements IQueryOptimizer {
         this.storage = storage;
         this.ddlValidator = new DdlValidator();
         this.binder = new Binder(storage);
-        this.selectionProjectionRewriter = new SelectionProjectionRewriter();
+        CardinalityEstimator cardinalityEstimator = new CardinalityEstimator(storage);
+        this.selectionProjectionRewriter = new SelectionProjectionRewriter(cardinalityEstimator);
         this.costModel = new CostModel(storage, bufferBlocks);
         this.optimizer = new JoinAccessPathOptimizer(costModel, storage);
         this.printer = new PlanPrinter();
-        this.annotator = new PlanAnnotator(new CardinalityEstimator(storage));
+        this.annotator = new PlanAnnotator(cardinalityEstimator);
     }
 
     @Override
