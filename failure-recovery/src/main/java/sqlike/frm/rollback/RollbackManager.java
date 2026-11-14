@@ -15,16 +15,21 @@ import sqlike.frm.port.RollbackPort;
 import sqlike.frm.port.SmPort;
 import sqlike.shared.DataChange;
 import sqlike.shared.ErrorCode;
+import sqlike.shared.SchemaChange;
+import sqlike.shared.SchemaImage;
+import sqlike.shared.SchemaChange;
+import sqlike.shared.SchemaImage;
 
 /**
  * Undoes one transaction during normal operation (FR3, FR-04, PRD v1.0 §11).
  *
- * <p>Reads the transaction's log records newest first. For every change that is not undone yet,
- * it first writes a COMPENSATION record through FR2 ({@code logCompensation(txId, originalLsn)},
- * forced to disk), then writes the before-image back through SM on the same RID with the LSN of
- * that compensation record. UPDATE returns to the old values, INSERT disappears, and DELETE comes
- * back. FR2 accepts {@code logAbort} only after every change has a compensation record; CCM
- * writes that final ABORT after this method returns.
+ * <p>Reads the transaction's log records newest first. For every change (DML or DDL) that is not
+ * undone yet, it first writes a COMPENSATION record through FR2 ({@code logCompensation(txId,
+ * originalLsn)}, forced to disk), then writes the before-image back through SM on the same RID (or
+ * restores the previous schema image) with the LSN of that compensation record. UPDATE returns to
+ * the old values, INSERT disappears, DELETE comes back, and SCHEMA_CHANGE reverts catalog/indexes.
+ * FR2 accepts {@code logAbort} only after every change has a compensation record; CCM writes that
+ * final ABORT after this method returns.
  *
  * <p>Repeating a rollback after a failure part-way is safe: changes that already have a
  * compensation record are skipped, except the newest one, whose SM write may not have finished
@@ -62,26 +67,17 @@ public class RollbackManager implements RollbackPort {
     }
 
     /**
-     * Compensates and writes back the before-image of every change of {@code txId} that is not
-     * undone yet, newest first. SM failures are not caught: the caller keeps the transaction
-     * FAILED and may retry.
+     * Compensates and writes back the before-image of every change (data and schema) of {@code txId}
+     * that is not undone yet, newest first. SM failures are not caught: the caller keeps the
+     * transaction FAILED and may retry.
      *
-     * @return number of before-images written
+     * @return number of undo operations applied
      */
     public int undoTxChanges(long txId) {
         List<LogRecord> records = new ArrayList<>();
         for (LogRecord record : logManager.readLogsBackward(txId)) {
             if (record.txID().equals(Optional.of(txId))) {
                 records.add(record); // defensive: only this transaction's records
-            }
-        }
-
-        // Reject before any compensation is logged, so the transaction is not left half undone.
-        for (LogRecord record : records) {
-            if (record.type() == LogType.SCHEMA_CHANGE) {
-                throw new FrmException(ErrorCode.UNSUPPORTED_OPERATION, "rollback of transaction "
-                        + txId + " needs SmPort.restoreSchema for the schema change at LSN "
-                        + record.lsn() + ", which is not available yet");
             }
         }
 
@@ -99,17 +95,35 @@ public class RollbackManager implements RollbackPort {
 
         int written = 0;
         for (LogRecord record : records) {
-            if (!isDataChange(record.type()) || record.change().isEmpty()) {
-                continue; // BEGIN, COMPENSATION and other markers
+            boolean hasDataUndo = isDataChange(record.type()) && record.change().isPresent();
+            boolean hasSchemaUndo = record.type() == LogType.SCHEMA_CHANGE && record.schemaChange().isPresent();
+
+            if (!hasDataUndo && !hasSchemaUndo) {
+                continue; 
             }
             if (compensated.contains(record.lsn()) && !Objects.equals(newestCompensated, record.lsn())) {
-                continue; // undone in an earlier attempt
+                continue; // Sudah di-undo pada percobaan rollback sebelumnya
             }
+
+            // 1. Catat log kompensasi ke LogManager (FR2) dan pastikan persisten (WAL)
             LogRecord clr = logManager.logCompensation(txId, record.lsn());
-            logManager.ensureDurable(clr.lsn()); // WAL before the page change
-            DataChange change = record.change().get();
-            storageManager.writeAt(change.tableName(), change.rid(), change.before(), clr.lsn());
+            logManager.ensureDurable(clr.lsn());
+
+            if (hasDataUndo) {
+                DataChange change = record.change().get();
+                storageManager.writeAt(change.tableName(), change.rid(), change.before(), clr.lsn());
+            } else {
+                // 2. Ekstrak before-image skema dari payload log SCHEMA_CHANGE
+                SchemaChange schemaChange = record.schemaChange().get();
+                List<SchemaImage> beforeImages = schemaChange.before();
+
+                // 3. Panggil restoreSchema melalui SmPort dalam urutan mundur
+                for (int i = beforeImages.size() - 1; i >= 0; i--) {
+                    storageManager.restoreSchema(beforeImages.get(i), clr.lsn());
+                }
+            }
             written++;
+        }
         }
         return written;
     }
