@@ -66,6 +66,10 @@ public class SlottedPage {
         return data.getInt(FREE_END_OFFSET) - directoryEnd(data);
     }
 
+    static boolean fitsEmptyPage(int pageSize, int recordSize) {
+        return (long) allocationSize(recordSize) + HEADER_SIZE + SLOT_SIZE <= pageSize;
+    }
+
     public boolean canFit(int recordSize) {
         int capacity = allocationSize(recordSize);
         ByteBuffer data = buffer();
