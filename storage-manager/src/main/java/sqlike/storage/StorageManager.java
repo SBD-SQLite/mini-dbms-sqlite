@@ -72,20 +72,65 @@ public final class StorageManager implements IStorageManager {
     @Override
     public RID insert(InsertReservation reservation, long lsn) throws StorageException {
         RID rid = records.insert(reservation, lsn);
+        try {
+            Record inserted = records.fetch(reservation.tableName(), rid)
+                    .orElseThrow(() -> new StorageException(StorageErrorCode.INVALID_STATE, "Inserted record is missing: " + rid));
+            indexes.onInsert(reservation.tableName(), inserted, lsn);
+        } catch (RuntimeException failure) {
+            rollbackRecord(reservation.tableName(), rid, new RecordImage(false, List.of()), lsn, failure);
+            throw failure;
+        }
         invalidateStatistics(reservation.tableName());
         return rid;
     }
 
     @Override
     public void update(String table, RID rid, List<Value> values, long lsn) throws StorageException {
+        Record before = records.fetch(table, rid)
+                .orElseThrow(() -> new StorageException(StorageErrorCode.RECORD_NOT_FOUND, "Record not found: " + rid));
         records.update(table, rid, values, lsn);
+        try {
+            Record after = records.fetch(table, rid)
+                    .orElseThrow(() -> new StorageException(StorageErrorCode.INVALID_STATE, "Updated record is missing: " + rid));
+            indexes.onUpdate(table, before, after, lsn);
+        } catch (RuntimeException failure) {
+            rollbackRecord(table, rid, new RecordImage(true, before.values()), lsn, failure);
+            throw failure;
+        }
         invalidateStatistics(table);
     }
 
     @Override
     public void delete(String table, RID rid, long lsn) throws StorageException {
+        Record before = records.fetch(table, rid)
+                .orElseThrow(() -> new StorageException(StorageErrorCode.RECORD_NOT_FOUND, "Record not found: " + rid));
         records.delete(table, rid, lsn);
+        try {
+            indexes.onDelete(table, before, lsn);
+        } catch (RuntimeException failure) {
+            rollbackRecord(table, rid, new RecordImage(true, before.values()), lsn, failure);
+            throw failure;
+        }
         invalidateStatistics(table);
+    }
+
+    @Override
+    public int clearTable(String table) throws StorageException {
+        synchronized (records) {
+            int removed = records.clearTable(table);
+            try {
+                indexes.rebuildTable(table);
+            } catch (RuntimeException failure) {
+                try {
+                    invalidateStatistics(table);
+                } catch (RuntimeException invalidation) {
+                    failure.addSuppressed(invalidation);
+                }
+                throw failure;
+            }
+            invalidateStatistics(table);
+            return removed;
+        }
     }
 
     @Override
@@ -140,6 +185,19 @@ public final class StorageManager implements IStorageManager {
 
     private void invalidateStatistics(String table) throws StorageException {
         if (statistics != null) statistics.invalidate(table);
+    }
+
+    private void rollbackRecord(String table, RID rid, RecordImage image, long lsn, RuntimeException failure) {
+        try {
+            records.restoreRecord(table, rid, image, lsn);
+        } catch (RuntimeException rollback) {
+            failure.addSuppressed(rollback);
+        }
+        try {
+            invalidateStatistics(table);
+        } catch (RuntimeException invalidation) {
+            failure.addSuppressed(invalidation);
+        }
     }
 
     @Override

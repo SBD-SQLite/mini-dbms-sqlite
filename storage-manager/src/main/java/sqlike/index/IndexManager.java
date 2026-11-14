@@ -247,6 +247,31 @@ public class IndexManager {
         }
     }
 
+    public void rebuildTable(String table) throws StorageException {
+        synchronized (records) {
+            if (table == null || table.isBlank()) throw new StorageException(INVALID_VALUE, "Invalid table name");
+            if (!catalog.tableExists(table)) throw new StorageException(TABLE_NOT_FOUND, "Table not found: " + table);
+
+            TableSchema schema = catalog.getSchema(table);
+            List<IndexMetadata> definitions = catalog.getIndexes(schema.tableName());
+            Map<String, Index> rebuilt = new HashMap<>();
+            definitions.forEach(definition -> indexes.remove(definition.indexName()));
+
+            try {
+                for (IndexMetadata definition : definitions) {
+                    int column = resolveColumn(schema, definition);
+                    if (column < 0) throw new StorageException(INVALID_STATE, "Index column missing: " + definition.indexName());
+                    rebuilt.put(definition.indexName(), buildIndex(definition, schema, column, true));
+                }
+                indexes.putAll(rebuilt);
+            } catch (RuntimeException failure) {
+                for (Index index : rebuilt.values()) discard(index, failure);
+                if (failure instanceof StorageException storage) throw storage;
+                throw new StorageException(INVALID_STATE, "Index rebuild failed for table: " + schema.tableName(), failure);
+            }
+        }
+    }
+
     // [Additional] 7. Flush
     public void flushAll() throws StorageException {
         synchronized (records) {
