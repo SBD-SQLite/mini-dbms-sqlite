@@ -2,6 +2,7 @@ package sqlike.qo;
 
 import sqlike.contract.IQueryOptimizer;
 import sqlike.contract.IStorageManager;
+import java.util.Optional;
 import sqlike.shared.*;
 
 public class QueryOptimizer implements IQueryOptimizer {
@@ -14,18 +15,37 @@ public class QueryOptimizer implements IQueryOptimizer {
     private final CostModel costModel;
     private final PlanPrinter printer;
     private final PlanAnnotator annotator;
+    private final IStorageManager storage;
+    private final DdlValidator ddlValidator;
 
     public QueryOptimizer(IStorageManager storage) {
+        this(storage, 3);
+    }
+
+    public QueryOptimizer(IStorageManager storage, int bufferBlocks) {
+        this(storage, bufferBlocks, null);
+    }
+
+    /**
+     * Opt-in genetic join search: with a non-null {@code geneticConfig} the cheaper of the heuristic and the GA plan
+     * is returned. A null config keeps the default heuristic behavior exactly.
+     */
+    public QueryOptimizer(IStorageManager storage, int bufferBlocks, GeneticOptimizerConfig geneticConfig) {
         if (storage == null) throw new IllegalArgumentException("storage is required");
         ExpressionParser expr = new ExpressionParser();
         this.lexer = new Lexer();
         this.queryParser = new QueryParser(new SelectParser(expr), new StatementParser());
+        this.storage = storage;
+        this.ddlValidator = new DdlValidator();
         this.binder = new Binder(storage);
-        this.selectionProjectionRewriter = new SelectionProjectionRewriter();
-        this.costModel = new CostModel(storage);
-        this.optimizer = new JoinAccessPathOptimizer(costModel, storage);
+        CardinalityEstimator cardinalityEstimator = new CardinalityEstimator(storage);
+        this.selectionProjectionRewriter = new SelectionProjectionRewriter(cardinalityEstimator);
+        this.costModel = new CostModel(storage, bufferBlocks);
+        this.optimizer = geneticConfig == null
+                ? new JoinAccessPathOptimizer(costModel, storage)
+                : new JoinAccessPathOptimizer(costModel, storage, geneticConfig);
         this.printer = new PlanPrinter();
-        this.annotator = new PlanAnnotator(new CardinalityEstimator(storage));
+        this.annotator = new PlanAnnotator(cardinalityEstimator);
     }
 
     @Override
@@ -41,6 +61,9 @@ public class QueryOptimizer implements IQueryOptimizer {
         StatementType st = query.statementType();
         if (st == StatementType.BEGIN || st == StatementType.COMMIT || st == StatementType.ABORT)
             throw QoErrors.invalidState("transaction statements are not optimized (" + st + ")");
+        // CREATE/DROP TABLE: validated against the catalog by DdlValidator (the Binder does not bind DDL), then passed through at cost 0.
+        Optional<PlanNode> ddl = query.root().filter(QueryOptimizer::isPassThrough);
+        if (ddl.isPresent()) return new QueryPlan(ddlValidator.validate(ddl.get(), storage), 0.0);
         PlanNode bound = binder.bind(query);
         if (isPassThrough(bound)) return new QueryPlan(bound, 0.0);
         PlanNode rewritten = selectionProjectionRewriter.rewrite(bound);
@@ -65,13 +88,29 @@ public class QueryOptimizer implements IQueryOptimizer {
         };
     }
 
+    /**
+     * Extra: heuristic and (when configured) GA cost of the join search for one SELECT, using the same rewrites as
+     * {@link #optimizeQuery}. Only SELECT is accepted (INVALID_STATE otherwise).
+     */
+    public JoinAccessPathOptimizer.OptimizationComparison compareJoinSearch(String sql) {
+        ParsedQuery parsed = parseQuery(sql);
+        if (parsed.statementType() != StatementType.SELECT)
+            throw QoErrors.invalidState("join search comparison needs a SELECT, got " + parsed.statementType());
+        PlanNode rewritten = selectionProjectionRewriter.rewrite(binder.bind(parsed));
+        return optimizer.optimizeWithComparison(rewritten);
+    }
+
     /** Extra: human-readable before/after plan buat driver */
     public String explainQuery(String sql) {
         ParsedQuery parsed = parseQuery(sql);
         if (parsed.transactionCommand().isPresent())
             return "TRANSACTION " + parsed.transactionCommand().get().action() + " (not optimized)\n";
         QueryPlan plan = optimizeQuery(parsed);
-        PlanNode after = isPassThrough(plan.root()) ? plan.root() : annotator.annotate(plan.root());
-        return printer.printBeforeAfter(parsed.root().get(), after, plan.estimatedCost());
+        if (isPassThrough(plan.root())) return printer.printNotOptimized(plan.root(), plan.estimatedCost());
+        PlanNode bound = binder.bind(parsed);
+        // "Before" is the Binder result (qualified, catalog-checked), not the raw parser tree.
+        double costBefore = costModel.getCost(bound);
+        return printer.printBeforeAfter(annotator.annotate(bound), costBefore,
+                annotator.annotate(plan.root()), plan.estimatedCost());
     }
 }

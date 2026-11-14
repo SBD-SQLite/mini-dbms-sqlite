@@ -136,6 +136,39 @@ final class QO5Plans {
         return copy(project, project.children(), original.outputColumns());
     }
 
+    /**
+     * Remove only bound identity projects introduced/exposed during QO5 rewrites. Keep the outermost
+     * SELECT project, including when enclosed by SORT/FILTER, and respect LIMIT/subquery boundaries.
+     * General projection composition/pushdown remains the responsibility of QO4.
+     */
+    static PlanNode simplifyIdentityProjects(PlanNode plan) {
+        return simplifyIdentityProjects(plan, true);
+    }
+
+    private static PlanNode simplifyIdentityProjects(PlanNode plan, boolean preserveOutputProject) {
+        if (plan.kind() == PlanNodeKind.LIMIT || hasSubquery(plan)) return plan;
+        boolean preserveChildProject = preserveOutputProject && plan.kind() != PlanNodeKind.PROJECT
+                && plan.children().size() == 1
+                && plan.kind() != PlanNodeKind.UPDATE && plan.kind() != PlanNodeKind.DELETE;
+        List<PlanNode> children = plan.children().stream()
+                .map(child -> simplifyIdentityProjects(child, preserveChildProject)).toList();
+        PlanNode current = withChildren(plan, children);
+        if (!preserveOutputProject && isIdentityProject(current)) return current.children().get(0);
+        return current;
+    }
+
+    static boolean isIdentityProject(PlanNode plan) {
+        if (plan.kind() != PlanNodeKind.PROJECT || plan.children().size() != 1) return false;
+        List<ResultColumn> outputs = plan.children().get(0).outputColumns();
+        if (outputs.isEmpty() || !plan.outputColumns().equals(outputs)
+                || plan.projection().size() != outputs.size()) return false;
+        for (int i = 0; i < outputs.size(); i++) {
+            if (outputs.get(i).source().isEmpty()
+                    || !outputs.get(i).source().get().equals(plan.projection().get(i))) return false;
+        }
+        return true;
+    }
+
     static PlanNode withChildren(PlanNode node, List<PlanNode> children) {
         if (node.children().equals(children)) return node;
         List<ResultColumn> outputs = node.outputColumns();

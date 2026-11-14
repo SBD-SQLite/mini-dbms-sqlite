@@ -3,6 +3,7 @@ package sqlike.qo;
 import java.util.List;
 import java.util.Optional;
 import sqlike.shared.PlanNode;
+import sqlike.shared.QoException;
 
 /** Mengisi estimatedRows di tiap node of a bound plan buat ditampilkan PlanPrinter */
 final class PlanAnnotator {

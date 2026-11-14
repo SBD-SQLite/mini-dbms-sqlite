@@ -50,14 +50,18 @@ public final class CardinalityEstimator {
         if (node.kind() == PlanNodeKind.SCAN)
             return stats(node.scan().orElseThrow().tableName()).blockCount();
         if (node.kind() == PlanNodeKind.INDEX_SCAN) {
-            String table = node.scan().orElseThrow().tableName();
-            long tableBlocks = stats(table).blockCount();
+            ScanSpec scan = node.scan().orElseThrow();
+            String table = scan.tableName();
+            TableStatistics tableStats = stats(table);
+            long tableBlocks = tableStats.blockCount();
             long qualifyingRows = estimateRows(node);
             if (tableBlocks <= 0 || qualifyingRows <= 0) return 0;
 
-            // Assume qualifying RIDs are uniformly scattered across table pages.
-            // Expected distinct pages = b * (1 - (1 - 1/b)^n). This is an
-            // unclustered-index heuristic until SM exposes clustering metadata.
+            if (indexStatistics(scan).clustered())
+                return Math.min(tableBlocks, ceilDiv(qualifyingRows, Math.max(1, tableStats.blockingFactor())));
+
+            // For an unclustered index, qualifying RIDs are uniformly scattered
+            // across table pages: expected distinct pages = b * (1 - (1 - 1/b)^n).
             double expectedPages = -((double) tableBlocks) *
                     Math.expm1(qualifyingRows * Math.log1p(-1.0 / tableBlocks));
             long roundedPages = (long) Math.ceil(expectedPages);
@@ -81,6 +85,8 @@ public final class CardinalityEstimator {
     }
 
     private double selectivityCached(Expression condition, PlanNode child) {
+        if (condition.kind() == ExpressionKind.SUBQUERY)
+            return subquerySelectivity(condition, child);
         if (condition.kind() == ExpressionKind.BINARY && condition.operator().orElse(null) == ExpressionOperator.AND && condition.operands().size() == 2)
             return clamp(selectivity(condition.operands().get(0), child) * selectivity(condition.operands().get(1), child));
         if (condition.kind() == ExpressionKind.BINARY) {
@@ -88,16 +94,59 @@ public final class CardinalityEstimator {
             if (condition.operands().size() == 2 && isComparison(op)) {
                 Expression left = condition.operands().get(0), right = condition.operands().get(1);
                 if (left.kind() == ExpressionKind.COLUMN && right.kind() == ExpressionKind.LITERAL)
-                    return comparisonSelectivity(left.column().orElseThrow(), op);
+                    return comparisonSelectivity(left.column().orElseThrow(), op, child);
                 if (right.kind() == ExpressionKind.COLUMN && left.kind() == ExpressionKind.LITERAL)
-                    return comparisonSelectivity(right.column().orElseThrow(), reverse(op));
-                if (left.kind() == ExpressionKind.COLUMN && right.kind() == ExpressionKind.COLUMN)
-                    return op == ExpressionOperator.EQ
-                            ? 1.0 / Math.max(distinct(left.column().orElseThrow()), distinct(right.column().orElseThrow()))
-                            : (op == ExpressionOperator.NE ? 0.9 : 1.0 / 3.0);
+                    return comparisonSelectivity(right.column().orElseThrow(), reverse(op), child);
+                if (left.kind() == ExpressionKind.COLUMN && isScalarSubquery(right))
+                    return scalarSubquerySelectivity(left.column().orElseThrow(), right, op, child);
+                if (right.kind() == ExpressionKind.COLUMN && isScalarSubquery(left))
+                    return scalarSubquerySelectivity(right.column().orElseThrow(), left, reverse(op), child);
+                if (left.kind() == ExpressionKind.COLUMN && right.kind() == ExpressionKind.COLUMN) {
+                    ColumnRef leftColumn = left.column().orElseThrow();
+                    ColumnRef rightColumn = right.column().orElseThrow();
+                    if (!hasQualifier(child, leftColumn) || !hasQualifier(child, rightColumn)) return 0.5;
+                    return columnComparisonSelectivity(leftColumn, rightColumn, op, child);
+                }
             }
         }
+        // Conservative fallback for computed expressions and unsupported subquery shapes.
         return 0.5;
+    }
+
+    private double scalarSubquerySelectivity(ColumnRef column, Expression scalar, ExpressionOperator op,
+                                             PlanNode input) {
+        SubquerySpec spec = scalar.subquery().orElseThrow();
+        if (spec.correlated() || !hasQualifier(input, column)) return 0.5;
+        if (estimateRows(spec.root()) == 0) return 0.0;
+        return comparisonSelectivity(column, op, input);
+    }
+
+    private static boolean isScalarSubquery(Expression expression) {
+        return expression.kind() == ExpressionKind.SUBQUERY
+                && expression.subquery().map(spec -> spec.type() == SubqueryType.SCALAR).orElse(false);
+    }
+
+    private double subquerySelectivity(Expression expression, PlanNode input) {
+        SubquerySpec spec = expression.subquery().orElseThrow();
+        long subqueryRows = estimateRows(spec.root());
+        if (spec.type() == SubqueryType.EXISTS) {
+            if (subqueryRows == 0) return 0.0;
+            return spec.correlated() ? 0.5 : 1.0;
+        }
+        if (spec.type() != SubqueryType.IN || spec.correlated() || expression.operands().isEmpty()) return 0.5;
+
+        Expression probe = expression.operands().get(0);
+        if (probe.kind() != ExpressionKind.COLUMN) return 0.5;
+        ColumnRef probeColumn = probe.column().orElseThrow();
+        if (!hasQualifier(input, probeColumn)) return 0.5;
+        long inputDistinct = Math.max(1, distinct(probeColumn, input));
+        if (subqueryRows == 0) return 0.0;
+
+        ResultColumn output = spec.root().outputColumns().get(0);
+        long resultDistinct = output.source().filter(source -> hasQualifier(spec.root(), source))
+                .map(source -> distinct(source, spec.root())).orElse(subqueryRows);
+        resultDistinct = Math.min(subqueryRows, Math.max(1, resultDistinct));
+        return clamp(Math.min(inputDistinct, resultDistinct) / (double) inputDistinct);
     }
 
     private long joinRows(PlanNode node) {
@@ -111,16 +160,67 @@ public final class CardinalityEstimator {
             for (String name : join.commonColumns()) {
                 ColumnRef l = findColumn(node.children().get(0), name);
                 ColumnRef r = findColumn(node.children().get(1), name);
-                selectivity /= Math.max(distinct(l), distinct(r));
+                selectivity /= Math.max(distinct(l, node.children().get(0)), distinct(r, node.children().get(1)));
             }
             return clampRows(leftRows * (double) rightRows * selectivity);
         }
-        if (join.condition().isPresent()) return clampRows(leftRows * (double) rightRows * selectivity(join.condition().get(), node));
+        if (join.condition().isPresent())
+            return clampRows(leftRows * (double) rightRows * joinConditionSelectivity(join.condition().get(), node));
         return safeMultiply(leftRows, rightRows);
     }
 
-    private double comparisonSelectivity(ColumnRef column, ExpressionOperator op) {
-        long distinct = Math.max(1, distinct(column));
+    private double joinConditionSelectivity(Expression condition, PlanNode scope) {
+        if (condition.kind() == ExpressionKind.BINARY
+                && condition.operator().orElse(null) == ExpressionOperator.AND
+                && condition.operands().size() == 2)
+            return clamp(joinConditionSelectivity(condition.operands().get(0), scope)
+                    * joinConditionSelectivity(condition.operands().get(1), scope));
+        if (condition.kind() == ExpressionKind.BINARY && isComparison(condition.operator().orElse(null))
+                && condition.operands().size() == 2
+                && condition.operands().get(0).kind() == ExpressionKind.COLUMN
+                && condition.operands().get(1).kind() == ExpressionKind.COLUMN) {
+            ColumnRef left = condition.operands().get(0).column().orElseThrow();
+            ColumnRef right = condition.operands().get(1).column().orElseThrow();
+            if (!hasQualifier(scope, left) || !hasQualifier(scope, right)) return 0.5;
+            if (left.equals(right)) return columnComparisonSelectivity(left, right,
+                    condition.operator().orElseThrow(), scope);
+
+            // Preserve the existing theta-join cardinality heuristic; filter selectivity
+            // uses the distinct-count complement and 0.5 range heuristic below.
+            long maxDistinct = Math.max(distinct(left, scope), distinct(right, scope));
+            return switch (condition.operator().orElseThrow()) {
+                case EQ -> 1.0 / maxDistinct;
+                case NE -> 0.9;
+                case GT, GE, LT, LE -> 1.0 / 3.0;
+                default -> 0.5;
+            };
+        }
+        return selectivity(condition, scope);
+    }
+
+    private double columnComparisonSelectivity(ColumnRef left, ColumnRef right,
+                                               ExpressionOperator op, PlanNode scope) {
+        if (left.equals(right)) {
+            // No NULL-fraction statistics are available; assume comparisons of a
+            // column with itself are evaluated over non-NULL values.
+            return switch (op) {
+                case EQ, GE, LE -> 1.0;
+                case NE, GT, LT -> 0.0;
+                default -> 0.5;
+            };
+        }
+        double equality = 1.0 / Math.max(distinct(left, scope), distinct(right, scope));
+        return switch (op) {
+            case EQ -> equality;
+            case NE -> 1.0 - equality;
+            case GT, GE, LT, LE -> 0.5;
+            default -> 0.5;
+        };
+    }
+
+    private double comparisonSelectivity(ColumnRef column, ExpressionOperator op, PlanNode scope) {
+        if (!hasQualifier(scope, column)) return 0.5;
+        long distinct = Math.max(1, distinct(column, scope));
         return switch (op) {
             case EQ -> 1.0 / distinct;
             case NE -> 1.0 - 1.0 / distinct;
@@ -129,6 +229,13 @@ public final class CardinalityEstimator {
             case GT, GE, LT, LE -> 0.5;
             default -> 0.5;
         };
+    }
+
+    private IndexStatistics indexStatistics(ScanSpec scan) {
+        String indexName = scan.indexName().orElseThrow();
+        IndexStatistics result = storage.getIndexStatistics(indexName);
+        if (result == null) throw QoErrors.invalidState("SM returned null statistics for index '" + indexName + "'");
+        return result;
     }
 
     private double indexSelectivity(ScanSpec scan) {
@@ -147,9 +254,36 @@ public final class CardinalityEstimator {
 
     private long estimateRowsForScan(String table) { return stats(table).recordCount(); }
 
-    private long distinct(ColumnRef column) {
-        String tableName = column.tableName().orElseThrow(() -> QoErrors.semantic("unqualified column in cardinality estimate"));
+    private long distinct(ColumnRef column, PlanNode scope) {
+        String qualifier = column.tableName().orElseThrow(() -> QoErrors.semantic("unqualified column in cardinality estimate"));
+        String tableName = tableForQualifier(scope, qualifier);
         return Math.max(1, distinct(tableName, column.columnName()));
+    }
+
+    private boolean hasQualifier(PlanNode scope, ColumnRef column) {
+        return column.tableName().map(qualifier -> hasQualifier(scope, qualifier)).orElse(false);
+    }
+
+    private boolean hasQualifier(PlanNode node, String qualifier) {
+        if (node.scan().isPresent()) {
+            ScanSpec scan = node.scan().get();
+            if (scan.tableName().equalsIgnoreCase(qualifier)
+                    || scan.alias().map(alias -> alias.equalsIgnoreCase(qualifier)).orElse(false)) return true;
+        }
+        return node.children().stream().anyMatch(child -> hasQualifier(child, qualifier));
+    }
+
+    private String tableForQualifier(PlanNode node, String qualifier) {
+        if (node.scan().isPresent()) {
+            ScanSpec scan = node.scan().get();
+            if (scan.alias().map(alias -> alias.equalsIgnoreCase(qualifier)).orElse(false)
+                    || scan.tableName().equalsIgnoreCase(qualifier)) return scan.tableName();
+        }
+        for (PlanNode child : node.children()) {
+            try { return tableForQualifier(child, qualifier); }
+            catch (IllegalArgumentException ignored) { }
+        }
+        throw new IllegalArgumentException("unknown table or alias '" + qualifier + "'");
     }
 
     private long distinct(String tableName, String columnName) {
@@ -170,6 +304,10 @@ public final class CardinalityEstimator {
             try { return firstStats(child); } catch (IllegalStateException ignored) { }
         }
         return new TableStatistics(0, 0, 0, 1, java.util.Map.of());
+    }
+
+    TableStatistics statisticsForTable(String table) {
+        return withCatalogCache(() -> stats(table));
     }
 
     private TableStatistics stats(String table) {
@@ -213,6 +351,9 @@ public final class CardinalityEstimator {
     }
 
     private static String key(String value) { return value.toLowerCase(Locale.ROOT); }
+    private static long ceilDiv(long numerator, long denominator) {
+        return numerator <= 0 ? 0 : 1 + (numerator - 1) / denominator;
+    }
 
     private static final class CatalogCache {
         private List<String> tableNames;

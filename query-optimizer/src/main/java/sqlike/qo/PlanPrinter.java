@@ -15,8 +15,14 @@ public class PlanPrinter {
         return print(plan.root()) + "Estimated cost: " + cost + "\n";
     }
 
-    public String printBeforeAfter(PlanNode before, PlanNode after, double cost) {
-        return "== Before ==\n" + print(before) + "== After ==\n" + print(after) + "Estimated cost: " + cost + "\n";
+    public String printBeforeAfter(PlanNode before, double costBefore, PlanNode after, double costAfter) {
+        return "== Before ==\n" + print(before) + "Estimated cost: " + costBefore + "\n"
+                + "== After ==\n" + print(after) + "Estimated cost: " + costAfter + "\n";
+    }
+
+    /** Statements that are validated but not optimized: one plan, no before/after stage. */
+    public String printNotOptimized(PlanNode plan, double cost) {
+        return "== Plan (not optimized) ==\n" + print(plan) + "Estimated cost: " + cost + "\n";
     }
 
     private void render(PlanNode n, int depth, StringBuilder sb) {
@@ -28,14 +34,16 @@ public class PlanPrinter {
 
     private String describe(PlanNode n) {
         return switch (n.kind()) {
-            case SCAN -> "SCAN " + n.scan().get().tableName();
-            case INDEX_SCAN -> "INDEX_SCAN " + n.scan().get().tableName() + " using " + n.scan().get().indexName().orElse("?");
+            case SCAN -> "SCAN " + n.scan().get().tableName() + alias(n.scan().get()) + " [full scan]";
+            case INDEX_SCAN -> "INDEX_SCAN " + n.scan().get().tableName() + alias(n.scan().get()) + " [index scan] using "
+                    + n.scan().get().indexName().orElse("?")
+                    + n.scan().get().condition().map(c -> " " + indexCondition(c)).orElse("");
             case FILTER -> "FILTER " + expr(n.predicate().get());
             case PROJECT -> "PROJECT [" + n.projection().stream().map(PlanPrinter::col).collect(Collectors.joining(", ")) + "]";
-            case JOIN -> "JOIN " + n.join().get().joinType()
+            case JOIN -> "JOIN " + n.join().get().joinType() + " algorithm=" + n.join().get().algorithm()
                     + n.join().get().condition().map(c -> " ON " + expr(c)).orElse("")
                     + (n.join().get().commonColumns().isEmpty() ? "" : " common=" + n.join().get().commonColumns());
-            case CARTESIAN -> "CARTESIAN";
+            case CARTESIAN -> "CARTESIAN algorithm=" + n.join().map(j -> j.algorithm().toString()).orElse("?");
             case SORT -> "SORT " + col(n.sort().get().column()) + " " + n.sort().get().direction();
             case INSERT -> "INSERT INTO " + n.mutation().get().tableName() + " (" + n.mutation().get().insertValues().size() + " values)";
             case UPDATE -> "UPDATE " + n.mutation().get().tableName() + " SET "
@@ -48,6 +56,16 @@ public class PlanPrinter {
             case CREATE_TABLE -> createTable(n.createTable().get());
             case DROP_TABLE -> "DROP_TABLE " + n.dropTable().get().tableName() + " " + n.dropTable().get().behavior();
         };
+    }
+
+    private static String alias(ScanSpec scan) {
+        return scan.alias().map(a -> " AS " + a).orElse("");
+    }
+
+    private static String indexCondition(IndexCondition c) {
+        return "IndexCondition(" + c.operator() + ", key=" + lit(c.key())
+                + c.upperBound().map(u -> ", upper=" + lit(u)).orElse("")
+                + ", lowerInclusive=" + c.lowerInclusive() + ", upperInclusive=" + c.upperInclusive() + ")";
     }
 
     private static String createTable(CreateTableSpec t) {

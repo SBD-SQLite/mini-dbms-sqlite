@@ -1,8 +1,18 @@
 package sqlike.qo;
 
 import sqlike.contract.IStorageManager;
+import sqlike.shared.Expression;
+import sqlike.shared.ExpressionKind;
+import sqlike.shared.IndexCondition;
 import sqlike.shared.IndexMetadata;
+import sqlike.shared.IndexOperator;
+import sqlike.shared.IndexStatistics;
+import sqlike.shared.IndexType;
+import sqlike.shared.JoinSpec;
+import sqlike.shared.MutationSpec;
 import sqlike.shared.PlanNode;
+import sqlike.shared.SubquerySpec;
+import sqlike.shared.ScanSpec;
 
 import java.util.function.Supplier;
 import sqlike.shared.TableStatistics;
@@ -11,15 +21,22 @@ import sqlike.shared.TableStatistics;
 public final class CostModel {
     private static final double SEEK_TIME_MS = 4.0;
     private static final double TRANSFER_TIME_MS = 0.1;
-    // Temporary assumption: one outer block, one input block, and one output block.
-    private static final int BUFFER_BLOCKS = 3;
+    // Default assumption: one outer block, one input block, and one output block.
+    private static final int DEFAULT_BUFFER_BLOCKS = 3;
 
     private final IStorageManager storage;
+    private final int bufferBlocks;
     private final CardinalityEstimator estimator;
 
     public CostModel(IStorageManager storage) {
+        this(storage, DEFAULT_BUFFER_BLOCKS);
+    }
+
+    public CostModel(IStorageManager storage, int bufferBlocks) {
         if (storage == null) throw new IllegalArgumentException("storage is required");
+        if (bufferBlocks < 3) throw new IllegalArgumentException("bufferBlocks must be at least 3");
         this.storage = storage;
+        this.bufferBlocks = bufferBlocks;
         this.estimator = new CardinalityEstimator(storage);
     }
 
@@ -35,7 +52,8 @@ public final class CostModel {
 
     private double costNode(PlanNode node) {
         double childCost = node.children().stream().mapToDouble(this::costNode).sum();
-        return childCost + switch (node.kind()) {
+        double subqueryCost = expressionSubqueryCost(node);
+        return childCost + subqueryCost + switch (node.kind()) {
             case SCAN -> costScan(node);
             case INDEX_SCAN -> costIndexScan(node);
             case FILTER -> costFilter(node);
@@ -51,17 +69,101 @@ public final class CostModel {
         };
     }
 
+    private double expressionSubqueryCost(PlanNode node) {
+        double evaluations = estimatedExpressionEvaluations(node);
+        double cost = 0.0;
+        if (node.predicate().isPresent()) cost += expressionSubqueryCost(node.predicate().get(), evaluations);
+        if (node.join().flatMap(JoinSpec::condition).isPresent())
+            cost += expressionSubqueryCost(node.join().flatMap(JoinSpec::condition).orElseThrow(), evaluations);
+        if (node.mutation().flatMap(MutationSpec::updateExpression).isPresent())
+            cost += expressionSubqueryCost(node.mutation().flatMap(MutationSpec::updateExpression).orElseThrow(), evaluations);
+        return cost;
+    }
+
+    private double expressionSubqueryCost(Expression expression, double evaluations) {
+        double cost = 0.0;
+        if (expression.kind() == ExpressionKind.SUBQUERY) {
+            SubquerySpec subquery = expression.subquery().orElseThrow();
+            double executions = subquery.correlated() ? evaluations : 1.0;
+            // Model a full evaluation; short-circuit behavior (notably EXISTS) is unknown.
+            cost += executions * costNode(subquery.root());
+        }
+        for (Expression operand : expression.operands())
+            cost += expressionSubqueryCost(operand, evaluations);
+        return cost;
+    }
+
+    private double estimatedExpressionEvaluations(PlanNode node) {
+        return switch (node.kind()) {
+            case FILTER, UPDATE, DELETE -> node.children().isEmpty() ? 0.0 : estimator.estimateRows(node.children().get(0));
+            case JOIN, CARTESIAN -> {
+                if (node.children().size() != 2) yield 0.0;
+                yield (double) estimator.estimateRows(node.children().get(0))
+                        * estimator.estimateRows(node.children().get(1));
+            }
+            default -> 1.0;
+        };
+    }
+
     private double costScan(PlanNode node) {
         long blocks = estimator.estimateBlocks(node);
         return sequentialReadCost(blocks);
     }
 
     private double costIndexScan(PlanNode node) {
-        long dataBlocks = estimator.estimateBlocks(node);
-        // The contract has no index height/page count. Model one index-page access,
-        // then a random heap-page access for each distinct qualifying data page.
-        return SEEK_TIME_MS + TRANSFER_TIME_MS
-                + dataBlocks * (SEEK_TIME_MS + TRANSFER_TIME_MS);
+        ScanSpec scan = node.scan().orElseThrow();
+        String indexName = scan.indexName().orElseThrow();
+        IndexMetadata definition = storage.getIndexes(scan.tableName()).stream()
+                .filter(index -> index.indexName().equalsIgnoreCase(indexName))
+                .findFirst()
+                .orElseThrow(() -> QoErrors.semantic("unknown index '" + indexName + "'"));
+        IndexStatistics statistics = storage.getIndexStatistics(indexName);
+        if (statistics == null) throw QoErrors.invalidState("SM returned null statistics for index '" + indexName + "'");
+
+        long qualifyingRows = estimator.estimateRows(node);
+        double indexPages = estimateIndexPages(definition, statistics, scan, qualifyingRows);
+        long heapPages = statistics.clustered()
+                ? estimateClusteredHeapPages(scan.tableName(), qualifyingRows)
+                : estimator.estimateBlocks(node);
+        double heapCost = heapPages == 0 ? 0.0 : statistics.clustered()
+                ? SEEK_TIME_MS + heapPages * TRANSFER_TIME_MS
+                : heapPages * (SEEK_TIME_MS + TRANSFER_TIME_MS);
+        return indexPages * (SEEK_TIME_MS + TRANSFER_TIME_MS) + heapCost;
+    }
+
+    private double estimateIndexPages(IndexMetadata definition, IndexStatistics statistics,
+                                      ScanSpec scan, long qualifyingRows) {
+        if (definition.indexType() == IndexType.HASH) {
+            IndexCondition condition = scan.condition().orElseThrow();
+            if (condition.operator() != IndexOperator.EQ)
+                throw QoErrors.invalidState("HASH index scan only supports equality lookups");
+            int buckets = statistics.bucketCount().orElseThrow(
+                    () -> QoErrors.invalidState("SM omitted HASH bucket count for index '" + definition.indexName() + "'"));
+            if (buckets <= 0) throw QoErrors.invalidState("SM returned invalid HASH bucket count for index '" + definition.indexName() + "'");
+            double overflowPagesPerBucket = statistics.overflowPageCount().orElse(0L) / (double) buckets;
+            // One descriptor, one directory page, the target bucket, and average overflow chain.
+            return 3.0 + overflowPagesPerBucket;
+        }
+
+        int height = statistics.height().orElseThrow(
+                () -> QoErrors.invalidState("SM omitted B+Tree height for index '" + definition.indexName() + "'"));
+        long totalLeafPages = statistics.leafPageCount().orElseThrow(
+                () -> QoErrors.invalidState("SM omitted B+Tree leaf-page count for index '" + definition.indexName() + "'"));
+        if (height <= 0 || totalLeafPages <= 0)
+            throw QoErrors.invalidState("SM returned invalid B+Tree statistics for index '" + definition.indexName() + "'");
+
+        long tableRows = estimator.statisticsForTable(scan.tableName()).recordCount();
+        double fraction = tableRows <= 0 ? 0.0 : Math.min(1.0, qualifyingRows / (double) tableRows);
+        long leafPagesRead = qualifyingRows <= 0 ? 1
+                : Math.min(totalLeafPages, Math.max(1, (long) Math.ceil(totalLeafPages * fraction)));
+        // Height includes the first leaf reached; range scans continue across sibling leaves.
+        return 1.0 + height + Math.max(0, leafPagesRead - 1);
+    }
+
+    private long estimateClusteredHeapPages(String table, long qualifyingRows) {
+        if (qualifyingRows <= 0) return 0;
+        TableStatistics stats = estimator.statisticsForTable(table);
+        return ceilDiv(qualifyingRows, Math.max(1, stats.blockingFactor()));
     }
 
     private double costFilter(PlanNode node) {
@@ -82,7 +184,7 @@ public final class CostModel {
         long innerBlocks = estimator.estimateBlocks(node.children().get(1));
         if (outerBlocks == 0 || innerBlocks == 0) return 0.0;
 
-        int outerCapacity = Math.max(1, BUFFER_BLOCKS - 2);
+        int outerCapacity = bufferBlocks - 2;
         long batches = ceilDiv(outerBlocks, outerCapacity);
         long innerRescans = Math.max(0, batches - 1);
 
@@ -100,23 +202,27 @@ public final class CostModel {
 
     private double costSort(PlanNode node) {
         long blocks = estimator.estimateBlocks(node.children().get(0));
-        if (blocks <= BUFFER_BLOCKS) return 0.0;
+        if (blocks <= bufferBlocks) return 0.0;
 
-        long runs = ceilDiv(blocks, BUFFER_BLOCKS);
+        int fanIn = bufferBlocks - 1;
+        long runs = ceilDiv(blocks, bufferBlocks);
         long mergePasses = 0;
-        long seeks = runs; // one sequential seek per initial run written
-        int fanIn = Math.max(2, BUFFER_BLOCKS - 1);
         while (runs > 1) {
-            long mergedRuns = ceilDiv(runs, fanIn);
-            seeks += runs + mergedRuns; // input-run seeks plus output-run seeks
-            runs = mergedRuns;
+            runs = ceilDiv(runs, fanIn);
             mergePasses++;
         }
 
-        // The child plan already accounts for producing/reading its input. Charge
-        // initial run writes, then one read and write of all blocks per merge pass.
-        double transfers = blocks + 2.0 * blocks * mergePasses;
-        return seeks * SEEK_TIME_MS + transfers * TRANSFER_TIME_MS;
+        // Course formula assumes one buffer block per run (b_b = 1).
+        long totalSeeks = 2 * ceilDiv(blocks, bufferBlocks)
+                + blocks * (2 * mergePasses - 1);
+        long totalTransfers = blocks * (2 * mergePasses + 1);
+
+        // The child plan already charges the initial sequential input read. Remove
+        // its one seek and b transfers from the full external-sort formula so that
+        // SORT(SCAN ...) matches the textbook total without double-counting input.
+        long sortSeeks = Math.max(0, totalSeeks - 1);
+        long sortTransfers = Math.max(0, totalTransfers - blocks);
+        return sortSeeks * SEEK_TIME_MS + sortTransfers * TRANSFER_TIME_MS;
     }
 
     private double costInsert(PlanNode node) {
@@ -135,11 +241,38 @@ public final class CostModel {
 
     private double costModifiedPages(PlanNode node) {
         if (node.children().isEmpty()) return 0.0;
-        long modifiedBlocks = estimator.estimateBlocks(node.children().get(0));
+        MutationSpec mutation = node.mutation().orElseThrow();
+        PlanNode input = node.children().get(0);
+        long qualifyingRows = estimator.estimateRows(input);
+        if (qualifyingRows == 0) return 0.0;
+
+        TableStatistics table = estimator.statisticsForTable(mutation.tableName());
+        long tableBlocks = table.blockCount();
+        if (tableBlocks <= 0) return 0.0;
+
+        long modifiedBlocks = hasClusteredIndexScan(input, mutation.tableName())
+                ? ceilDiv(qualifyingRows, Math.max(1, table.blockingFactor()))
+                : Math.min(tableBlocks, qualifyingRows);
+        modifiedBlocks = Math.min(tableBlocks, modifiedBlocks);
         if (modifiedBlocks == 0) return 0.0;
-        // Child costs include finding/reading qualifying rows. Charge one seek and
-        // one transfer per dirty page to persist the modifications.
+
+        // Without tuple-to-page statistics, unclustered matches may touch up to
+        // one target page per row; clustered index matches are assumed contiguous.
         return SEEK_TIME_MS + modifiedBlocks * TRANSFER_TIME_MS;
+    }
+
+    private boolean hasClusteredIndexScan(PlanNode node, String tableName) {
+        if (node.kind() == sqlike.shared.PlanNodeKind.INDEX_SCAN) {
+            ScanSpec scan = node.scan().orElseThrow();
+            if (scan.tableName().equalsIgnoreCase(tableName)) {
+                String indexName = scan.indexName().orElseThrow();
+                IndexStatistics statistics = storage.getIndexStatistics(indexName);
+                if (statistics == null)
+                    throw QoErrors.invalidState("SM returned null statistics for index '" + indexName + "'");
+                return statistics.clustered();
+            }
+        }
+        return node.children().stream().anyMatch(child -> hasClusteredIndexScan(child, tableName));
     }
 
     private double costCreateIndex(PlanNode node) {

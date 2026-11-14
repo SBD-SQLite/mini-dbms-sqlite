@@ -1,6 +1,7 @@
 package sqlike.qo;
 
 import java.util.List;
+import sqlike.shared.QoException;
 
 /** cursor over the tokens produced by {@link Lexer}, selalu diakhiri with one EOF token */
 public final class TokenStream {
@@ -38,7 +39,6 @@ public final class TokenStream {
     public void expectEndOfStatement() {
         matchSymbol(";");
         Token t = peek();
-        if (t.isKeyword(Keyword.LIMIT)) throw QoErrors.unsupported("LIMIT is not part of the agreed contract", t.offset());
         if (!t.isEof()) throw unexpected("unexpected token at end of statement");
     }
 

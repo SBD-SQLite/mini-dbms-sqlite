@@ -92,11 +92,81 @@ public class StatementParser {
     }
 
     public ParsedQuery parseCreateTable(TokenStream ts) {
-        throw QoErrors.unsupported("CREATE TABLE is not part of the agreed contract", ts.peek().offset());
+        ts.expectKeyword(Keyword.CREATE);
+        ts.expectKeyword(Keyword.TABLE);
+        String table = identifier(ts, "table name");
+        ts.expectSymbol("(");
+        List<ColumnSchema> columns = new ArrayList<>();
+        List<String> primaryKey = new ArrayList<>();
+        List<ForeignKeySpec> foreignKeys = new ArrayList<>();
+        do {
+            if (ts.matchKeyword(Keyword.PRIMARY)) {
+                ts.expectKeyword(Keyword.KEY);
+                if (!primaryKey.isEmpty()) throw ts.unexpected("multiple PRIMARY KEY declarations");
+                primaryKey.addAll(columnList(ts));
+            } else if (ts.matchKeyword(Keyword.FOREIGN)) {
+                ts.expectKeyword(Keyword.KEY);
+                List<String> local = columnList(ts);
+                ts.expectKeyword(Keyword.REFERENCES);
+                String referencedTable = identifier(ts, "referenced table name");
+                List<String> referenced = columnList(ts);
+                foreignKeys.add(new ForeignKeySpec(local, referencedTable, referenced));
+            } else {
+                String name = identifier(ts, "column name");
+                Token typeToken = ts.expectIdentifier("column type");
+                DataType type;
+                try { type = DataType.valueOf(typeToken.text().toUpperCase(Locale.ROOT)); }
+                catch (IllegalArgumentException exception) {
+                    throw QoErrors.syntax("expected INTEGER, FLOAT, CHAR(n), or VARCHAR(n)", typeToken.offset());
+                }
+                // The grammar accepts an optional "(n)" after any type; whether the type needs, forbids or
+                // allows the length (and a duplicate column name) is a definition rule that DdlValidator reports.
+                Optional<Integer> length = Optional.empty();
+                if (ts.matchSymbol("(")) {
+                    boolean negative = ts.matchSymbol("-");
+                    Token size = ts.peek();
+                    if (size.type() != TokenType.INTEGER) throw ts.unexpected("expected a character length");
+                    ts.next();
+                    try {
+                        int value = Integer.parseInt(size.text());
+                        length = Optional.of(negative ? -value : value);
+                    } catch (NumberFormatException exception) {
+                        throw QoErrors.syntax("character length must fit in a 32 bit integer", size.offset());
+                    }
+                    ts.expectSymbol(")");
+                }
+                columns.add(new ColumnSchema(name, type, length));
+                if (ts.matchKeyword(Keyword.PRIMARY)) {
+                    ts.expectKeyword(Keyword.KEY);
+                    if (!primaryKey.isEmpty()) throw ts.unexpected("multiple PRIMARY KEY declarations");
+                    primaryKey.add(name);
+                }
+            }
+        } while (ts.matchSymbol(","));
+        ts.expectSymbol(")");
+        ts.expectEndOfStatement();
+        return query(StatementType.CREATE_TABLE, PlanNodes.createTable(new CreateTableSpec(
+                table, List.copyOf(columns), List.copyOf(primaryKey), List.copyOf(foreignKeys))));
     }
 
     public ParsedQuery parseDropTable(TokenStream ts) {
-        throw QoErrors.unsupported("DROP TABLE is not part of the agreed contract", ts.peek().offset());
+        ts.expectKeyword(Keyword.DROP);
+        ts.expectKeyword(Keyword.TABLE);
+        String table = identifier(ts, "table name");
+        DropBehavior behavior = DropBehavior.RESTRICT;
+        if (ts.matchKeyword(Keyword.CASCADE)) behavior = DropBehavior.CASCADE;
+        else ts.matchKeyword(Keyword.RESTRICT);
+        ts.expectEndOfStatement();
+        return query(StatementType.DROP_TABLE, PlanNodes.dropTable(new DropTableSpec(table, behavior)));
+    }
+
+    private List<String> columnList(TokenStream ts) {
+        ts.expectSymbol("(");
+        List<String> columns = new ArrayList<>();
+        columns.add(identifier(ts, "column name"));
+        while (ts.matchSymbol(",")) columns.add(identifier(ts, "column name"));
+        ts.expectSymbol(")");
+        return List.copyOf(columns);
     }
 
     private Value parseInsertValue(TokenStream ts) {

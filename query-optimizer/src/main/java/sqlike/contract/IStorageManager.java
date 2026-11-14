@@ -20,6 +20,7 @@ public interface IStorageManager {
     TableSchema getSchema(String table);
     TableStatistics getStatistics(String table);
     List<IndexMetadata> getIndexes(String table);
+    IndexStatistics getIndexStatistics(String name);
 
     void createIndex(IndexMetadata definition);
     List<RID> lookupIndex(String name, IndexCondition condition);

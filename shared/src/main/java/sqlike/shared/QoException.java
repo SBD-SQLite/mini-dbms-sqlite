@@ -12,4 +12,3 @@ public class QoException extends RuntimeException {
 
     public ErrorInfo getInfo() { return info; }
 }
-

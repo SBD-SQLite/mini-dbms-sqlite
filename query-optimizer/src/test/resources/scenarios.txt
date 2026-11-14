@@ -24,7 +24,9 @@ clause-order         | SYNTAX_ERROR          | SELECT name WHERE id = 1 FROM stu
 unterminated-string  | SYNTAX_ERROR          | SELECT * FROM students WHERE name = 'abc
 unclosed-paren       | SYNTAX_ERROR          | SELECT * FROM students WHERE (id = 1
 trailing-tokens      | SYNTAX_ERROR          | SELECT * FROM students WHERE id = 1 2
-table-alias          | UNSUPPORTED_OPERATION | SELECT * FROM students s
+table-alias-no-as    | SYNTAX_ERROR          | SELECT * FROM students s
+left-join-unsupported | UNSUPPORTED_OPERATION | SELECT * FROM students LEFT JOIN takes ON students.id = takes.id
+outer-join-unsupported | UNSUPPORTED_OPERATION | SELECT * FROM students FULL OUTER JOIN takes ON students.id = takes.id
 missing-table        | SYNTAX_ERROR          | SELECT * FROM
 
 # --- semantic validation ---
@@ -44,3 +46,31 @@ char-column-compare  | OK | SELECT * FROM takes WHERE grade = 'E'
 or-unsupported       | UNSUPPORTED_OPERATION | SELECT * FROM students WHERE id = 1 OR id = 2
 subquery-unsupported | UNSUPPORTED_OPERATION | SELECT * FROM students WHERE id IN (SELECT id FROM takes)
 int-overflow         | INVALID_VALUE         | SELECT * FROM students WHERE id = 2147483648
+
+# --- bonus: LIMIT and table alias (AS only) ---
+limit-basic          | OK                    | SELECT name FROM students LIMIT 5
+limit-zero           | OK                    | SELECT name FROM students LIMIT 0
+limit-order-by       | OK                    | SELECT name FROM students WHERE id > 10 ORDER BY name LIMIT 5
+limit-join           | OK                    | SELECT students.name, dept.dname FROM students JOIN dept ON students.dept_id = dept.dept_id ORDER BY students.name LIMIT 3
+limit-negative       | SYNTAX_ERROR          | SELECT * FROM students LIMIT -1
+limit-float          | SYNTAX_ERROR          | SELECT * FROM students LIMIT 1.5
+limit-missing-count  | SYNTAX_ERROR          | SELECT * FROM students LIMIT
+limit-before-order   | SYNTAX_ERROR          | SELECT * FROM students LIMIT 5 ORDER BY id
+alias-as-star        | OK                    | SELECT * FROM students AS s
+column-alias         | UNSUPPORTED_OPERATION | SELECT id AS x FROM students
+alias-missing-name   | SYNTAX_ERROR          | SELECT * FROM students AS
+# KNOWN ISSUE (waits for QO3): Binder does not resolve alias qualifiers yet; desired result is OK.
+alias-qualified-where  | XFAIL SEMANTIC_ERROR  | SELECT s.id FROM students AS s WHERE s.id = 1
+alias-join-on          | XFAIL SEMANTIC_ERROR  | SELECT * FROM students AS s JOIN dept AS d ON s.dept_id = d.dept_id
+alias-comma-join       | XFAIL SEMANTIC_ERROR  | SELECT s.name FROM students AS s, dept AS d WHERE s.dept_id = d.dept_id
+
+# --- explain with indexes: "@index <table> <column> <HASH|BPLUS_TREE>" applies to the scenarios below it ---
+@index students id HASH
+@index students gpa BPLUS_TREE
+explain-index-eq     | OK                    | SELECT name FROM students WHERE id = 5
+explain-index-range  | OK                    | SELECT name FROM students WHERE gpa > 3.9
+explain-index-join   | OK                    | SELECT students.name, dept.dname FROM students JOIN dept ON students.dept_id = dept.dept_id WHERE students.id = 5
+explain-no-index-col | OK                    | SELECT * FROM students WHERE dept_id = 2
+explain-update-index | OK                    | UPDATE students SET gpa = 4.0 WHERE id = 5
+explain-delete-index | OK                    | DELETE FROM students WHERE id = 5
+explain-create-index | OK                    | CREATE INDEX idx_dept ON students(dept_id)

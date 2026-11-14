@@ -2,6 +2,7 @@ package sqlike.qo;
 
 import java.util.List;
 import java.util.LinkedHashSet;
+import java.util.OptionalDouble;
 import sqlike.contract.IStorageManager;
 import sqlike.shared.PlanNode;
 
@@ -12,12 +13,14 @@ public class JoinAccessPathOptimizer {
     private final PlanSelector planSelector = new PlanSelector();
     private final CostModel costModel;
     private final AccessPathOptimizer accessOptimizer;
+    private final GeneticJoinOrderOptimizer geneticOptimizer;
 
     /** Supply the same QO3 model used by the facade; no catalog or cost formula is duplicated. */
     public JoinAccessPathOptimizer(CostModel costModel) {
         if (costModel == null) throw new IllegalArgumentException("cost model is required");
         this.costModel = costModel;
         this.accessOptimizer = null;
+        this.geneticOptimizer = null;
     }
 
     /** Full pipeline; the one-argument constructor remains available for join-only consumers. */
@@ -25,20 +28,63 @@ public class JoinAccessPathOptimizer {
         if (costModel == null) throw new IllegalArgumentException("cost model is required");
         this.costModel = costModel;
         this.accessOptimizer = new AccessPathOptimizer(storage);
+        this.geneticOptimizer = null;
+    }
+
+    /** Opt-in GA; existing constructors and the IQueryOptimizer contract keep heuristic defaults. */
+    public JoinAccessPathOptimizer(CostModel costModel, IStorageManager storage, GeneticOptimizerConfig config) {
+        if (costModel == null) throw new IllegalArgumentException("cost model is required");
+        this.costModel = costModel;
+        this.accessOptimizer = new AccessPathOptimizer(storage);
+        this.geneticOptimizer = new GeneticJoinOrderOptimizer(config);
     }
 
     public PlanNode optimize(PlanNode plan) {
         QO5Plans.requirePlan(plan);
         if (!isOptimizable(plan)) return plan;
+        return optimizeWithComparison(plan).plan();
+    }
+
+    /** Per-call comparison; no last-result mutable state is retained on the optimizer. */
+    public OptimizationComparison optimizeWithComparison(PlanNode plan) {
+        QO5Plans.requirePlan(plan);
+        return costModel.withCatalogCache(() -> compare(plan));
+    }
+
+    public record OptimizationComparison(PlanNode plan, double estimatedCost, double heuristicCost,
+                                         OptionalDouble geneticCost, int evaluatedIndividuals) { }
+
+    private OptimizationComparison compare(PlanNode plan) {
+        if (!isOptimizable(plan)) {
+            double cost = costModel.getCost(plan);
+            return new OptimizationComparison(plan, cost, cost, OptionalDouble.empty(), 0);
+        }
 
         PlanNode rewritten = joinRewriter.mergeSelectionIntoJoin(joinRewriter.cartesianToJoin(plan));
-        var candidates = new LinkedHashSet<>(generateCandidates(rewritten));
+        var candidates = new LinkedHashSet<PlanNode>();
+        for (PlanNode candidate : generateCandidates(rewritten))
+            candidates.add(QO5Plans.simplifyIdentityProjects(restoreOutputSchema(candidate, plan)));
         // Include the incoming baseline too; equivalent rewritten plans win equal-cost ties.
-        candidates.add(plan);
+        candidates.add(QO5Plans.simplifyIdentityProjects(plan));
         PlanNode candidate = planSelector.pickCheapest(List.copyOf(candidates), costModel);
-        PlanNode result = restoreOutputSchema(candidate, plan);
+        // Final shape: join reordering can leave PROJECT over PROJECT or a PROJECT equal to its input.
+        PlanNode result = ProjectionCleanup.normalize(QO5Plans.simplifyIdentityProjects(restoreOutputSchema(candidate, plan)));
         PlanNodes.validate(result);
-        return result;
+        double heuristicCost = costModel.getCost(result);
+        if (geneticOptimizer == null)
+            return new OptimizationComparison(result, heuristicCost, heuristicCost, OptionalDouble.empty(), 0);
+
+        GeneticJoinOrderOptimizer.Result genetic = geneticOptimizer.optimize(rewritten, costModel,
+                raw -> prepareGeneticCandidate(raw, plan));
+        PlanNode selected = ProjectionCleanup.normalize(planSelector.pickCheapest(List.of(result, genetic.plan()), costModel));
+        PlanNodes.validate(selected);
+        return new OptimizationComparison(selected, costModel.getCost(selected), heuristicCost,
+                OptionalDouble.of(genetic.estimatedCost()), genetic.evaluatedIndividuals());
+    }
+
+    private PlanNode prepareGeneticCandidate(PlanNode candidate, PlanNode original) {
+        PlanNode accessed = accessOptimizer == null ? candidate : accessOptimizer.chooseAccessPath(candidate, costModel);
+        return QO5Plans.simplifyIdentityProjects(restoreOutputSchema(accessed, original));
     }
 
     private List<PlanNode> generateCandidates(PlanNode plan) {
