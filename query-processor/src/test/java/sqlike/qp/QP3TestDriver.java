@@ -779,7 +779,10 @@ public class QP3TestDriver {
 
         @Override
         public TableSchema getSchema(String table) {
-            throw new UnsupportedOperationException("Not used in QP3TestDriver");
+            if (!"students".equals(table) || !tables.containsKey(table)) {
+                throw new StorageException(StorageErrorCode.TABLE_NOT_FOUND, "Unknown table: " + table);
+            }
+            return new TableSchema(table, table, studentSchema().columns());
         }
 
         @Override

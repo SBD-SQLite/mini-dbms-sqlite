@@ -1,6 +1,5 @@
 package sqlike.qp;
 
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashSet;
@@ -208,7 +207,7 @@ public final class Schema {
             throw new IllegalStateException("Type mismatch: " + column.name());
         }
         if (payload instanceof String text && column.maxLength().isPresent()
-                && text.getBytes(StandardCharsets.UTF_8).length > column.maxLength().get()) {
+                && text.codePointCount(0, text.length()) > column.maxLength().get()) {
             throw new IllegalStateException("Text too long: " + column.name());
         }
         return input;

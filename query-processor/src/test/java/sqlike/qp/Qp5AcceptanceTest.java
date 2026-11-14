@@ -39,7 +39,11 @@ public final class Qp5AcceptanceTest {
         test("QP-12 CCM adapter waits for write grants", Qp5AcceptanceTest::adapterWriteWait);
         test("QP-12 CCM adapter reports failed ABORT and preserves the session", Qp5AcceptanceTest::adapterAbortStatus);
         test("QP-09 Access request ordering and merging", Qp5AcceptanceTest::accessOrderingAndMerging);
-        test("QP-04 CHAR/VARCHAR length in UTF-8 bytes", Qp5AcceptanceTest::utf8ByteLength);
+        test("QP-04 CHAR/VARCHAR length in Unicode code points", Qp5AcceptanceTest::textCodePointLength);
+        test("QP-10/QP-11 Unicode text survives INSERT and UPDATE", Qp5AcceptanceTest::unicodeTextDml);
+        test("QP-10 INSERT stops on missing or failed constraint metadata", () -> metadataFailures("INSERT"));
+        test("QP-11 UPDATE stops on missing or failed constraint metadata", () -> metadataFailures("UPDATE"));
+        test("QP-07 DELETE stops on missing or failed constraint metadata", () -> metadataFailures("DELETE"));
         test("QP-12 COMMIT success and rejection", Qp5AcceptanceTest::commitResults);
         test("QP-12 unknown COMMIT outcome never triggers rollback", Qp5AcceptanceTest::commitOutcomeUnknown);
         test("QP-13 CREATE INDEX and confirmation", Qp5AcceptanceTest::createIndexes);
@@ -310,28 +314,129 @@ public final class Qp5AcceptanceTest {
         assertEquals(List.of("CCM.access.WRITE", "CCM.access.WRITE", "CCM.access.READ"), ccmAccessTrace);
     }
 
-    private static void utf8ByteLength() {
-        Schema schema = Schema.of(List.of(
-                new ColumnSchema("code", DataType.VARCHAR, Optional.of(3))
-        ));
+    private static void textCodePointLength() {
+        for (DataType type : List.of(DataType.CHAR, DataType.VARCHAR)) {
+            Schema one = Schema.of(List.of(new ColumnSchema("code", type, Optional.of(1))));
+            for (String text : List.of("", "a", "\u00e9", "\u4e2d", "\ud83d\ude80")) {
+                Row result = one.validate(Row.of(new Value(DataType.VARCHAR, Optional.empty(), Optional.empty(), Optional.of(text))));
+                assertEquals(text, result.values().get(0).textValue().orElseThrow());
+                assertEquals(type, result.values().get(0).type());
+            }
+            assertTextTooLong(one, "ab");
+            assertTextTooLong(one, "\ud83d\ude80\ud83d\ude80");
+            assertTextTooLong(one, "e\u0301");
 
-        Value v1 = new Value(DataType.VARCHAR, Optional.empty(), Optional.empty(), Optional.of("abc"));
-        Row r1 = schema.validate(new Row(List.of(v1)));
-        assertEquals("abc", r1.values().get(0).textValue().orElseThrow());
-
-        Value v2 = new Value(DataType.VARCHAR, Optional.empty(), Optional.empty(), Optional.of("é"));
-        Row r2 = schema.validate(new Row(List.of(v2)));
-        assertEquals("é", r2.values().get(0).textValue().orElseThrow());
-
-        // Two characters exceed the three-byte UTF-8 limit.
-        boolean threw = false;
-        try {
-            Value v3 = new Value(DataType.VARCHAR, Optional.empty(), Optional.empty(), Optional.of("éé"));
-            schema.validate(new Row(List.of(v3)));
-        } catch (IllegalStateException e) {
-            threw = e.getMessage().contains("Text too long");
+            Schema three = Schema.of(List.of(new ColumnSchema("code", type, Optional.of(3))));
+            for (String text : List.of("abc", "\u00e9\u4e2d\ud83d\ude80", "\ud83d\ude80\ud83d\ude80\ud83d\ude80")) {
+                assertEquals(text, three.validate(Row.of(new Value(type, Optional.empty(), Optional.empty(), Optional.of(text)))).values().get(0).textValue().orElseThrow());
+            }
+            assertTextTooLong(three, "abcd");
+            assertTextTooLong(three, "\u00e9\u4e2d\ud83d\ude80a");
         }
-        assertTrue(threw, "String with UTF-8 byte size exceeding maxLength should be rejected");
+    }
+
+    private static void assertTextTooLong(Schema schema, String text) {
+        try {
+            schema.validate(Row.of(new Value(DataType.VARCHAR, Optional.empty(), Optional.empty(), Optional.of(text))));
+            throw new AssertionError("Text exceeding the code-point limit was accepted");
+        } catch (IllegalStateException e) {
+            assertTrue(e.getMessage().contains("Text too long"), e.getMessage());
+        }
+    }
+
+    private static void unicodeTextDml() throws Exception {
+        TestDatabase database = new TestDatabase();
+        database.execute("CREATE TABLE unicode_text (id INTEGER PRIMARY KEY, code CHAR(1), label VARCHAR(3));");
+        assertAffected(1, database.execute("INSERT INTO unicode_text VALUES (1, '\u00e9', '\u00e9\u4e2d\ud83d\ude80');"));
+        assertEquals(List.of(List.of(1, "\u00e9", "\u00e9\u4e2d\ud83d\ude80")), values(database.execute("SELECT * FROM unicode_text;")));
+        assertAffected(1, database.execute("UPDATE unicode_text SET code = '\ud83d\ude80' WHERE id = 1;"));
+        database.trace.clear();
+        Result rejectedInsert = database.runner.execute(database.session, "INSERT INTO unicode_text VALUES (2, 'x', '\u00e9\u4e2d\ud83d\ude80a');");
+        assertTrue(!rejectedInsert.success() && rejectedInsert.message().contains("Text too long"), rejectedInsert.message());
+        assertTrue(!database.trace.contains("SM.reserve"), "Oversized text reserved a RID");
+        Result rejectedUpdate = database.runner.execute(database.session, "UPDATE unicode_text SET label = '\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80' WHERE id = 1;");
+        assertTrue(!rejectedUpdate.success() && rejectedUpdate.message().contains("Text too long"), rejectedUpdate.message());
+        assertTrue(!database.trace.contains("SM.insert") && !database.trace.contains("SM.update"), "Oversized text reached storage writes");
+        assertEquals(List.of(List.of(1, "\ud83d\ude80", "\u00e9\u4e2d\ud83d\ude80")), values(database.execute("SELECT * FROM unicode_text;")));
+    }
+
+    private static void metadataFailures(String operation) {
+        List<String> points = switch (operation) {
+            case "INSERT" -> List.of("target", "reference");
+            case "UPDATE" -> List.of("target", "catalog", "parent");
+            case "DELETE" -> List.of("catalog", "parent", "child");
+            default -> throw new AssertionError(operation);
+        };
+        for (String point : points) {
+            for (boolean missing : List.of(false, true)) {
+                List<String> writes = new ArrayList<>();
+                var error = new QpException(new ErrorInfo(ErrorCode.IO_ERROR, ComponentType.SM, "Metadata unavailable: " + point, Optional.empty()));
+                var columns = List.of(new ColumnSchema("id", DataType.INTEGER, Optional.empty()));
+                var parent = new TableSchema("parent", "parent", columns);
+                var child = new TableSchema("child", "child", columns, List.of(), List.of(new ForeignKeySpec(List.of("id"), "parent", List.of("id"))));
+                TableId target = new TableId(point.equals("reference") ? "child" : "parent");
+                AtomicInteger parentReads = new AtomicInteger();
+                IStorageManager storage = (IStorageManager) Proxy.newProxyInstance(Qp5AcceptanceTest.class.getClassLoader(), new Class<?>[]{IStorageManager.class}, (proxy, method, args) -> {
+                    if (method.getName().equals("getTableSchema")) {
+                        String table = ((TableId) args[0]).value();
+                        int reads = table.equals("parent") ? parentReads.incrementAndGet() : 0;
+                        boolean fail = switch (point) {
+                            case "target" -> table.equals(target.value());
+                            case "parent" -> table.equals("parent") && reads == (operation.equals("UPDATE") ? 2 : 1);
+                            case "child" -> table.equals("child");
+                            case "reference" -> table.equals("parent");
+                            default -> false;
+                        };
+                        if (fail) {if (missing) return null; throw error;}
+                        return table.equals("parent") ? parent : child;
+                    }
+                    return switch (method.getName()) {
+                        case "getSchema" -> Schema.fromTableSchema(target.value().equals("parent") ? parent : child);
+                        case "listTables" -> {
+                            if (point.equals("catalog")) {if (missing) yield null; throw error;}
+                            yield List.of("parent", "child");
+                        }
+                        case "scan" -> new sqlike.qp.port.QpContracts.RecordCursor() {
+                            @Override public Optional<StoredRecord> next() {return Optional.empty();}
+                            @Override public void close() { }
+                        };
+                        case "reserveInsert" -> {writes.add("reserve"); yield new Rid(new RID(new PageId(target.value(), 0), 0));}
+                        case "applyChange", "releaseReservation" -> {writes.add(method.getName()); yield null;}
+                        default -> throw new AssertionError("Unexpected storage call: " + method.getName());
+                    };
+                });
+                IConcurrencyControl concurrency = (IConcurrencyControl) Proxy.newProxyInstance(Qp5AcceptanceTest.class.getClassLoader(), new Class<?>[]{IConcurrencyControl.class}, (proxy, method, args) -> switch (method.getName()) {
+                    case "getState" -> TransactionState.ACTIVE;
+                    case "authorizeChange" -> {writes.add("authorize"); yield new WritePermit(((ChangeRecord) args[0]).id(), new Lsn(1));}
+                    case "acquireApplyLease" -> {writes.add("lease"); yield (WriteLease) () -> {};}
+                    case "confirmApplied" -> {writes.add("confirm"); yield null;}
+                    default -> throw new AssertionError("Unexpected CCM call: " + method.getName());
+                });
+                var coordinator = new MutationCoordinator(storage, concurrency);
+                ExecutionContext context = ExecutionContext.of(51);
+                for (String table : List.of("parent", "child")) {
+                    context.addGrant(new AccessGrant(new TxId(51), ResourceKey.table(new TableId(table)), AccessMode.WRITE));
+                }
+                Row values = Row.of(sqlike.qo.Literals.integer(2));
+                StoredRecord before = new StoredRecord(new RID(new PageId(target.value(), 0), 0), Row.of(sqlike.qo.Literals.integer(1)));
+                boolean rejected = false;
+                try {
+                    switch (operation) {
+                        case "INSERT" -> coordinator.insert(target, values, context);
+                        case "UPDATE" -> coordinator.update(target, before, values, context);
+                        case "DELETE" -> coordinator.delete(target, before, context);
+                        default -> throw new AssertionError(operation);
+                    }
+                } catch (QpException actual) {
+                    rejected = true;
+                    assertEquals(ErrorCode.IO_ERROR, actual.getErrorInfo().code());
+                    assertEquals(ComponentType.SM, actual.getErrorInfo().component());
+                    if (!missing) assertTrue(actual == error, "Original metadata error was replaced");
+                }
+                assertTrue(rejected, operation + " ignored " + point + " metadata failure; writes=" + writes);
+                assertTrue(writes.isEmpty(), "Metadata failure reached reservation, WAL, or apply: " + writes);
+            }
+        }
     }
 
     private static void createIndexes() throws Exception {

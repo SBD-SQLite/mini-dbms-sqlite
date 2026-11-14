@@ -117,6 +117,15 @@ public class MutationCoordinator {
         }
     }
 
+    private TableSchema requireTableSchema(TableId tableId) {
+        TableSchema schema = storage.getTableSchema(tableId);
+        if (schema == null) {
+            throw new QpException(new ErrorInfo(ErrorCode.IO_ERROR, ComponentType.SM,
+                    "Storage manager returned no schema for table '" + tableId.value() + "'", Optional.empty()));
+        }
+        return schema;
+    }
+
     private void enforceInsertOrUpdateConstraints(
             TableId tableId,
             Row candidateRow,
@@ -125,15 +134,7 @@ public class MutationCoordinator {
         if (storage == null) {
             return;
         }
-        TableSchema tableSchema;
-        try {
-            tableSchema = storage.getTableSchema(tableId);
-        } catch (RuntimeException e) {
-            return;
-        }
-        if (tableSchema == null) {
-            return;
-        }
+        TableSchema tableSchema = requireTableSchema(tableId);
         Schema qpSchema = Schema.fromTableSchema(tableSchema);
 
         if (!tableSchema.primaryKey().isEmpty()) {
@@ -166,7 +167,7 @@ public class MutationCoordinator {
 
         for (ForeignKeySpec fk : tableSchema.foreignKeys()) {
             TableId refTableId = new TableId(fk.referencedTable());
-            TableSchema refTableSchema = storage.getTableSchema(refTableId);
+            TableSchema refTableSchema = requireTableSchema(refTableId);
             Schema refQpSchema = Schema.fromTableSchema(refTableSchema);
             List<Integer> localOffsets = fk.columnNames().stream()
                     .map(col -> qpSchema.findColumnOffset(null, col))
@@ -219,30 +220,21 @@ public class MutationCoordinator {
         if (storage == null) {
             return;
         }
-        List<String> allTables;
-        try {
-            allTables = storage.listTables();
-        } catch (RuntimeException e) {
+        List<String> allTables = storage.listTables();
+        if (allTables == null) {
+            throw new QpException(new ErrorInfo(ErrorCode.IO_ERROR, ComponentType.SM,
+                    "Storage manager returned no table list", Optional.empty()));
+        }
+        if (allTables.isEmpty()) {
             return;
         }
-        if (allTables == null || allTables.isEmpty()) {
-            return;
-        }
-        TableSchema parentSchema;
-        try {
-            parentSchema = storage.getTableSchema(parentTableId);
-        } catch (RuntimeException e) {
-            return;
-        }
-        if (parentSchema == null) {
-            return;
-        }
+        TableSchema parentSchema = requireTableSchema(parentTableId);
         Schema parentQpSchema = Schema.fromTableSchema(parentSchema);
 
         for (String childTableName : allTables) {
             TableId childTableId = new TableId(childTableName);
-            TableSchema childSchema = storage.getTableSchema(childTableId);
-            if (childSchema == null || childSchema.foreignKeys().isEmpty()) {
+            TableSchema childSchema = requireTableSchema(childTableId);
+            if (childSchema.foreignKeys().isEmpty()) {
                 continue;
             }
             Schema childQpSchema = Schema.fromTableSchema(childSchema);
