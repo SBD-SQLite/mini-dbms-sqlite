@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# SQLike Query Processor - Universal Test Runner (Bash)
+# SQLike Query Processor - Isolated Test Runner (Bash, stub QO/SM/CCM/FRM)
 # ==============================================================================
 # Usage:
 #   ./query-processor/run-tests.sh         # Runs all test drivers
@@ -38,7 +38,7 @@ if [ ! -x "${JAVA_CMD}" ]; then
 fi
 
 if [ -z "${JAVAC_CMD}" ] || [ -z "${JAVA_CMD}" ]; then
-    echo -e "${RED}[ERROR] JDK 17+ (javac/java) is not installed or not in PATH.${RESET}"
+    echo -e "${RED}[ERROR] JDK 21+ (javac/java) is not installed or not in PATH.${RESET}"
     exit 1
 fi
 
@@ -68,7 +68,7 @@ for sdir in "${SOURCE_DIRS[@]}"; do
     if [ -d "${sdir}" ]; then
         while IFS= read -r f; do
             SOURCES+=("$f")
-        done < <(find "${sdir}" -type f -name "*.java")
+        done < <(find "${sdir}" -type f -name "*.java" ! -name "M1ContractTestDriver.java")
     fi
 done
 
@@ -78,7 +78,7 @@ if [ ${#SOURCES[@]} -eq 0 ]; then
 fi
 
 echo -e "Compiling ${#SOURCES[@]} Java files into ${BUILD_DIR}..."
-if ! "${JAVAC_CMD}" --release 17 -encoding UTF-8 -d "${BUILD_DIR}" "${SOURCES[@]}"; then
+if ! "${JAVAC_CMD}" --release 21 -encoding UTF-8 -d "${BUILD_DIR}" "${SOURCES[@]}"; then
     echo -e "${RED}[FAIL] Compilation failed! Please check syntax and type errors.${RESET}"
     exit 1
 fi
@@ -96,7 +96,7 @@ run_test() {
     local extra_args=("$@")
 
     echo -e "\n${BOLD}${CYAN}--- Running ${name} (${class_name}) ---${RESET}"
-    if "${JAVA_CMD}" -cp "${BUILD_DIR}" "${class_name}" "${extra_args[@]}"; then
+    if "${JAVA_CMD}" -ea -cp "${BUILD_DIR}" "${class_name}" "${extra_args[@]}"; then
         echo -e "${GREEN}[PASS] ${name} completed successfully.${RESET}"
     else
         echo -e "${RED}[FAIL] ${name} encountered errors.${RESET}"
