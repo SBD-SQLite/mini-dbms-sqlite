@@ -2,8 +2,10 @@ package sqlike.ccm;
 
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
@@ -12,6 +14,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import sqlike.shared.AccessStatus;
 import sqlike.shared.ProtocolType;
 import sqlike.shared.ResourceId;
+import sqlike.shared.ResourceScope;
 import sqlike.shared.TransactionStatus;
 
 public class TimestampProtocol implements IConcurrencyProtocol {
@@ -47,12 +50,12 @@ public class TimestampProtocol implements IConcurrencyProtocol {
 
     @Override
     public AccessStatus checkRead(Transaction tx, ResourceId resource) {
-        return check(tx, resource, false);
+        return check(tx, canonicalResource(resource), false);
     }
 
     @Override
     public AccessStatus checkWrite(Transaction tx, ResourceId resource) {
-        return check(tx, resource, true);
+        return check(tx, canonicalResource(resource), true);
     }
 
     @Override
@@ -177,6 +180,25 @@ public class TimestampProtocol implements IConcurrencyProtocol {
         } finally {
             lock.unlock();
         }
+    }
+
+    private static ResourceId canonicalResource(ResourceId resource) {
+        Objects.requireNonNull(resource, "resource");
+        Objects.requireNonNull(resource.scope(), "resource.scope");
+        String name = Objects.requireNonNull(resource.tableName(), "resource.tableName").toLowerCase(Locale.ROOT);
+        
+        if (name.isBlank()) {
+            throw new IllegalArgumentException("Resource name must not be blank");
+        }
+        
+        if (Resources.isCatalog(resource)) {
+            if (!name.equals(Resources.CATALOG_NAME) || resource.rid().isPresent()) {
+                throw new IllegalArgumentException("Catalog resources must use __catalog__ without a RID");
+            }
+            return Resources.catalog();
+        }
+        
+        return new ResourceId(ResourceScope.TABLE, name, Optional.empty());
     }
 
     private final class Entry {

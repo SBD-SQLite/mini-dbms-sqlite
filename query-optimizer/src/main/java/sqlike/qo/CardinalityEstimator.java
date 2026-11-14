@@ -1,10 +1,18 @@
 package sqlike.qo;
 
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.function.Supplier;
 import sqlike.contract.IStorageManager;
 import sqlike.shared.*;
 
 public final class CardinalityEstimator {
+    private static final double BLOCK_SIZE_BYTES = 4096.0;
+
     private final IStorageManager storage;
+    private final ThreadLocal<CatalogCache> activeCache = new ThreadLocal<>();
 
     public CardinalityEstimator(IStorageManager storage) {
         if (storage == null) throw new IllegalArgumentException("storage is required");
@@ -12,6 +20,11 @@ public final class CardinalityEstimator {
     }
 
     public long estimateRows(PlanNode node) {
+        if (node == null) throw QoErrors.invalidValue("plan node is null", 0);
+        return withCatalogCache(() -> estimateRowsCached(node));
+    }
+
+    private long estimateRowsCached(PlanNode node) {
         return switch (node.kind()) {
             case SCAN -> stats(node.scan().orElseThrow().tableName()).recordCount();
             case INDEX_SCAN -> clampRows(estimateRowsForScan(node.scan().orElseThrow().tableName()) *
@@ -22,10 +35,18 @@ public final class CardinalityEstimator {
             case PROJECT, SORT, UPDATE, DELETE -> node.children().isEmpty() ? 0 : estimateRows(node.children().get(0));
             case INSERT -> 1;
             case CREATE_INDEX -> 0;
+            case LIMIT -> node.children().isEmpty() ? 0
+                    : Math.min(estimateRows(node.children().get(0)), node.limit().orElseThrow().count());
+            case CREATE_TABLE, DROP_TABLE -> 0;
         };
     }
 
     public long estimateBlocks(PlanNode node) {
+        if (node == null) throw QoErrors.invalidValue("plan node is null", 0);
+        return withCatalogCache(() -> estimateBlocksCached(node));
+    }
+
+    private long estimateBlocksCached(PlanNode node) {
         if (node.kind() == PlanNodeKind.SCAN)
             return stats(node.scan().orElseThrow().tableName()).blockCount();
         if (node.kind() == PlanNodeKind.INDEX_SCAN) {
@@ -43,13 +64,23 @@ public final class CardinalityEstimator {
             return Math.min(tableBlocks, Math.max(1, roundedPages));
         }
         long rows = estimateRows(node);
-        if (node.children().isEmpty()) return rows == 0 ? 0 : 1;
-        TableStatistics source = firstStats(node);
-        int factor = Math.max(1, source.blockingFactor());
-        return rows == 0 ? 0 : 1 + (rows - 1) / factor;
+        if (rows == 0) return 0;
+        if (node.children().isEmpty()) return 1;
+
+        double tupleSize = estimatedTupleSize(node);
+        int blockingFactor = tupleSize > 0
+                ? Math.max(1, (int) Math.floor(BLOCK_SIZE_BYTES / tupleSize))
+                : Math.max(1, firstStats(node).blockingFactor());
+        return 1 + (rows - 1) / blockingFactor;
     }
 
     public double selectivity(Expression condition, PlanNode child) {
+        if (condition == null || child == null)
+            throw QoErrors.invalidValue("condition and child plan are required", 0);
+        return withCatalogCache(() -> selectivityCached(condition, child));
+    }
+
+    private double selectivityCached(Expression condition, PlanNode child) {
         if (condition.kind() == ExpressionKind.BINARY && condition.operator().orElse(null) == ExpressionOperator.AND && condition.operands().size() == 2)
             return clamp(selectivity(condition.operands().get(0), child) * selectivity(condition.operands().get(1), child));
         if (condition.kind() == ExpressionKind.BINARY) {
@@ -93,9 +124,9 @@ public final class CardinalityEstimator {
         return switch (op) {
             case EQ -> 1.0 / distinct;
             case NE -> 1.0 - 1.0 / distinct;
-            // No min/max histogram is part of the SM statistics contract yet.
-            // Use a uniform-distribution heuristic, to be refined with SM4.
-            case GT, GE, LT, LE -> 1.0 / 3.0;
+            // SM does not expose min/max or histograms. Follow the course's n_r/2
+            // range heuristic (selectivity 0.5) until richer statistics are agreed.
+            case GT, GE, LT, LE -> 0.5;
             default -> 0.5;
         };
     }
@@ -109,7 +140,8 @@ public final class CardinalityEstimator {
                 .map(IndexMetadata::columnName).findFirst().orElse("");
         return switch (condition.operator()) {
             case EQ -> 1.0 / Math.max(1, distinct(table, columnName));
-            case GT, GE, LT, LE, BETWEEN -> 1.0 / 3.0;
+            // Same n_r/2 range heuristic used for sequential filters.
+            case GT, GE, LT, LE, BETWEEN -> 0.5;
         };
     }
 
@@ -140,11 +172,51 @@ public final class CardinalityEstimator {
         return new TableStatistics(0, 0, 0, 1, java.util.Map.of());
     }
 
-    private TableStatistics stats(String table) { return storage.getStatistics(actualTableName(table)); }
+    private TableStatistics stats(String table) {
+        CatalogCache cache = activeCache.get();
+        String actualName = actualTableName(table);
+        if (cache == null) return storage.getStatistics(actualName);
+        return cache.statistics.computeIfAbsent(key(actualName), ignored -> storage.getStatistics(actualName));
+    }
 
     private String actualTableName(String table) {
-        return storage.listTables().stream().filter(name -> name.equalsIgnoreCase(table)).findFirst()
+        CatalogCache cache = activeCache.get();
+        if (cache == null)
+            return storage.listTables().stream().filter(name -> name.equalsIgnoreCase(table)).findFirst()
+                    .orElseThrow(() -> QoErrors.semantic("unknown table '" + table + "'"));
+        if (cache.tableNames == null) cache.tableNames = List.copyOf(storage.listTables());
+        return cache.tableNames.stream().filter(name -> name.equalsIgnoreCase(table)).findFirst()
                 .orElseThrow(() -> QoErrors.semantic("unknown table '" + table + "'"));
+    }
+
+    <T> T withCatalogCache(Supplier<T> action) {
+        if (activeCache.get() != null) return action.get();
+        activeCache.set(new CatalogCache());
+        try {
+            return action.get();
+        } finally {
+            activeCache.remove();
+        }
+    }
+
+    private double estimatedTupleSize(PlanNode node) {
+        if (node.kind() == PlanNodeKind.SCAN || node.kind() == PlanNodeKind.INDEX_SCAN) {
+            double size = stats(node.scan().orElseThrow().tableName()).averageRecordSize();
+            return size > 0 ? size : 0;
+        }
+        if (node.kind() == PlanNodeKind.JOIN || node.kind() == PlanNodeKind.CARTESIAN) {
+            if (node.children().size() != 2) return 0;
+            return estimatedTupleSize(node.children().get(0)) + estimatedTupleSize(node.children().get(1));
+        }
+        if (!node.children().isEmpty()) return estimatedTupleSize(node.children().get(0));
+        return 0;
+    }
+
+    private static String key(String value) { return value.toLowerCase(Locale.ROOT); }
+
+    private static final class CatalogCache {
+        private List<String> tableNames;
+        private final Map<String, TableStatistics> statistics = new HashMap<>();
     }
     private static long clampRows(double rows) { return rows <= 0 ? 0 : rows >= Long.MAX_VALUE ? Long.MAX_VALUE : (long) Math.ceil(rows); }
     private static long safeMultiply(long a, long b) { return a == 0 || b == 0 ? 0 : a > Long.MAX_VALUE / b ? Long.MAX_VALUE : a * b; }

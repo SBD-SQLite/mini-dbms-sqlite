@@ -7,5 +7,7 @@ public enum LogType{
     DELETE,
     COMMIT,
     ABORT, 
-    CHECKPOINT
+    CHECKPOINT,
+    SCHEMA_CHANGE, 
+    COMPENSATION
 }

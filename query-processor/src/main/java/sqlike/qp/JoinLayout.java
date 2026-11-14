@@ -1,8 +1,13 @@
 package sqlike.qp;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.ArrayList;
 import java.util.Objects;
+import java.util.Set;
+import sqlike.shared.ColumnSchema;
 
 public class JoinLayout {
     private Schema leftSchema;
@@ -10,18 +15,46 @@ public class JoinLayout {
     private Schema inputSchema;
     private Schema outputSchema;
     private List<Integer> outputMapping;
-    
+
     public JoinLayout(Schema left, Schema right, Schema output, List<Integer> mapping) {
         leftSchema = Objects.requireNonNull(left);
         rightSchema = Objects.requireNonNull(right);
         var columns = new ArrayList<>(left.columns());
         columns.addAll(right.columns());
-        inputSchema = Schema.of(columns);
-        outputSchema = Objects.requireNonNull(output);
-        outputMapping = List.copyOf(mapping);
+        List<Set<String>> inputOwners = new ArrayList<>(columns.size());
+        for (int i = 0; i < left.columnCount(); i++) {
+            inputOwners.add(left.columnTablesAt(i));
+        }
+        for (int i = 0; i < right.columnCount(); i++) {
+            inputOwners.add(right.columnTablesAt(i));
+        }
+        inputSchema = Schema.withColumnTables(columns, java.util.Optional.empty(), inputOwners);
+
+        Objects.requireNonNull(output);
+        outputMapping = List.copyOf(Objects.requireNonNull(mapping));
+        outputSchema = output;
         validateMapping();
+
+        List<Set<String>> outputOwners = new ArrayList<>(outputMapping.size());
+        for (int i = 0; i < outputMapping.size(); i++) {
+            int srcOffset = outputMapping.get(i);
+            Set<String> owners = new LinkedHashSet<>(inputSchema.columnTablesAt(srcOffset));
+            owners.addAll(output.columnTablesAt(i));
+            ColumnSchema outCol = output.getColumn(i);
+            if (srcOffset < left.columnCount()) {
+                for (int r = 0; r < right.columnCount(); r++) {
+                    int rightInputOffset = left.columnCount() + r;
+                    if (!outputMapping.contains(rightInputOffset)
+                            && right.getColumn(r).name().equalsIgnoreCase(outCol.name())) {
+                        owners.addAll(right.columnTablesAt(r));
+                    }
+                }
+            }
+            outputOwners.add(owners);
+        }
+        outputSchema = Schema.withColumnTables(output.columns(), output.tableName(), outputOwners);
     }
-    
+
     public Schema getInputSchema() {
         return inputSchema;
     }
@@ -48,8 +81,16 @@ public class JoinLayout {
         return RowEnvelope.of(Row.of(outputMapping.stream().map(input::getValue).toList()));
     }
 
-    // provenance kosong pada M1, lengkapi setelah RowEnvelope multi-relasi disepakati.
-    private Map<String,RecordRef> mergeOrigins(RowEnvelope left, RowEnvelope right) {return Map.of();}
+    private Map<String, RecordRef> mergeOrigins(RowEnvelope left, RowEnvelope right) {
+        Map<String, RecordRef> origins = new LinkedHashMap<>();
+        if (left != null && left.rid().isPresent() && leftSchema.tableName().isPresent()) {
+            origins.put(leftSchema.tableName().get(), new RecordRef(leftSchema.tableName().get(), left.rid().get()));
+        }
+        if (right != null && right.rid().isPresent() && rightSchema.tableName().isPresent()) {
+            origins.put(rightSchema.tableName().get(), new RecordRef(rightSchema.tableName().get(), right.rid().get()));
+        }
+        return Map.copyOf(origins);
+    }
 
     private void validateMapping() {
         if (outputMapping.size() != outputSchema.columnCount()) {
@@ -63,7 +104,10 @@ public class JoinLayout {
             }
         }
     }
-
 }
 
-class RecordRef {}
+record RecordRef(String tableName, sqlike.shared.RID rid) {
+    RecordRef() {
+        this("", null);
+    }
+}

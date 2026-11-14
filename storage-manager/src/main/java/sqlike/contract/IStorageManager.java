@@ -5,6 +5,7 @@ import java.util.Optional;
 import sqlike.shared.DropBehavior;
 import sqlike.shared.IndexCondition;
 import sqlike.shared.IndexMetadata;
+import sqlike.shared.IndexStatistics;
 import sqlike.shared.InsertReservation;
 import sqlike.shared.RID;
 import sqlike.shared.Record;
@@ -42,6 +43,8 @@ public interface IStorageManager {
     void createIndex(IndexMetadata definition) throws StorageException;
 
     List<IndexMetadata> getIndexes(String table) throws StorageException;
+
+    IndexStatistics getIndexStatistics(String name) throws StorageException;
 
     List<RID> lookupIndex(String name, IndexCondition condition) throws StorageException;
 

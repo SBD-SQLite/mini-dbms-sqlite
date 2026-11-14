@@ -34,21 +34,27 @@ public final class Binder {
             case SORT -> bindSort(node);
             case INSERT, UPDATE, DELETE -> bindMutation(node);
             case CREATE_INDEX -> bindCreateIndex(node);
+            case LIMIT -> bindLimit(node);
+            case CREATE_TABLE, DROP_TABLE -> throw QoErrors.unsupported(node.kind() + " binding is not implemented", 0);
         };
     }
 
     private PlanNode bindScan(PlanNode node) {
         ScanSpec scan = node.scan().orElseThrow();
         TableSchema schema = table(scan.tableName());
+        Optional<String> indexName = scan.indexName();
         if (node.kind() == PlanNodeKind.INDEX_SCAN) {
-            boolean found = storage.getIndexes(schema.tableName()).stream()
-                    .anyMatch(i -> i.indexName().equalsIgnoreCase(scan.indexName().orElseThrow()));
-            if (!found) throw QoErrors.semantic("unknown index '" + scan.indexName().orElseThrow() + "'");
+            IndexMetadata index = storage.getIndexes(schema.tableName()).stream()
+                    .filter(i -> i.indexName().equalsIgnoreCase(scan.indexName().orElseThrow()))
+                    .findFirst()
+                    .orElseThrow(() -> QoErrors.semantic("unknown index '" + scan.indexName().orElseThrow() + "'"));
+            indexName = Optional.of(index.indexName());
         }
+        ScanSpec boundScan = new ScanSpec(schema.tableName(), indexName, scan.condition(), scan.alias());
         List<ResultColumn> outputs = schema.columns().stream()
-                .map(c -> new ResultColumn(c.name(), Optional.of(ColumnRef.of(schema.tableName(), c.name())), c.dataType()))
+                .map(c -> new ResultColumn(c.name(), Optional.of(Refs.column(schema.tableName(), c.name())), c.dataType()))
                 .toList();
-        return copy(node, List.of(), outputs, Optional.of(scan), node.predicate(), node.projection(), node.join(), node.sort(), node.mutation(), node.createIndex());
+        return copy(node, List.of(), outputs, Optional.of(boundScan), node.predicate(), node.projection(), node.join(), node.sort(), node.mutation(), node.createIndex());
     }
 
     private PlanNode bindFilter(PlanNode node) {
@@ -124,6 +130,12 @@ public final class Binder {
                 Optional.of(new SortSpec(resolved, sort.direction())), node.mutation(), node.createIndex());
     }
 
+    private PlanNode bindLimit(PlanNode node) {
+        PlanNode child = bindNode(node.children().get(0));
+        return copy(node, List.of(child), child.outputColumns(), node.scan(), node.predicate(), node.projection(), node.join(),
+                node.sort(), node.mutation(), node.createIndex());
+    }
+
     private PlanNode bindMutation(PlanNode node) {
         MutationSpec mutation = node.mutation().orElseThrow();
         TableSchema schema = table(mutation.tableName());
@@ -133,6 +145,7 @@ public final class Binder {
             for (int i = 0; i < schema.columns().size(); i++)
                 if (!compatible(schema.columns().get(i).dataType(), mutation.insertValues().get(i).type()))
                     throw QoErrors.semantic("INSERT value type does not match column '" + schema.tableName() + "." + schema.columns().get(i).name() + "'");
+            mutation = new MutationSpec(schema.tableName(), mutation.insertValues(), mutation.updateColumn(), mutation.updateExpression());
             return copy(node, List.of(), List.of(), node.scan(), node.predicate(), node.projection(), node.join(), node.sort(), Optional.of(mutation), node.createIndex());
         }
         PlanNode child = bindNode(node.children().get(0));
@@ -142,6 +155,8 @@ public final class Binder {
             if (!compatible(columnSchema(target).dataType(), expressionType(value)))
                 throw QoErrors.semantic("UPDATE expression type does not match column '" + render(target) + "'");
             mutation = new MutationSpec(schema.tableName(), mutation.insertValues(), Optional.of(target), Optional.of(value));
+        } else {
+            mutation = new MutationSpec(schema.tableName(), mutation.insertValues(), mutation.updateColumn(), mutation.updateExpression());
         }
         return copy(node, List.of(child), child.outputColumns(), node.scan(), node.predicate(), node.projection(), node.join(), node.sort(), Optional.of(mutation), node.createIndex());
     }
@@ -149,8 +164,9 @@ public final class Binder {
     private PlanNode bindCreateIndex(PlanNode node) {
         IndexMetadata index = node.createIndex().orElseThrow();
         TableSchema schema = table(index.tableName());
-        column(schema, index.columnName());
-        return node;
+        ColumnSchema column = column(schema, index.columnName());
+        IndexMetadata boundIndex = new IndexMetadata(index.indexName(), schema.tableName(), column.name(), index.indexType());
+        return copy(node, node.children(), node.outputColumns(), node.scan(), node.predicate(), node.projection(), node.join(), node.sort(), node.mutation(), Optional.of(boundIndex));
     }
 
     private Expression bindExpression(Expression expression, List<TableSchema> tables) {
@@ -216,16 +232,16 @@ public final class Binder {
         if (candidates.isEmpty()) throw QoErrors.semantic("unknown column '" + render(ref) + "'");
         if (candidates.size() > 1) throw QoErrors.semantic("ambiguous column '" + ref.columnName() + "'");
         ColumnSchema col = column(candidates.get(0), ref.columnName());
-        return ColumnRef.of(candidates.get(0).tableName(), col.name());
+        return Refs.column(candidates.get(0).tableName(), col.name());
     }
 
     private List<TableSchema> scope(PlanNode node) {
-        Map<Long, TableSchema> found = new LinkedHashMap<>();
+        Map<String, TableSchema> found = new LinkedHashMap<>();
         collectSchemas(node, found);
         return List.copyOf(found.values());
     }
 
-    private void collectSchemas(PlanNode node, Map<Long, TableSchema> found) {
+    private void collectSchemas(PlanNode node, Map<String, TableSchema> found) {
         node.scan().ifPresent(s -> {
             TableSchema schema = table(s.tableName());
             found.putIfAbsent(schema.tableId(), schema);
@@ -234,7 +250,7 @@ public final class Binder {
     }
 
     private List<TableSchema> mergeScope(List<TableSchema> left, List<TableSchema> right) {
-        Map<Long, TableSchema> merged = new LinkedHashMap<>();
+        Map<String, TableSchema> merged = new LinkedHashMap<>();
         left.forEach(t -> merged.put(t.tableId(), t));
         right.forEach(t -> merged.put(t.tableId(), t));
         return List.copyOf(merged.values());
@@ -268,10 +284,11 @@ public final class Binder {
     }
 
     private static boolean compatible(DataType a, DataType b) {
-        return a == b || numeric(a) && numeric(b);
+        return a == b || numeric(a) && numeric(b) || text(a) && text(b);
     }
 
     private static boolean numeric(DataType type) { return type == DataType.INTEGER || type == DataType.FLOAT; }
+    private static boolean text(DataType type) { return type == DataType.CHAR || type == DataType.VARCHAR; }
     private static boolean isComparison(ExpressionOperator op) {
         return op == ExpressionOperator.EQ || op == ExpressionOperator.NE || op == ExpressionOperator.GT ||
                 op == ExpressionOperator.GE || op == ExpressionOperator.LT || op == ExpressionOperator.LE;
@@ -298,6 +315,7 @@ public final class Binder {
     private PlanNode copy(PlanNode n, List<PlanNode> children, List<ResultColumn> outputs, Optional<ScanSpec> scan,
                           Optional<Expression> predicate, List<ColumnRef> projection, Optional<JoinSpec> join,
                           Optional<SortSpec> sort, Optional<MutationSpec> mutation, Optional<IndexMetadata> createIndex) {
-        return new PlanNode(n.kind(), children, outputs, n.estimatedRows(), scan, predicate, projection, join, sort, mutation, createIndex);
+        return new PlanNode(n.kind(), children, outputs, n.estimatedRows(), scan, predicate, projection, join, sort, mutation, createIndex,
+                n.limit(), n.createTable(), n.dropTable());
     }
 }

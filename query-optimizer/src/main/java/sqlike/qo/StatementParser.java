@@ -53,7 +53,7 @@ public class StatementParser {
         Expression predicate = ts.matchKeyword(Keyword.WHERE) ? expressionParser.parseExpression(ts) : null;
         ts.expectEndOfStatement();
 
-        MutationSpec mutation = new MutationSpec(table, List.of(), Optional.of(ColumnRef.of(table, column)), Optional.of(update));
+        MutationSpec mutation = new MutationSpec(table, List.of(), Optional.of(Refs.column(table, column)), Optional.of(update));
         return query(StatementType.UPDATE, PlanNodes.update(filteredScan(table, predicate), mutation));
     }
 

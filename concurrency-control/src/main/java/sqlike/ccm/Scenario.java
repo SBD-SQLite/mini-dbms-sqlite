@@ -2,8 +2,10 @@ package sqlike.ccm;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 
 import sqlike.shared.AccessStatus;
@@ -13,10 +15,11 @@ import sqlike.shared.RID;
 import sqlike.shared.ResourceId;
 
 /**
- * Represents a concurrency control test scenario for {@link CCMDriver} (CC-09, CC-10).
+ * Represents a concurrency control test scenario for {@link CCMDriver} (CC-07, CC-09, CC-10).
  *
- * <p>Supports both concurrent multi-threaded execution against {@code IConcurrencyControlManager}
- * and standalone manual schedule verification via {@link SerializabilityVerifier}.
+ * <p>Supports concurrent multi-threaded execution against {@code IConcurrencyControlManager},
+ * standalone manual schedule verification via {@link SerializabilityVerifier}, WAL failure
+ * injection, rollback before-image verification, and protocol invariant checks.
  */
 public class Scenario {
 
@@ -32,11 +35,33 @@ public class Scenario {
             String txLabel,
             ActionType action,
             Optional<ResourceId> resource,
-            Optional<AccessStatus> expectedAccessStatus) {
+            Optional<AccessStatus> expectedAccessStatus,
+            Optional<Integer> writeValue,
+            Optional<Integer> expectedReadValue,
+            boolean injectWalFailure,
+            boolean deadlockTrigger) {
+
+        public Step(
+                String txLabel,
+                ActionType action,
+                Optional<ResourceId> resource,
+                Optional<AccessStatus> expectedAccessStatus) {
+            this(
+                    txLabel,
+                    action,
+                    resource,
+                    expectedAccessStatus,
+                    Optional.empty(),
+                    Optional.empty(),
+                    false,
+                    false);
+        }
 
         public Step {
             resource = resource == null ? Optional.empty() : resource;
             expectedAccessStatus = expectedAccessStatus == null ? Optional.empty() : expectedAccessStatus;
+            writeValue = writeValue == null ? Optional.empty() : writeValue;
+            expectedReadValue = expectedReadValue == null ? Optional.empty() : expectedReadValue;
         }
     }
 
@@ -47,6 +72,8 @@ public class Scenario {
     private final boolean expectedSerializable;
     private final boolean standaloneManualSchedule;
     private final List<ScheduleOperation> manualSchedule;
+    private final Map<ResourceId, Integer> initialValues;
+    private final Optional<String> expectedVictimLabel;
 
     public Scenario(
             String name,
@@ -54,6 +81,17 @@ public class Scenario {
             boolean deadlockScenario,
             List<Step> steps,
             boolean expectedSerializable) {
+        this(name, protocol, deadlockScenario, steps, expectedSerializable, Map.of(), Optional.empty());
+    }
+
+    public Scenario(
+            String name,
+            ProtocolType protocol,
+            boolean deadlockScenario,
+            List<Step> steps,
+            boolean expectedSerializable,
+            Map<ResourceId, Integer> initialValues,
+            Optional<String> expectedVictimLabel) {
         this.name = name;
         this.protocol = protocol;
         this.deadlockScenario = deadlockScenario;
@@ -61,6 +99,8 @@ public class Scenario {
         this.expectedSerializable = expectedSerializable;
         this.standaloneManualSchedule = false;
         this.manualSchedule = Collections.emptyList();
+        this.initialValues = initialValues == null ? Map.of() : Map.copyOf(initialValues);
+        this.expectedVictimLabel = expectedVictimLabel == null ? Optional.empty() : expectedVictimLabel;
     }
 
     private Scenario(
@@ -74,6 +114,8 @@ public class Scenario {
         this.expectedSerializable = expectedSerializable;
         this.standaloneManualSchedule = true;
         this.manualSchedule = List.copyOf(manualSchedule);
+        this.initialValues = Map.of();
+        this.expectedVictimLabel = Optional.empty();
     }
 
     public static Scenario manualSchedule(
@@ -88,9 +130,11 @@ public class Scenario {
      *
      * <pre>
      * # protokol: lock
+     * # seed: A=100
+     * # victim: T2
      * T1 BEGIN
      * T2 BEGIN
-     * T1 W(A)
+     * T1 W(A=200)
      * T2 W(B)
      * T1 W(B) # menunggu
      * T2 W(A) # deadlock
@@ -100,6 +144,8 @@ public class Scenario {
         ProtocolType protocol = ProtocolType.LOCK_BASED;
         boolean deadlock = false;
         List<Step> steps = new ArrayList<>();
+        Map<ResourceId, Integer> seeds = new LinkedHashMap<>();
+        Optional<String> expectedVictim = Optional.empty();
 
         String[] lines = script.split("\\R");
         for (String rawLine : lines) {
@@ -108,13 +154,24 @@ public class Scenario {
                 continue;
             }
             if (trimmed.startsWith("#")) {
-                String lowerHeader = trimmed.toLowerCase(Locale.ROOT);
-                if (lowerHeader.contains("protokol:") || lowerHeader.contains("protocol:")) {
+                String headerBody = trimmed.substring(1).trim();
+                String lowerHeader = headerBody.toLowerCase(Locale.ROOT);
+                if (lowerHeader.startsWith("protokol:") || lowerHeader.startsWith("protocol:")) {
                     if (lowerHeader.contains("timestamp")) {
                         protocol = ProtocolType.TIMESTAMP_BASED;
                     } else if (lowerHeader.contains("lock")) {
                         protocol = ProtocolType.LOCK_BASED;
                     }
+                } else if (lowerHeader.startsWith("seed:")) {
+                    String seedSpec = headerBody.substring("seed:".length()).trim();
+                    for (String part : seedSpec.split(",")) {
+                        String[] kv = part.trim().split("=", 2);
+                        if (kv.length == 2) {
+                            seeds.put(parseResource(kv[0].trim()), Integer.parseInt(kv[1].trim()));
+                        }
+                    }
+                } else if (lowerHeader.startsWith("victim:")) {
+                    expectedVictim = Optional.of(headerBody.substring("victim:".length()).trim());
                 }
                 continue;
             }
@@ -131,8 +188,17 @@ public class Scenario {
             }
 
             Optional<AccessStatus> expectedStatus = Optional.empty();
+            boolean stepDeadlock = false;
+            boolean injectWalFail = false;
+
             if (commentPart.contains("deadlock")) {
                 deadlock = true;
+                stepDeadlock = true;
+                expectedStatus = Optional.of(AccessStatus.ABORTED);
+            }
+            if (commentPart.contains("fail_wal") || commentPart.contains("wal_failure")) {
+                injectWalFail = true;
+                expectedStatus = Optional.of(AccessStatus.ABORTED);
             }
             if (commentPart.contains("menunggu") || commentPart.contains("wait")) {
                 expectedStatus = Optional.of(AccessStatus.WAIT);
@@ -151,23 +217,47 @@ public class Scenario {
             String upperOp = opToken.toUpperCase(Locale.ROOT);
 
             if (upperOp.equals("BEGIN")) {
-                steps.add(new Step(txLabel, ActionType.BEGIN, Optional.empty(), Optional.empty()));
+                steps.add(new Step(
+                        txLabel, ActionType.BEGIN, Optional.empty(), expectedStatus,
+                        Optional.empty(), Optional.empty(), injectWalFail, stepDeadlock));
             } else if (upperOp.equals("COMMIT")) {
-                steps.add(new Step(txLabel, ActionType.COMMIT, Optional.empty(), Optional.empty()));
+                steps.add(new Step(
+                        txLabel, ActionType.COMMIT, Optional.empty(), expectedStatus,
+                        Optional.empty(), Optional.empty(), injectWalFail, stepDeadlock));
             } else if (upperOp.equals("ABORT")) {
-                steps.add(new Step(txLabel, ActionType.ABORT, Optional.empty(), Optional.empty()));
+                steps.add(new Step(
+                        txLabel, ActionType.ABORT, Optional.empty(), expectedStatus,
+                        Optional.empty(), Optional.empty(), injectWalFail, stepDeadlock));
             } else if (upperOp.startsWith("R(") && opToken.endsWith(")")) {
-                String resName = opToken.substring(2, opToken.length() - 1).trim();
-                steps.add(new Step(txLabel, ActionType.READ, Optional.of(parseResource(resName)), expectedStatus));
+                String inner = opToken.substring(2, opToken.length() - 1).trim();
+                String resName = inner;
+                Optional<Integer> expectedReadVal = Optional.empty();
+                int eqIdx = inner.indexOf('=');
+                if (eqIdx > 0) {
+                    resName = inner.substring(0, eqIdx).trim();
+                    expectedReadVal = Optional.of(Integer.parseInt(inner.substring(eqIdx + 1).trim()));
+                }
+                steps.add(new Step(
+                        txLabel, ActionType.READ, Optional.of(parseResource(resName)), expectedStatus,
+                        Optional.empty(), expectedReadVal, injectWalFail, stepDeadlock));
             } else if (upperOp.startsWith("W(") && opToken.endsWith(")")) {
-                String resName = opToken.substring(2, opToken.length() - 1).trim();
-                steps.add(new Step(txLabel, ActionType.WRITE, Optional.of(parseResource(resName)), expectedStatus));
+                String inner = opToken.substring(2, opToken.length() - 1).trim();
+                String resName = inner;
+                Optional<Integer> writeVal = Optional.empty();
+                int eqIdx = inner.indexOf('=');
+                if (eqIdx > 0) {
+                    resName = inner.substring(0, eqIdx).trim();
+                    writeVal = Optional.of(Integer.parseInt(inner.substring(eqIdx + 1).trim()));
+                }
+                steps.add(new Step(
+                        txLabel, ActionType.WRITE, Optional.of(parseResource(resName)), expectedStatus,
+                        writeVal, Optional.empty(), injectWalFail, stepDeadlock));
             } else {
                 throw new IllegalArgumentException("Unrecognized operation in schedule: " + rawLine);
             }
         }
 
-        return new Scenario(name, protocol, deadlock, steps, expectedSerializable);
+        return new Scenario(name, protocol, deadlock, steps, expectedSerializable, seeds, expectedVictim);
     }
 
     public static ResourceId parseResource(String symbol) {
@@ -175,10 +265,10 @@ public class Scenario {
         if (colonIdx > 0) {
             String table = symbol.substring(0, colonIdx).trim();
             int slot = Integer.parseInt(symbol.substring(colonIdx + 1).trim());
-            return ResourceId.ofRecord(table, new RID(new PageId(table, 0L), slot));
+            return Resources.record(table, new RID(new PageId(table, 0L), slot));
         }
         int slot = Math.abs(symbol.hashCode() % 10_000);
-        return ResourceId.ofRecord("items_" + symbol, new RID(new PageId("items_" + symbol, 0L), slot));
+        return Resources.record("items_" + symbol, new RID(new PageId("items_" + symbol, 0L), slot));
     }
 
     public String getName() {
@@ -207,5 +297,13 @@ public class Scenario {
 
     public List<ScheduleOperation> getManualSchedule() {
         return manualSchedule;
+    }
+
+    public Map<ResourceId, Integer> getInitialValues() {
+        return initialValues;
+    }
+
+    public Optional<String> getExpectedVictimLabel() {
+        return expectedVictimLabel;
     }
 }

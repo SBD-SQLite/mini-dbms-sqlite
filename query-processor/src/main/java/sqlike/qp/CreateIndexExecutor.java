@@ -2,16 +2,51 @@ package sqlike.qp;
 
 import java.util.Objects;
 import sqlike.qp.port.QpContracts.*;
-import sqlike.qp.stub.StubRuntime.AbstractCommandExecutor;
+import static sqlike.qp.port.QpContracts.failure;
+import sqlike.storage.StorageException;
 
+/** Callers must reject CREATE INDEX during validation to keep an explicit transaction active. */
 public final class CreateIndexExecutor extends AbstractCommandExecutor {
     private final CreateIndexSpec spec;
-    private final IStorageManager storage;
-    public CreateIndexExecutor(CreateIndexSpec spec, IStorageManager storage) {
-        this.spec = Objects.requireNonNull(spec); this.storage = Objects.requireNonNull(storage);
+    private final sqlike.contract.IStorageManager storageContract;
+    private final sqlike.qp.port.QpContracts.IStorageManager qpStorage;
+
+    public CreateIndexExecutor(CreateIndexSpec spec, sqlike.contract.IStorageManager storage) {
+        super();
+        this.spec = Objects.requireNonNull(spec);
+        this.storageContract = Objects.requireNonNull(storage);
+        this.qpStorage = null;
     }
-    @Override protected long doExecute(ExecutionContext context) {
-        storage.createIndex(spec, context, context.requireGrant(spec.tableId(), AccessMode.WRITE)); return 0;
+
+    public CreateIndexExecutor(CreateIndexSpec spec, sqlike.qp.port.QpContracts.IStorageManager storage) {
+        super();
+        this.spec = Objects.requireNonNull(spec);
+        this.storageContract = null;
+        this.qpStorage = Objects.requireNonNull(storage);
     }
-    @Override protected void doClose() { }
+
+    public CreateIndexSpec getSpec() {
+        return spec;
+    }
+
+    @Override
+    protected long doExecute(ExecutionContext context) {
+        if (!context.implicit()) {
+            throw failure("CREATE INDEX is not allowed within an explicit transaction");
+        }
+        context.requireGrant(spec.tableId(), AccessMode.WRITE);
+        if (qpStorage != null) {
+            qpStorage.createIndex(spec, context, context.requireGrant(spec.tableId(), AccessMode.WRITE));
+        } else if (storageContract != null) {
+            try {
+                storageContract.createIndex(spec.definition());
+            } catch (StorageException e) {
+                throw new QpException(sqlike.shared.ErrorCode.IO_ERROR, "Failed to create index: " + e.getMessage());
+            }
+        }
+        return 0;
+    }
+
+    @Override
+    protected void doClose() { }
 }

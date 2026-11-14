@@ -3,11 +3,12 @@ package sqlike.qp.stub;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
+import sqlike.shared.AccessStatus;
 import sqlike.qp.port.QpContracts.*;
 import static sqlike.qp.port.QpContracts.failure;
 
 /** STUB ONLY: CCM/FRM fake with scripted access, event traces, and overlay rollback; no locks or WAL. */
-public final class StubTransactions implements IConcurrencyControl {
+public final class StubTransactions implements IConcurrencyControl, IFailureRecovery {
     private final StubStorage storage;
     private final List<String> trace;
     private final AtomicLong ids;
@@ -55,6 +56,10 @@ public final class StubTransactions implements IConcurrencyControl {
         active(change.txId()); log("FRM.CHANGE"); WritePermit permit = new WritePermit(change.id(), new Lsn(lsn.incrementAndGet()));
         permits.put(change.id(), permit); return permit;
     }
+    @Override public WritePermit authorizeSchemaChange(SchemaChangeRecord change) {
+        active(change.txId()); log("FRM.SCHEMA_CHANGE"); WritePermit permit = new WritePermit(change.id(), new Lsn(lsn.incrementAndGet()));
+        permits.put(change.id(), permit); return permit;
+    }
     @Override public WriteLease acquireApplyLease(WritePermit permit) {
         active(permit.changeId().txId());
         if (!permit.equals(permits.get(permit.changeId())) || !leases.add(permit.changeId())) throw failure("Invalid apply lease");
@@ -85,4 +90,9 @@ public final class StubTransactions implements IConcurrencyControl {
         leases.removeIf(id -> id.txId().equals(tx)); states.put(tx, TransactionState.ABORTED); getCancellationToken(tx).cancel();
         trace.add("FRM.ABORT." + tx.value()); return TransactionState.ABORTED;
     }
+    @Override public Lsn appendEvent(TxId txId, TransactionEvent event) { log("FRM." + event + "." + txId.value()); return new Lsn(lsn.incrementAndGet()); }
+    @Override public Lsn appendChange(ChangeRecord change) { log("FRM.CHANGE." + change.id().sequence()); return new Lsn(lsn.incrementAndGet()); }
+    @Override public void forceLog(Lsn lsn) { trace.add("FRM.FORCE." + lsn.value()); }
+    @Override public void rollback(TxId txId) { storage.discard(txId); }
+    @Override public RecoveryReport recover() { trace.add("FRM.RECOVER"); return new RecoveryReport(true, storage.lastTxId()); }
 }
