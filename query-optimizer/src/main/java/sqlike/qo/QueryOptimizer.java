@@ -23,6 +23,14 @@ public class QueryOptimizer implements IQueryOptimizer {
     }
 
     public QueryOptimizer(IStorageManager storage, int bufferBlocks) {
+        this(storage, bufferBlocks, null);
+    }
+
+    /**
+     * Opt-in genetic join search: with a non-null {@code geneticConfig} the cheaper of the heuristic and the GA plan
+     * is returned. A null config keeps the default heuristic behavior exactly.
+     */
+    public QueryOptimizer(IStorageManager storage, int bufferBlocks, GeneticOptimizerConfig geneticConfig) {
         if (storage == null) throw new IllegalArgumentException("storage is required");
         ExpressionParser expr = new ExpressionParser();
         this.lexer = new Lexer();
@@ -33,7 +41,9 @@ public class QueryOptimizer implements IQueryOptimizer {
         CardinalityEstimator cardinalityEstimator = new CardinalityEstimator(storage);
         this.selectionProjectionRewriter = new SelectionProjectionRewriter(cardinalityEstimator);
         this.costModel = new CostModel(storage, bufferBlocks);
-        this.optimizer = new JoinAccessPathOptimizer(costModel, storage);
+        this.optimizer = geneticConfig == null
+                ? new JoinAccessPathOptimizer(costModel, storage)
+                : new JoinAccessPathOptimizer(costModel, storage, geneticConfig);
         this.printer = new PlanPrinter();
         this.annotator = new PlanAnnotator(cardinalityEstimator);
     }
@@ -76,6 +86,18 @@ public class QueryOptimizer implements IQueryOptimizer {
             case CREATE_TABLE, DROP_TABLE -> true;
             default -> false;
         };
+    }
+
+    /**
+     * Extra: heuristic and (when configured) GA cost of the join search for one SELECT, using the same rewrites as
+     * {@link #optimizeQuery}. Only SELECT is accepted (INVALID_STATE otherwise).
+     */
+    public JoinAccessPathOptimizer.OptimizationComparison compareJoinSearch(String sql) {
+        ParsedQuery parsed = parseQuery(sql);
+        if (parsed.statementType() != StatementType.SELECT)
+            throw QoErrors.invalidState("join search comparison needs a SELECT, got " + parsed.statementType());
+        PlanNode rewritten = selectionProjectionRewriter.rewrite(binder.bind(parsed));
+        return optimizer.optimizeWithComparison(rewritten);
     }
 
     /** Extra: human-readable before/after plan buat driver */

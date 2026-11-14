@@ -41,7 +41,7 @@ public final class SelectionProjectionRewriter {
     public PlanNode rewrite(PlanNode root) {
         if (root == null) throw QoErrors.invalidValue("plan root is null", 0);
         PlanNode selectionsRewritten = rewriteSelections(root);
-        PlanNode result = rewriteProjections(selectionsRewritten);
+        PlanNode result = ProjectionCleanup.normalize(rewriteProjections(selectionsRewritten));
         PlanNodes.validate(result);
         return result;
     }
@@ -293,7 +293,7 @@ public final class SelectionProjectionRewriter {
         } else result.add(expression);
     }
 
-    private List<ColumnRef> columns(Expression expression) {
+    List<ColumnRef> columns(Expression expression) {
         LinkedHashSet<ColumnRef> result = new LinkedHashSet<>();
         collectColumns(expression, result);
         return List.copyOf(result);
@@ -302,7 +302,31 @@ public final class SelectionProjectionRewriter {
     private void collectColumns(Expression expression, Set<ColumnRef> result) {
         if (expression.kind() == ExpressionKind.COLUMN)
             expression.column().ifPresent(result::add);
+        // A correlated subquery depends on the outer columns it reads, so they count as columns of the predicate.
+        expression.subquery().ifPresent(subquery -> result.addAll(outerReferences(subquery.root())));
         expression.operands().forEach(child -> collectColumns(child, result));
+    }
+
+    /** Columns read inside {@code root} (nested subqueries included) whose qualifier is not a scan of {@code root} itself. */
+    private Set<ColumnRef> outerReferences(PlanNode root) {
+        Set<String> inner = new LinkedHashSet<>();
+        for (String name : tables(root)) inner.add(name.toLowerCase(java.util.Locale.ROOT));
+        Set<ColumnRef> read = new LinkedHashSet<>();
+        collectReads(root, read);
+        Set<ColumnRef> outer = new LinkedHashSet<>();
+        for (ColumnRef ref : read)
+            if (ref.tableName().isPresent() && !inner.contains(ref.tableName().get().toLowerCase(java.util.Locale.ROOT)))
+                outer.add(ref);
+        return outer;
+    }
+
+    private void collectReads(PlanNode node, Set<ColumnRef> read) {
+        read.addAll(node.projection());
+        node.sort().ifPresent(sort -> read.add(sort.column()));
+        node.predicate().ifPresent(predicate -> collectColumns(predicate, read));
+        node.join().flatMap(spec -> spec.condition()).ifPresent(condition -> collectColumns(condition, read));
+        node.mutation().flatMap(mutation -> mutation.updateExpression()).ifPresent(value -> collectColumns(value, read));
+        node.children().forEach(child -> collectReads(child, read));
     }
 
     private boolean containsSubquery(Expression expression) {

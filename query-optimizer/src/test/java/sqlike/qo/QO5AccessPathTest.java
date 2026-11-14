@@ -48,6 +48,7 @@ final class QO5AccessPathTest {
         test.accept("catalog snapshots do not leak between optimization calls", QO5AccessPathTest::catalogRefresh);
         test.accept("SELECT star drops only the redundant identity project after index selection", QO5AccessPathTest::identityCleanup);
         test.accept("identity cleanup preserves reordered repeated narrowed and renamed columns", QO5AccessPathTest::nonidentityProjects);
+        test.accept("projection cleanup merges, drops identity, reaches below LIMIT and into subqueries", QO5AccessPathTest::projectionCleanup);
         test.accept("identity cleanup is immutable idempotent and stops at LIMIT", QO5AccessPathTest::cleanupBoundaries);
         test.accept("cleanup keeps residual and ORDER BY columns available", QO5AccessPathTest::cleanupRequiredColumns);
         test.accept("final candidate costs include projection cleanup", QO5AccessPathTest::cleanupCostSelection);
@@ -369,11 +370,11 @@ final class QO5AccessPathTest {
     private static void identityCleanup() {
         Fixture fixture = new Fixture(index("students", "id", IndexType.HASH));
         PlanNode before = rewritten("SELECT * FROM students WHERE id = 3");
-        check(nodes(before, PlanNodeKind.PROJECT).size() > 1, "fixture must expose the extra QO4 project");
+        // QO4 already drops the identity PROJECT of SELECT *, so no PROJECT may appear before or after index selection.
+        equal(0, nodes(before, PlanNodeKind.PROJECT).size());
         PlanNode after = new JoinAccessPathOptimizer(fixture.cost, fixture.storage).optimize(before);
-        equal(PlanNodeKind.PROJECT, after.kind());
-        equal(PlanNodeKind.INDEX_SCAN, after.children().get(0).kind());
-        equal(1, nodes(after, PlanNodeKind.PROJECT).size());
+        equal(PlanNodeKind.INDEX_SCAN, after.kind());
+        equal(0, nodes(after, PlanNodeKind.PROJECT).size());
         fixture.equivalent(before, after);
     }
 
@@ -397,6 +398,51 @@ final class QO5AccessPathTest {
         PlanNode unbound = PlanNodes.project(scan, inner.projection());
         PlanNode wrapper = PlanNodes.project(unbound, inner.projection());
         check(QO5Plans.simplifyIdentityProjects(wrapper) == wrapper, "unbound metadata was treated as identity");
+    }
+
+    private static void projectionCleanup() {
+        PlanNode scan = bound("SELECT * FROM students").children().get(0);
+        List<ResultColumn> all = scan.outputColumns();
+        List<ColumnRef> allRefs = all.stream().map(column -> column.source().orElseThrow()).toList();
+        // PROJECT(name) over PROJECT(name, id) merges into one PROJECT over the scan.
+        List<ResultColumn> nameId = List.of(all.get(1), all.get(0));
+        PlanNode wide = project(scan, List.of(allRefs.get(1), allRefs.get(0)), nameId);
+        PlanNode narrow = project(wide, List.of(allRefs.get(1)), List.of(all.get(1)));
+        PlanNode merged = ProjectionCleanup.normalize(narrow);
+        equal(PlanNodeKind.PROJECT, merged.kind());
+        equal(PlanNodeKind.SCAN, merged.children().get(0).kind());
+        equal(List.of(allRefs.get(1)), merged.projection());
+        equal(List.of(all.get(1)), merged.outputColumns());
+        equivalent(narrow, merged, data());
+        // An identical PROJECT disappears, a reordering one stays.
+        PlanNode identity = project(scan, allRefs, all);
+        equal(scan, ProjectionCleanup.normalize(identity));
+        PlanNode reordered = project(scan, List.of(allRefs.get(1), allRefs.get(0), allRefs.get(2), allRefs.get(3)),
+                List.of(all.get(1), all.get(0), all.get(2), all.get(3)));
+        check(ProjectionCleanup.normalize(reordered) == reordered, "reordering PROJECT was removed");
+        // Cleaning reaches below LIMIT and keeps LIMIT on top; the input plan is not mutated.
+        PlanNode inner = project(identity, allRefs, all);
+        PlanNode limited = new PlanNode(PlanNodeKind.LIMIT, List.of(inner), inner.outputColumns(), Optional.empty(), Optional.empty(),
+                Optional.empty(), List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),
+                Optional.of(new LimitSpec(2)), Optional.empty(), Optional.empty());
+        String snapshot = limited.toString();
+        PlanNode cleaned = ProjectionCleanup.normalize(limited);
+        equal(snapshot, limited.toString());
+        equal(PlanNodeKind.LIMIT, cleaned.kind());
+        equal(0, nodes(cleaned, PlanNodeKind.PROJECT).size());
+        check(ProjectionCleanup.normalize(cleaned) == cleaned, "cleanup is not idempotent");
+        equivalent(limited, cleaned, data());
+        // Subquery plans are cleaned too; the filter keeps its own predicate otherwise.
+        Expression subquery = new Expression(ExpressionKind.SUBQUERY, Optional.empty(), Optional.empty(), Optional.empty(),
+                List.of(), Optional.of(new SubquerySpec(SubqueryType.EXISTS, bound("SELECT * FROM dept"), false)));
+        PlanNode filtered = ProjectionCleanup.normalize(QO5Plans.filter(identity, subquery));
+        equal(PlanNodeKind.FILTER, filtered.kind());
+        equal(PlanNodeKind.SCAN, filtered.children().get(0).kind());
+        equal(0, nodes(filtered.predicate().orElseThrow().subquery().orElseThrow().root(), PlanNodeKind.PROJECT).size());
+        // Unbound metadata is never merged or treated as identity.
+        PlanNode unbound = PlanNodes.project(scan, List.of(allRefs.get(1), allRefs.get(0)));
+        PlanNode wrapper = PlanNodes.project(unbound, List.of(allRefs.get(1)));
+        check(ProjectionCleanup.normalize(wrapper) == wrapper, "unbound metadata was merged");
     }
 
     private static void cleanupBoundaries() {
@@ -526,6 +572,8 @@ final class QO5AccessPathTest {
         boolean failIndexes;
 
         Fixture(IndexMetadata... definitions) {
+            statistics.put("students", MockStorageManager.largeStatistics("students"));
+            statistics.put("takes", MockStorageManager.largeStatistics("takes"));
             IStorageManager base = catalog();
             storage = (IStorageManager) Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[] { IStorageManager.class },
                     (proxy, method, args) -> switch (method.getName()) {
@@ -541,6 +589,9 @@ final class QO5AccessPathTest {
                             check(base.listTables().contains(table), "catalog needs canonical table spelling");
                             yield java.util.Arrays.stream(definitions).filter(index -> index.tableName().equalsIgnoreCase(table)).toList();
                         }
+                        case "getIndexStatistics" -> MockStorageManager.defaultIndexStatistics(java.util.Arrays.stream(definitions)
+                                .filter(index -> index.indexName().equalsIgnoreCase((String) args[0])).findFirst()
+                                .orElseThrow(() -> new AssertionError("statistics requested for unknown index " + args[0])));
                         default -> throw new AssertionError("optimizer must not perform physical I/O: " + method.getName());
                     });
             cost = new CostModel(storage);

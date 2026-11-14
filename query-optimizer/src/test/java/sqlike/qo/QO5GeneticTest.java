@@ -42,6 +42,10 @@ final class QO5GeneticTest {
         test.accept("LIMIT zero and positive preserve their nodes and skip GA search", QO5GeneticTest::limits);
         test.accept("subquery plans remain search boundaries", QO5GeneticTest::subqueries);
         test.accept("GA leaves input plans and returned history immutable", QO5GeneticTest::immutability);
+        test.accept("QueryOptimizer opt-in GA is never costlier, deterministic, valid and off by default", QO5GeneticTest::facadeGa);
+        test.accept("QueryOptimizer reports heuristic and GA costs for a join search", QO5GeneticTest::facadeComparison);
+        test.accept("buffer blocks option lowers block nested loop cost", QO5GeneticTest::bufferBlocksOption);
+        test.accept("QODriver parses buffer-blocks and GA options and prints a comparison", QO5GeneticTest::driverOptions);
         test.accept("GA validates missing plans and cost models", QO5GeneticTest::validation);
     }
 
@@ -250,6 +254,78 @@ final class QO5GeneticTest {
         check(result.plan() == before, "GA entered subquery scope");
     }
 
+    private static void facadeGa() {
+        IStorageManager storage = catalog();
+        QueryOptimizer heuristic = new QueryOptimizer(storage);
+        QueryOptimizer explicitOff = new QueryOptimizer(storage, 3, null);
+        QueryOptimizer ga = new QueryOptimizer(storage, 3, config());
+        for (String sql : List.of(FOUR, FOUR + " WHERE s.id = 3", "SELECT * FROM students NATURAL JOIN dept NATURAL JOIN takes",
+                "SELECT s.name FROM students AS s, dept AS d, takes AS t WHERE s.dept_id = d.dept_id AND s.id = t.id")) {
+            QueryPlan base = heuristic.optimizeQuery(heuristic.parseQuery(sql));
+            // Default behavior is unchanged by the new constructor.
+            equal(base.root(), explicitOff.optimizeQuery(explicitOff.parseQuery(sql)).root());
+            equal(base.estimatedCost(), explicitOff.optimizeQuery(explicitOff.parseQuery(sql)).estimatedCost());
+            QueryPlan searched = ga.optimizeQuery(ga.parseQuery(sql));
+            PlanNodes.validate(searched.root());
+            check(searched.estimatedCost() <= base.estimatedCost() + 1e-9, "GA facade must not return a costlier plan: " + sql);
+            equal(searched.estimatedCost(), ga.getCost(searched));
+            equal(base.root().outputColumns(), searched.root().outputColumns());
+            equivalent(bound(sql), searched.root(), data(), storage);
+            // Same seed, same plan.
+            equal(searched.root(), new QueryOptimizer(storage, 3, config()).optimizeQuery(ga.parseQuery(sql)).root());
+        }
+    }
+
+    private static void facadeComparison() {
+        IStorageManager storage = catalog();
+        var off = new QueryOptimizer(storage).compareJoinSearch(FOUR);
+        check(off.geneticCost().isEmpty(), "heuristic facade must not run the GA");
+        equal(0, off.evaluatedIndividuals());
+        var on = new QueryOptimizer(storage, 3, config()).compareJoinSearch(FOUR);
+        check(on.geneticCost().isPresent(), "GA facade must report a GA cost");
+        check(on.evaluatedIndividuals() > 0, "GA must evaluate individuals");
+        equal(off.heuristicCost(), on.heuristicCost());
+        check(on.estimatedCost() <= on.heuristicCost() + 1e-9, "selected cost must not exceed heuristic cost");
+        try { new QueryOptimizer(storage, 3, config()).compareJoinSearch("DELETE FROM students"); throw new AssertionError("expected INVALID_STATE"); }
+        catch (QoException expected) { equal(ErrorCode.INVALID_STATE, expected.getInfo().code()); }
+        invalid(() -> new QueryOptimizer(storage, 2, config()));
+    }
+
+    private static void bufferBlocksOption() {
+        IStorageManager storage = catalog();
+        String sql = "SELECT * FROM students JOIN takes ON students.id = takes.id";
+        double m3 = new QueryOptimizer(storage, 3).optimizeQuery(new QueryOptimizer(storage).parseQuery(sql)).estimatedCost();
+        double m10 = new QueryOptimizer(storage, 10).optimizeQuery(new QueryOptimizer(storage).parseQuery(sql)).estimatedCost();
+        check(m10 < m3, "a larger buffer must lower the block nested loop cost: " + m3 + " vs " + m10);
+    }
+
+    private static void driverOptions() {
+        var none = QODriver.Options.parse(new String[] { "--explain", "SELECT 1" }, 2);
+        equal(3, none.bufferBlocks());
+        check(none.genetic().isEmpty(), "GA must be off unless requested");
+        var ga = QODriver.Options.parse(new String[] { "--compare", "q", "--ga" }, 2);
+        equal(GeneticOptimizerConfig.defaults(), ga.genetic().orElseThrow());
+        var tuned = QODriver.Options.parse(new String[] { "--explain", "q", "--population", "8", "--generations", "4",
+                "--mutation-rate", "0.5", "--seed", "7", "--buffer-blocks", "11" }, 2);
+        equal(new GeneticOptimizerConfig(8, 4, 0.5, 7), tuned.genetic().orElseThrow());
+        equal(11, tuned.bufferBlocks());
+        for (String[] bad : List.of(new String[] { "--bogus", "1" }, new String[] { "--population" }, new String[] { "--population", "x" },
+                new String[] { "--buffer-blocks", "2" }, new String[] { "--population", "1" }))
+            invalid(() -> QODriver.Options.parse(prepend(bad), 2));
+        var compare = QODriver.Options.parse(new String[] { "--compare", "q", "--population", "6", "--generations", "3" }, 2);
+        String report = compare.compare(compare.newOptimizer(MockStorageManager.create()),
+                "SELECT * FROM students NATURAL JOIN dept NATURAL JOIN takes");
+        check(report.contains("Heuristic cost:") && report.contains("GA cost:") && report.contains("Evaluated individuals:"), report);
+    }
+
+    private static String[] prepend(String[] options) {
+        String[] all = new String[options.length + 2];
+        all[0] = "--explain";
+        all[1] = "q";
+        System.arraycopy(options, 0, all, 2, options.length);
+        return all;
+    }
+
     private static void immutability() {
         PlanNode before = rewritten(FOUR);
         String snapshot = before.toString();
@@ -275,12 +351,19 @@ final class QO5GeneticTest {
                 (proxy, method, args) -> switch (method.getName()) {
                     case "listTables" -> base.listTables();
                     case "getSchema" -> base.getSchema((String) args[0]);
-                    case "getStatistics" -> base.getStatistics((String) args[0]);
+                    case "getStatistics" -> {
+                        TableStatistics large = MockStorageManager.largeStatistics((String) args[0]);
+                        yield large != null ? large : base.getStatistics((String) args[0]);
+                    }
                     case "getIndexes" -> {
                         String table = (String) args[0];
                         check(base.listTables().contains(table), "alias leaked into physical catalog access");
                         yield table.equals("students") ? List.of(new IndexMetadata("students_id", table, "id", IndexType.HASH))
                                 : List.<IndexMetadata>of();
+                    }
+                    case "getIndexStatistics" -> {
+                        check("students_id".equalsIgnoreCase((String) args[0]), "statistics requested for unknown index " + args[0]);
+                        yield MockStorageManager.defaultIndexStatistics(new IndexMetadata("students_id", "students", "id", IndexType.HASH));
                     }
                     default -> throw new AssertionError("GA must not perform record I/O: " + method.getName());
                 });

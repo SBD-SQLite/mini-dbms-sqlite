@@ -160,20 +160,27 @@ public final class QO2Test {
 
         });
 
-        for (String sql : List.of("CREATE TABLE t ()", "CREATE TABLE t (id INT)", "CREATE TABLE t (s CHAR)",
-                "CREATE TABLE t (s VARCHAR(0))", "CREATE TABLE t (s CHAR(-1))", "CREATE TABLE t (s VARCHAR(1.5))",
+        for (String sql : List.of("CREATE TABLE t ()", "CREATE TABLE t (id INT)", "CREATE TABLE t (s VARCHAR(1.5))",
                 "CREATE TABLE t (s CHAR(2147483648))", "CREATE TABLE t (id INTEGER,)", "CREATE TABLE t (id INTEGER",
                 "CREATE TABLE t (id INTEGER, PRIMARY (id))", "CREATE TABLE t (id INTEGER, PRIMARY KEY ())",
                 "CREATE TABLE t (id INTEGER, FOREIGN KEY (id) parent(id))",
                 "CREATE TABLE t (id INTEGER, FOREIGN KEY (id) REFERENCES p())",
-                "CREATE TABLE t (id INTEGER, FOREIGN KEY (id) REFERENCES p(a,b))",
                 "CREATE TABLE t (id INTEGER PRIMARY KEY, PRIMARY KEY (id))",
-                "CREATE TABLE t (id INTEGER, ID FLOAT)", "CREATE TABLE t (id INTEGER(4))",
-                "CREATE TABLE t (id INTEGER); DROP TABLE t",
+                 "CREATE TABLE t (id INTEGER); DROP TABLE t",
                 "DROP t", "DROP TABLE", "DROP TABLE t CASCADE RESTRICT", "DROP TABLE t junk")) {
             test("QO17 reject " + sql, () -> error(ErrorCode.SYNTAX_ERROR, () -> parse(sql)));
 
         }
+        // Definition errors are not grammar errors: they parse, and DdlValidator reports them as SEMANTIC_ERROR.
+        test("QO17 definition errors parse with their payload untouched", () -> {
+            eq(Optional.empty(), parse("CREATE TABLE t (s CHAR)").root().orElseThrow().createTable().orElseThrow().columns().get(0).maxLength());
+            eq(Optional.empty(), parse("CREATE TABLE t (s VARCHAR)").root().orElseThrow().createTable().orElseThrow().columns().get(0).maxLength());
+            eq(Optional.of(0), parse("CREATE TABLE t (s VARCHAR(0))").root().orElseThrow().createTable().orElseThrow().columns().get(0).maxLength());
+            eq(Optional.of(-1), parse("CREATE TABLE t (s CHAR(-1))").root().orElseThrow().createTable().orElseThrow().columns().get(0).maxLength());
+            eq(Optional.of(4), parse("CREATE TABLE t (id INTEGER(4))").root().orElseThrow().createTable().orElseThrow().columns().get(0).maxLength());
+            eq(2, parse("CREATE TABLE t (id INTEGER, ID FLOAT)").root().orElseThrow().createTable().orElseThrow().columns().size());
+            eq(1, parse("CREATE TABLE t (id INTEGER, FOREIGN KEY (id) REFERENCES p(a,b))").root().orElseThrow().createTable().orElseThrow().foreignKeys().size());
+        });
         test("QO17 subquery payloads and nesting", () -> {
             Expression in = predicate("id IN (SELECT id FROM child WHERE score > 2) AND id > 0").operands().get(0);
             eq(ExpressionKind.SUBQUERY, in.kind());

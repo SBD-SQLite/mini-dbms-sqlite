@@ -25,6 +25,8 @@ public final class QO4Test {
         test("handles aliased relations during pushdown", QO4Test::aliasPushdown);
         test("keeps LIMIT and correlated subqueries as rewrite boundaries", QO4Test::rewriteBoundaries);
         test("keeps parsed subquery predicates at their original scope", QO4Test::parsedSubqueryBoundary);
+        test("tracks outer columns read by correlated subqueries", QO4Test::correlatedSubqueryDependencies);
+        test("pipeline leaves no PROJECT over PROJECT or identity PROJECT and keeps results", QO4Test::projectionShapeAcrossPipeline);
         test("preserves result rows across representative rewrite", QO4Test::rewriteIsEquivalent);
         test("does not mutate the input plan and preserves metadata", QO4Test::inputAndMetadata);
         System.out.printf("QO4: %d passed, %d failed%n", passed, failed);
@@ -331,6 +333,104 @@ public final class QO4Test {
     @SuppressWarnings({"rawtypes","unchecked"}) private static int cmp(Object a,Object b) {
         if(a instanceof Number x && b instanceof Number y) return Double.compare(x.doubleValue(),y.doubleValue());
         return ((Comparable)a).compareTo(b);
+    }
+    private static void correlatedSubqueryDependencies() {
+        String sql = "SELECT s.name FROM students AS s, dept AS d WHERE s.dept_id = d.dept_id AND EXISTS "
+                + "(SELECT * FROM takes AS t WHERE t.id = s.id AND t.course_id = d.dept_id)";
+        PlanNode root = rewrite(sql);
+        PlanNodes.validate(root);
+        eq(PlanNodeKind.PROJECT, root.kind());
+        PlanNode filter = root.children().get(0);
+        eq(PlanNodeKind.FILTER, filter.kind());
+        Expression whole = filter.predicate().orElseThrow();
+        Expression predicate = subqueryOperand(whole);
+        check(predicate != null, "the subquery conjunct must stay in the filter above the join");
+        check(predicate.subquery().orElseThrow().correlated(), "subquery must be flagged correlated");
+        // The correlated predicate reads s.id and d.dept_id, so it must stay above the join that provides both.
+        PlanNode join = filter.children().get(0);
+        check(join.kind() == PlanNodeKind.JOIN || join.kind() == PlanNodeKind.CARTESIAN, "predicate must sit directly above the join");
+        check(findScan(join, "s") && findScan(join, "d"), "join must provide both referenced relations");
+        IStorageManager s = MockStorageManager.create();
+        SelectionProjectionRewriter rewriter = new SelectionProjectionRewriter(new CardinalityEstimator(s));
+        eq(Set.of(Refs.column("s", "id"), Refs.column("d", "dept_id")), new HashSet<>(rewriter.columns(predicate)));
+        // A nested subquery reaching the outermost query contributes that column to the middle subquery as well.
+        PlanNode nested = new Binder(s).bind(new QueryOptimizer(s).parseQuery("SELECT s.name FROM students AS s WHERE EXISTS "
+                + "(SELECT * FROM takes AS t WHERE t.id = 1 AND EXISTS (SELECT * FROM dept AS d WHERE d.dept_id = s.dept_id AND d.dname = t.grade))"));
+        Expression middle = subqueryOperand(find(nested, PlanNodeKind.FILTER).predicate().orElseThrow());
+        eq(Set.of(Refs.column("s", "dept_id")), new HashSet<>(rewriter.columns(middle)));
+        PlanNodes.validate(new SelectionProjectionRewriter(new CardinalityEstimator(s)).rewrite(nested));
+    }
+    private static Expression subqueryOperand(Expression e) {
+        if (e.kind() == ExpressionKind.SUBQUERY) return e;
+        for (Expression operand : e.operands()) {
+            Expression found = subqueryOperand(operand);
+            if (found != null) return found;
+        }
+        return null;
+    }
+    private static boolean findScan(PlanNode node, String qualifier) {
+        if (node.scan().map(scan -> scan.alias().orElse(scan.tableName()).equalsIgnoreCase(qualifier)).orElse(false)) return true;
+        return node.children().stream().anyMatch(child -> findScan(child, qualifier));
+    }
+    private static final List<String> SHAPE_QUERIES = List.of(
+            "SELECT * FROM students", "SELECT name FROM students", "SELECT name, gpa FROM students WHERE gpa > 3.0 ORDER BY gpa DESC",
+            "SELECT id FROM students ORDER BY id", "SELECT * FROM students WHERE id = 3 AND gpa > 3.0",
+            "SELECT s.name, d.dname FROM students AS s JOIN dept AS d ON s.dept_id = d.dept_id",
+            "SELECT s.name, d.dname FROM students AS s JOIN dept AS d ON s.dept_id = d.dept_id WHERE s.gpa > 3.0 ORDER BY s.name",
+            "SELECT * FROM students, dept", "SELECT * FROM students, dept WHERE students.dept_id = dept.dept_id",
+            "SELECT students.name FROM students, dept WHERE students.dept_id = dept.dept_id",
+            "SELECT a.id, b.id FROM students AS a, students AS b WHERE a.dept_id = b.dept_id AND a.id = 1",
+            "SELECT a.id, b.id FROM students AS a JOIN students AS b ON a.dept_id = b.dept_id WHERE a.id = 1",
+            "SELECT * FROM students NATURAL JOIN dept", "SELECT * FROM students NATURAL JOIN dept NATURAL JOIN takes",
+            "SELECT id FROM students NATURAL JOIN takes ORDER BY id", "SELECT dname FROM students NATURAL JOIN dept WHERE dept_id = 10",
+            "SELECT * FROM students, dept NATURAL JOIN takes",
+            "SELECT students.name, dept.dname, takes.course_id FROM students JOIN takes ON students.id = takes.id "
+                    + "JOIN dept ON students.dept_id = dept.dept_id WHERE takes.course_id = 100",
+            "SELECT a.name FROM students AS a, students AS b, dept AS d, takes AS t WHERE a.dept_id = d.dept_id AND b.id = t.id AND a.id = b.id",
+            "SELECT name FROM students LIMIT 3", "SELECT * FROM students LIMIT 1", "SELECT name FROM students WHERE id > 1 ORDER BY name LIMIT 2",
+            "SELECT s.name, d.dname FROM students AS s JOIN dept AS d ON s.dept_id = d.dept_id ORDER BY s.name LIMIT 2",
+            "SELECT s.name FROM students AS s WHERE EXISTS (SELECT * FROM takes AS t WHERE t.id = s.id)",
+            "SELECT name FROM students WHERE id IN (SELECT id FROM takes)",
+            "SELECT name FROM students WHERE gpa > (SELECT course_id FROM takes WHERE grade = 'A')",
+            "SELECT s.name FROM students AS s, dept AS d WHERE s.dept_id = d.dept_id AND EXISTS (SELECT * FROM takes AS t WHERE t.id = s.id)",
+            "SELECT s.name FROM students AS s WHERE EXISTS (SELECT * FROM takes AS t WHERE t.id = s.id AND "
+                    + "EXISTS (SELECT * FROM dept AS d WHERE d.dept_id = s.dept_id))");
+
+    /** No PROJECT may sit directly on another PROJECT or equal its input, in the main plan or in any subquery plan. */
+    private static void projectionShapeAcrossPipeline() {
+        IStorageManager storage = QO5TestSupport.catalog();
+        QueryOptimizer optimizer = new QueryOptimizer(storage);
+        check(SHAPE_QUERIES.size() >= 25, "need at least 25 queries");
+        for (String sql : SHAPE_QUERIES) {
+            PlanNode after = optimizer.optimizeQuery(optimizer.parseQuery(sql)).root();
+            PlanNodes.validate(after);
+            requireNoRedundantProject(after, sql);
+            if (sql.contains("(SELECT")) continue; // the test evaluator has no subquery support
+            PlanNode before = new Binder(storage).bind(optimizer.parseQuery(sql));
+            QO5TestSupport.equivalent(before, after, QO5TestSupport.data(), storage);
+            eq(before.outputColumns().stream().map(ResultColumn::name).toList(),
+                    after.outputColumns().stream().map(ResultColumn::name).toList());
+            if (sql.contains("ORDER BY id"))
+                eq(QO5TestSupport.eval(before, QO5TestSupport.data(), storage).values(),
+                        QO5TestSupport.eval(after, QO5TestSupport.data(), storage).values());
+        }
+    }
+
+    private static void requireNoRedundantProject(PlanNode node, String sql) {
+        if (node.kind() == PlanNodeKind.PROJECT) {
+            check(node.children().get(0).kind() != PlanNodeKind.PROJECT, "PROJECT over PROJECT: " + sql);
+            check(!QO5Plans.isIdentityProject(node), "identity PROJECT: " + sql);
+        }
+        node.children().forEach(child -> requireNoRedundantProject(child, sql));
+        List<Expression> expressions = new ArrayList<>();
+        node.predicate().ifPresent(expressions::add);
+        node.join().flatMap(JoinSpec::condition).ifPresent(expressions::add);
+        for (Expression expression : expressions) requireNoRedundantProject(expression, sql);
+    }
+
+    private static void requireNoRedundantProject(Expression expression, String sql) {
+        expression.subquery().ifPresent(spec -> requireNoRedundantProject(spec.root(), sql));
+        expression.operands().forEach(operand -> requireNoRedundantProject(operand, sql));
     }
     private static void test(String name, Runnable body) {
         try { body.run(); passed++; System.out.println("PASS "+name); }

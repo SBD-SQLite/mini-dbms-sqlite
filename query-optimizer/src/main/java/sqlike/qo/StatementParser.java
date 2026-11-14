@@ -110,8 +110,6 @@ public class StatementParser {
                 ts.expectKeyword(Keyword.REFERENCES);
                 String referencedTable = identifier(ts, "referenced table name");
                 List<String> referenced = columnList(ts);
-                if (local.size() != referenced.size())
-                    throw ts.unexpected("FOREIGN KEY column counts must match");
                 foreignKeys.add(new ForeignKeySpec(local, referencedTable, referenced));
             } else {
                 String name = identifier(ts, "column name");
@@ -121,23 +119,22 @@ public class StatementParser {
                 catch (IllegalArgumentException exception) {
                     throw QoErrors.syntax("expected INTEGER, FLOAT, CHAR(n), or VARCHAR(n)", typeToken.offset());
                 }
+                // The grammar accepts an optional "(n)" after any type; whether the type needs, forbids or
+                // allows the length (and a duplicate column name) is a definition rule that DdlValidator reports.
                 Optional<Integer> length = Optional.empty();
-                if (type == DataType.CHAR || type == DataType.VARCHAR) {
-                    ts.expectSymbol("(");
+                if (ts.matchSymbol("(")) {
+                    boolean negative = ts.matchSymbol("-");
                     Token size = ts.peek();
-                    if (size.type() != TokenType.INTEGER) throw ts.unexpected("expected positive character length");
+                    if (size.type() != TokenType.INTEGER) throw ts.unexpected("expected a character length");
                     ts.next();
                     try {
                         int value = Integer.parseInt(size.text());
-                        if (value <= 0) throw new NumberFormatException();
-                        length = Optional.of(value);
+                        length = Optional.of(negative ? -value : value);
                     } catch (NumberFormatException exception) {
-                        throw QoErrors.syntax("character length must be a positive 32 bit integer", size.offset());
+                        throw QoErrors.syntax("character length must fit in a 32 bit integer", size.offset());
                     }
                     ts.expectSymbol(")");
                 }
-                if (columns.stream().anyMatch(c -> c.name().equalsIgnoreCase(name)))
-                    throw ts.unexpected("duplicate column '" + name + "'");
                 columns.add(new ColumnSchema(name, type, length));
                 if (ts.matchKeyword(Keyword.PRIMARY)) {
                     ts.expectKeyword(Keyword.KEY);
@@ -148,7 +145,6 @@ public class StatementParser {
         } while (ts.matchSymbol(","));
         ts.expectSymbol(")");
         ts.expectEndOfStatement();
-        if (columns.isEmpty()) throw ts.unexpected("CREATE TABLE requires at least one column");
         return query(StatementType.CREATE_TABLE, PlanNodes.createTable(new CreateTableSpec(
                 table, List.copyOf(columns), List.copyOf(primaryKey), List.copyOf(foreignKeys))));
     }

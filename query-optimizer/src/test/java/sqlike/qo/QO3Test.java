@@ -325,8 +325,240 @@ public final class QO3Test {
                 eq(1, calls.getOrDefault(table, 0));
         });
 
+        subqueryCorrelationTests(optimizer, storage);
+        naturalJoinTests(optimizer, storage);
+
         System.out.printf("QO3: %d passed, %d failed%n", passed, failed);
         return failed;
+    }
+
+    /** Subqueries written in SQL: the Binder derives {@code correlated} from the columns the subquery actually reads. */
+    private static void subqueryCorrelationTests(QueryOptimizer optimizer, IStorageManager storage) {
+        test("SQL EXISTS with an outer alias is correlated and its outer column is qualified by the alias", () -> {
+            PlanNode plan = optimizer.optimizeQuery(optimizer.parseQuery(
+                    "SELECT s.name FROM students AS s WHERE EXISTS (SELECT * FROM takes AS t WHERE t.id = s.id)")).root();
+            PlanNodes.validate(plan);
+            List<SubquerySpec> found = subqueries(plan);
+            eq(1, found.size());
+            eq(SubqueryType.EXISTS, found.get(0).type());
+            eq(true, found.get(0).correlated());
+            eq(true, renderedPlan(found.get(0).root()).contains("(t.id = s.id)"));
+        });
+        test("SQL correlated IN and scalar subqueries are flagged, uncorrelated ones are not", () -> {
+            eq(true, onlySubquery(optimizer, "SELECT name FROM students AS s WHERE s.id IN "
+                    + "(SELECT t.id FROM takes AS t WHERE t.course_id = s.dept_id)").correlated());
+            eq(true, onlySubquery(optimizer, "SELECT name FROM students AS s WHERE s.gpa > "
+                    + "(SELECT t.course_id FROM takes AS t WHERE t.id = s.id)").correlated());
+            eq(false, onlySubquery(optimizer, "SELECT name FROM students WHERE id IN (SELECT id FROM takes)").correlated());
+            eq(false, onlySubquery(optimizer, "SELECT name FROM students WHERE EXISTS (SELECT * FROM dept WHERE dept_id = 1)").correlated());
+            eq(false, onlySubquery(optimizer, "SELECT name FROM students WHERE id = (SELECT id FROM takes WHERE course_id = 1)").correlated());
+        });
+        test("outer reference by full table name (no alias) is resolved", () -> {
+            SubquerySpec spec = onlySubquery(optimizer,
+                    "SELECT name FROM students WHERE EXISTS (SELECT * FROM takes WHERE takes.id = students.id)");
+            eq(true, spec.correlated());
+            eq(true, renderedPlan(spec.root()).contains("(takes.id = students.id)"));
+        });
+        test("an unqualified inner column wins over the outer column of the same name", () -> {
+            // takes.id exists in the subquery, so the unqualified id is not an outer reference.
+            eq(false, onlySubquery(optimizer, "SELECT name FROM students WHERE EXISTS (SELECT * FROM takes WHERE id = 1)").correlated());
+        });
+        test("an inner alias shadows the outer alias of the same name", () -> {
+            SubquerySpec spec = onlySubquery(optimizer,
+                    "SELECT name FROM students AS s WHERE EXISTS (SELECT * FROM takes AS s WHERE s.id = 1)");
+            eq(false, spec.correlated());
+            eq(true, renderedPlan(spec.root()).contains("takes AS s"));
+        });
+        test("nested subqueries: reference to the outermost query flags both levels", () -> {
+            List<SubquerySpec> found = subqueries(optimizer.optimizeQuery(optimizer.parseQuery(
+                    "SELECT s.name FROM students AS s WHERE EXISTS (SELECT * FROM takes AS t WHERE t.id = s.id AND "
+                            + "t.course_id IN (SELECT d.dept_id FROM dept AS d WHERE d.dept_id = s.dept_id))")).root());
+            eq(2, found.size());
+            eq(true, found.get(0).correlated());
+            eq(true, found.get(1).correlated());
+        });
+        test("nested subqueries: inner references only the middle query, middle references the outer one", () -> {
+            List<SubquerySpec> found = subqueries(optimizer.optimizeQuery(optimizer.parseQuery(
+                    "SELECT s.name FROM students AS s WHERE EXISTS (SELECT * FROM takes AS t WHERE t.id = s.id AND "
+                            + "EXISTS (SELECT * FROM dept AS d WHERE d.dept_id = t.course_id))")).root());
+            eq(2, found.size());
+            eq(true, found.get(0).correlated());
+            eq(true, found.get(1).correlated());
+        });
+        test("nested subqueries: an uncorrelated inner subquery stays uncorrelated inside a correlated one", () -> {
+            List<SubquerySpec> found = subqueries(optimizer.optimizeQuery(optimizer.parseQuery(
+                    "SELECT s.name FROM students AS s WHERE EXISTS (SELECT * FROM takes AS t WHERE t.id = s.id AND "
+                            + "t.course_id IN (SELECT d.dept_id FROM dept AS d))")).root());
+            eq(2, found.size());
+            eq(true, found.get(0).correlated());
+            eq(false, found.get(1).correlated());
+        });
+        test("nested subqueries: a middle query that reads no outer column is uncorrelated although its inner one is correlated to it", () -> {
+            List<SubquerySpec> found = subqueries(optimizer.optimizeQuery(optimizer.parseQuery(
+                    "SELECT name FROM students WHERE EXISTS (SELECT * FROM takes AS t WHERE EXISTS "
+                            + "(SELECT * FROM dept AS d WHERE d.dept_id = t.course_id))")).root());
+            eq(2, found.size());
+            eq(false, found.get(0).correlated());
+            eq(true, found.get(1).correlated());
+        });
+        test("correlated subquery plans pass PlanNodes.validate", () -> {
+            for (String sql : List.of(
+                    "SELECT s.name FROM students AS s WHERE EXISTS (SELECT * FROM takes AS t WHERE t.id = s.id)",
+                    "SELECT s.name FROM students AS s WHERE s.id IN (SELECT t.id FROM takes AS t WHERE t.course_id = s.dept_id)",
+                    "SELECT name FROM students AS s WHERE s.gpa > (SELECT t.course_id FROM takes AS t WHERE t.id = s.id)",
+                    "UPDATE students SET gpa = 4.0 WHERE EXISTS (SELECT * FROM takes WHERE takes.id = students.id)",
+                    "DELETE FROM students WHERE id IN (SELECT takes.id FROM takes WHERE takes.course_id = students.dept_id)"))
+                PlanNodes.validate(optimizer.optimizeQuery(optimizer.parseQuery(sql)).root());
+        });
+        test("outer columns do not leak: the outer query cannot see subquery tables, siblings cannot see each other", () -> {
+            expectSemantic(() -> optimizer.optimizeQuery(optimizer.parseQuery(
+                    "SELECT name FROM students WHERE EXISTS (SELECT * FROM takes WHERE takes.id = students.id) AND takes.id = 1")));
+            expectSemantic(() -> optimizer.optimizeQuery(optimizer.parseQuery(
+                    "SELECT name FROM students WHERE EXISTS (SELECT * FROM takes WHERE takes.id = students.id) "
+                            + "AND EXISTS (SELECT * FROM dept WHERE dept.dept_id = takes.id)")));
+        });
+        test("a second Binder call does not inherit the outer scope of the previous statement", () -> {
+            Binder binder = new Binder(storage);
+            binder.bind(optimizer.parseQuery(
+                    "SELECT s.name FROM students AS s WHERE EXISTS (SELECT * FROM takes AS t WHERE t.id = s.id)"));
+            expectSemantic(() -> binder.bind(optimizer.parseQuery("SELECT name FROM students WHERE s.id = 1")));
+        });
+        test("subquery errors: unknown outer column, unknown inner column, wrong width, incompatible IN type", () -> {
+            for (String sql : List.of(
+                    "SELECT s.name FROM students AS s WHERE EXISTS (SELECT * FROM takes AS t WHERE t.id = zz.id)",
+                    "SELECT s.name FROM students AS s WHERE EXISTS (SELECT * FROM takes AS t WHERE t.id = s.nocol)",
+                    "SELECT s.name FROM students AS s WHERE EXISTS (SELECT * FROM takes AS t WHERE t.nocol = s.id)",
+                    "SELECT s.name FROM students AS s WHERE s.id IN (SELECT t.id, t.course_id FROM takes AS t WHERE t.id = s.id)",
+                    "SELECT s.name FROM students AS s WHERE s.gpa > (SELECT t.id, t.course_id FROM takes AS t WHERE t.id = s.id)",
+                    "SELECT s.name FROM students AS s WHERE s.name IN (SELECT t.id FROM takes AS t WHERE t.id = s.id)"))
+                expectSemantic(() -> optimizer.optimizeQuery(optimizer.parseQuery(sql)));
+        });
+        test("EXISTS accepts any column list, including one column and *", () -> {
+            optimizer.optimizeQuery(optimizer.parseQuery(
+                    "SELECT s.name FROM students AS s WHERE EXISTS (SELECT t.id, t.course_id FROM takes AS t WHERE t.id = s.id)"));
+            optimizer.optimizeQuery(optimizer.parseQuery(
+                    "SELECT s.name FROM students AS s WHERE EXISTS (SELECT t.id FROM takes AS t WHERE t.id = s.id)"));
+        });
+        test("cost: an uncorrelated subquery is charged once, a correlated one once per outer row", () -> {
+            CostModel costs = new CostModel(storage);
+            CardinalityEstimator estimator = new CardinalityEstimator(storage);
+            PlanNode uncorrelated = optimizer.optimizeQuery(optimizer.parseQuery(
+                    "SELECT s.name FROM students AS s WHERE EXISTS (SELECT * FROM takes AS t WHERE t.course_id = 1)")).root();
+            PlanNode correlated = optimizer.optimizeQuery(optimizer.parseQuery(
+                    "SELECT s.name FROM students AS s WHERE EXISTS (SELECT * FROM takes AS t WHERE t.course_id = s.dept_id)")).root();
+            PlanNode filterUncorrelated = uncorrelated.children().get(0), filterCorrelated = correlated.children().get(0);
+            double outerScan = costs.getCost(filterUncorrelated.children().get(0));
+            double innerUncorrelated = costs.getCost(subqueries(uncorrelated).get(0).root());
+            double innerCorrelated = costs.getCost(subqueries(correlated).get(0).root());
+            long outerRows = estimator.estimateRows(filterCorrelated.children().get(0));
+            close(outerScan + innerUncorrelated, costs.getCost(uncorrelated));
+            close(outerScan + outerRows * innerCorrelated, costs.getCost(correlated));
+        });
+    }
+
+    /** NATURAL JOIN: the common columns appear once and may be referenced without a qualifier. */
+    private static void naturalJoinTests(QueryOptimizer optimizer, IStorageManager storage) {
+        Binder binder = new Binder(storage);
+        test("NATURAL JOIN common column is unambiguous in SELECT, WHERE and ORDER BY", () -> {
+            for (String sql : List.of(
+                    "SELECT id FROM students NATURAL JOIN takes ORDER BY id",
+                    "SELECT id, name FROM students NATURAL JOIN takes WHERE id > 3",
+                    "SELECT name FROM students NATURAL JOIN takes ORDER BY id DESC",
+                    "SELECT dept_id, dname FROM students NATURAL JOIN dept WHERE dept_id = 2")) {
+                PlanNodes.validate(optimizer.optimizeQuery(optimizer.parseQuery(sql)).root());
+                binder.bind(optimizer.parseQuery(sql));
+            }
+        });
+        test("NATURAL JOIN unqualified common column binds to the left side; both qualifiers stay usable", () -> {
+            PlanNode bound = binder.bind(optimizer.parseQuery("SELECT id FROM students NATURAL JOIN takes ORDER BY id"));
+            eq("students.id", renderColumn(bound.projection().get(0)));
+            eq("students.id", renderColumn(bound.children().get(0).sort().orElseThrow().column()));
+            PlanNode both = binder.bind(optimizer.parseQuery("SELECT students.id, takes.id FROM students NATURAL JOIN takes"));
+            eq(List.of("students.id", "takes.id"), both.projection().stream().map(QO3Test::renderColumn).toList());
+        });
+        test("NATURAL JOIN keeps its output schema: left columns first, common columns once", () -> {
+            PlanNode bound = binder.bind(optimizer.parseQuery("SELECT * FROM students NATURAL JOIN dept"));
+            eq(List.of("students.id", "students.name", "students.gpa", "students.dept_id", "dept.dname"),
+                    bound.projection().stream().map(QO3Test::renderColumn).toList());
+            PlanNode join = bound.children().get(0);
+            eq(List.of("dept_id"), join.join().orElseThrow().commonColumns());
+            eq(List.of("id", "name", "gpa", "dept_id", "dname"), join.outputColumns().stream().map(c -> c.name()).toList());
+        });
+        test("three-table NATURAL JOIN resolves common columns of each step", () -> {
+            PlanNode bound = binder.bind(optimizer.parseQuery(
+                    "SELECT dept_id, id, dname FROM students NATURAL JOIN dept NATURAL JOIN takes ORDER BY dept_id"));
+            eq(List.of("students.dept_id", "students.id", "dept.dname"),
+                    bound.projection().stream().map(QO3Test::renderColumn).toList());
+            PlanNode star = binder.bind(optimizer.parseQuery("SELECT * FROM students NATURAL JOIN dept NATURAL JOIN takes"));
+            eq(List.of("id", "name", "gpa", "dept_id", "dname", "course_id", "grade"),
+                    star.projection().stream().map(sqlike.shared.ColumnRef::columnName).toList());
+        });
+        test("comma plus NATURAL JOIN takes common columns from the left product only", () -> {
+            // students x dept repeats dept_id, but the NATURAL JOIN with takes only shares id.
+            PlanNode star = binder.bind(optimizer.parseQuery("SELECT * FROM students, dept NATURAL JOIN takes"));
+            PlanNode join = star.children().get(0);
+            eq(List.of("id"), join.join().orElseThrow().commonColumns());
+            eq(List.of("students.id", "students.name", "students.gpa", "students.dept_id", "dept.dept_id", "dept.dname",
+                    "takes.course_id", "takes.grade"), star.projection().stream().map(QO3Test::renderColumn).toList());
+            PlanNodes.validate(optimizer.optimizeQuery(optimizer.parseQuery("SELECT * FROM students, dept NATURAL JOIN takes")).root());
+            // A column that is repeated on the left but not shared stays ambiguous when referenced unqualified.
+            expectSemantic(() -> binder.bind(optimizer.parseQuery("SELECT dept_id FROM students, dept NATURAL JOIN takes")));
+            binder.bind(optimizer.parseQuery("SELECT students.dept_id, dept.dept_id, id FROM students, dept NATURAL JOIN takes"));
+        });
+        test("NATURAL JOIN with a common column repeated on the left is a SEMANTIC_ERROR from the Binder", () -> {
+            String sql = "SELECT * FROM students, dept NATURAL JOIN dept AS d2";
+            try {
+                binder.bind(optimizer.parseQuery(sql));
+                throw new AssertionError("expected semantic error");
+            } catch (QoException error) {
+                eq(ErrorCode.SEMANTIC_ERROR, error.getInfo().code());
+                eq(true, error.getInfo().message().contains("ambiguous natural join column"));
+            }
+            expectSemantic(() -> optimizer.optimizeQuery(optimizer.parseQuery(sql)));
+        });
+        test("NATURAL JOIN without common columns is a SEMANTIC_ERROR; other joins still report ambiguous columns", () -> {
+            expectSemantic(() -> binder.bind(optimizer.parseQuery("SELECT * FROM dept NATURAL JOIN takes")));
+            expectSemantic(() -> binder.bind(optimizer.parseQuery("SELECT id FROM students, takes")));
+            expectSemantic(() -> binder.bind(optimizer.parseQuery("SELECT id FROM students JOIN takes ON students.id = takes.id")));
+        });
+    }
+
+    private static String renderColumn(sqlike.shared.ColumnRef ref) {
+        return ref.tableName().map(table -> table + ".").orElse("") + ref.columnName();
+    }
+
+    private static SubquerySpec onlySubquery(QueryOptimizer optimizer, String sql) {
+        PlanNode plan = optimizer.optimizeQuery(optimizer.parseQuery(sql)).root();
+        PlanNodes.validate(plan);
+        List<SubquerySpec> found = subqueries(plan);
+        eq(1, found.size());
+        return found.get(0);
+    }
+
+    /** Every subquery reachable from {@code plan}, outer ones before the ones nested inside them. */
+    private static List<SubquerySpec> subqueries(PlanNode plan) {
+        List<SubquerySpec> found = new java.util.ArrayList<>();
+        collectSubqueries(plan, found);
+        return found;
+    }
+
+    private static void collectSubqueries(PlanNode node, List<SubquerySpec> found) {
+        node.predicate().ifPresent(e -> collectSubqueries(e, found));
+        node.join().flatMap(JoinSpec::condition).ifPresent(e -> collectSubqueries(e, found));
+        node.mutation().flatMap(m -> m.updateExpression()).ifPresent(e -> collectSubqueries(e, found));
+        node.children().forEach(child -> collectSubqueries(child, found));
+    }
+
+    private static void collectSubqueries(Expression expression, List<SubquerySpec> found) {
+        expression.subquery().ifPresent(spec -> {
+            found.add(spec);
+            collectSubqueries(spec.root(), found);
+        });
+        expression.operands().forEach(operand -> collectSubqueries(operand, found));
+    }
+
+    private static String renderedPlan(PlanNode plan) {
+        return new PlanPrinter().print(plan);
     }
 
     private static PlanNode scanWithAlias(String table, String alias) {
