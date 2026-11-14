@@ -89,8 +89,15 @@ public class StatisticsManager {
     }
 
     public TableStatistics getStatistics(String table) throws StorageException {
-        // Recompute until the CRUD owner wires every invalidation path
-        return refresh(table);
+        CatalogManager source;
+        synchronized (this) { source = catalog; }
+        if (source == null) throw new StorageException(INVALID_STATE, "Statistics requires a catalog");
+        String name = source.getSchema(table).tableName();
+        synchronized (this) {
+            TableStatistics cached = cachedStats.get(name);
+            if (cached != null && !invalidTables.contains(name)) return cached;
+        }
+        return refresh(name);
     }
 
     public TableStatistics refresh(String table) throws StorageException {
