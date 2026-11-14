@@ -32,11 +32,13 @@ public class JoinAccessPathOptimizer {
         if (!isOptimizable(plan)) return plan;
 
         PlanNode rewritten = joinRewriter.mergeSelectionIntoJoin(joinRewriter.cartesianToJoin(plan));
-        var candidates = new LinkedHashSet<>(generateCandidates(rewritten));
+        var candidates = new LinkedHashSet<PlanNode>();
+        for (PlanNode candidate : generateCandidates(rewritten))
+            candidates.add(QO5Plans.simplifyIdentityProjects(restoreOutputSchema(candidate, plan)));
         // Include the incoming baseline too; equivalent rewritten plans win equal-cost ties.
-        candidates.add(plan);
+        candidates.add(QO5Plans.simplifyIdentityProjects(plan));
         PlanNode candidate = planSelector.pickCheapest(List.copyOf(candidates), costModel);
-        PlanNode result = restoreOutputSchema(candidate, plan);
+        PlanNode result = QO5Plans.simplifyIdentityProjects(restoreOutputSchema(candidate, plan));
         PlanNodes.validate(result);
         return result;
     }
