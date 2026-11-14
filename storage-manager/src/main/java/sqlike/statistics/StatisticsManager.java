@@ -89,20 +89,29 @@ public class StatisticsManager {
     }
 
     public TableStatistics getStatistics(String table) throws StorageException {
-        // Recompute until the CRUD owner wires every invalidation path
-        return refresh(table);
+        CatalogManager source;
+        synchronized (this) { source = catalog; }
+        if (source == null) throw new StorageException(INVALID_STATE, "Statistics requires a catalog");
+        String name = source.getSchema(table).tableName();
+        synchronized (this) {
+            TableStatistics cached = cachedStats.get(name);
+            if (cached != null && !invalidTables.contains(name)) return cached;
+        }
+        return refresh(name);
     }
 
     public TableStatistics refresh(String table) throws StorageException {
         CatalogManager sourceCatalog;
         RecordManager sourceRecords;
         BlockCountProvider sourceCounter;
+        BlockManager sourceBlocks;
         int sourcePageSize;
         long observedRevision;
         synchronized (this) {
             sourceCatalog = catalog;
             sourceRecords = records;
             sourceCounter = blockCountProvider;
+            sourceBlocks = blocks;
             sourcePageSize = blocks == null ? 0 : blocks.getPageSize();
             observedRevision = revision;
         }
@@ -161,7 +170,9 @@ public class StatisticsManager {
 
         long blockCount;
         try {
-            blockCount = sourceCounter == null ? observedExtent : sourceCounter.countBlocks(schema.tableId());
+            // b_r comes from the Block Manager (file size / page size)
+            blockCount = sourceCounter != null ? sourceCounter.countBlocks(schema.tableId())
+                    : sourceBlocks.getPageCount(schema.tableId());
         } catch (StorageException e) {
             failRefresh(name);
             throw e;
@@ -205,6 +216,33 @@ public class StatisticsManager {
             invalidTables.add(name);
             revision++;
         }
+    }
+
+    public synchronized void forget(String table) {
+        cachedStats.keySet().removeIf(name -> name.equalsIgnoreCase(table));
+        invalidTables.removeIf(name -> name.equalsIgnoreCase(table));
+        revision++;
+    }
+
+    public synchronized void reset() {
+        cachedStats.clear();
+        invalidTables.clear();
+        revision++;
+    }
+
+    public void recomputeAll() throws StorageException {
+        CatalogManager source;
+        synchronized (this) { source = catalog; }
+        if (source == null) throw new StorageException(INVALID_STATE, "Statistics requires a catalog");
+        StorageException first = null;
+        for (String table : source.listTables()) {
+            try {
+                refresh(table);
+            } catch (StorageException e) {
+                if (first == null) first = e; else first.addSuppressed(e);
+            }
+        }
+        if (first != null) throw first;
     }
 
     private synchronized void failRefresh(String table) {

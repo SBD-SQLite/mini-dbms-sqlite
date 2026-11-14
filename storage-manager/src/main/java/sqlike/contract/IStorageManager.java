@@ -2,6 +2,7 @@ package sqlike.contract;
 
 import java.util.List;
 import java.util.Optional;
+import sqlike.shared.DropBehavior;
 import sqlike.shared.IndexCondition;
 import sqlike.shared.IndexMetadata;
 import sqlike.shared.IndexStatistics;
@@ -13,6 +14,7 @@ import sqlike.shared.RecordImage;
 import sqlike.shared.TableSchema;
 import sqlike.shared.TableStatistics;
 import sqlike.shared.Value;
+import sqlike.storage.StorageErrorCode;
 import sqlike.storage.StorageException;
 
 public interface IStorageManager {
@@ -45,6 +47,18 @@ public interface IStorageManager {
     IndexStatistics getIndexStatistics(String name) throws StorageException;
 
     List<RID> lookupIndex(String name, IndexCondition condition) throws StorageException;
+
+    default void createTable(TableSchema schema) throws StorageException {
+        throw new StorageException(StorageErrorCode.UNSUPPORTED_OPERATION, "createTable is not supported");
+    }
+
+    default void dropTable(String table, DropBehavior behavior) throws StorageException {
+        throw new StorageException(StorageErrorCode.UNSUPPORTED_OPERATION, "dropTable is not supported");
+    }
+
+    default List<TableSchema> getReferencingTables(String table) throws StorageException {
+        throw new StorageException(StorageErrorCode.UNSUPPORTED_OPERATION, "getReferencingTables is not supported");
+    }
 
     void flushAll() throws StorageException;
 
