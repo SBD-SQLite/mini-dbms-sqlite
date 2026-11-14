@@ -1,7 +1,6 @@
 package sqlike.storage;
 
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -10,6 +9,7 @@ import java.util.Set;
 import java.util.regex.Pattern;
 import sqlike.block.BlockManager;
 import sqlike.shared.DropBehavior;
+import sqlike.shared.ForeignKeySpec;
 import sqlike.contract.IStorageManager;
 import sqlike.record.RecordManager;
 import sqlike.catalog.CatalogManager;
@@ -158,44 +158,36 @@ public final class StorageManager implements IStorageManager {
         if (behavior == null) throw new StorageException(StorageErrorCode.INVALID_VALUE, "DropBehavior must not be null");
         TableSchema root = catalog.getSchema(table);
 
-        // Collect the tables to drop: just the root, or the transitive closure of dependents for CASCADE.
-        Map<String, TableSchema> victims = new LinkedHashMap<>();
-        List<TableSchema> pending = new ArrayList<>(List.of(root));
-        while (!pending.isEmpty()) {
-            TableSchema current = pending.remove(0);
-            if (victims.putIfAbsent(current.tableName(), current) != null) continue;
-            List<TableSchema> dependents = catalog.dependents(current.tableName());
-            if (behavior == DropBehavior.RESTRICT && current == root && !dependents.isEmpty()) {
-                throw new StorageException(StorageErrorCode.INVALID_STATE, "Cannot drop " + root.tableName()
-                        + ": referenced by foreign key of " + dependents.get(0).tableName());
-            }
-            if (behavior == DropBehavior.CASCADE) pending.addAll(dependents);
+        List<TableSchema> dependents = catalog.dependents(root.tableName());
+        if (behavior == DropBehavior.RESTRICT && !dependents.isEmpty()) {
+            throw new StorageException(StorageErrorCode.INVALID_STATE, "Cannot drop " + root.tableName()
+                    + ": referenced by foreign key of " + dependents.get(0).tableName());
         }
 
         // Remember indexes before they disappear from the catalog (their files must go too).
         Set<String> indexFileIds = new LinkedHashSet<>();
-        for (TableSchema victim : victims.values()) {
-            for (IndexMetadata index : catalog.getIndexes(victim.tableName())) indexFileIds.add("idx_" + index.indexName());
-        }
+        for (IndexMetadata index : catalog.getIndexes(root.tableName())) indexFileIds.add("idx_" + index.indexName());
 
         Map<String, TableSchema> savedSchemas = catalog.snapshotSchemas();
         Map<String, IndexMetadata> savedIndexes = catalog.snapshotIndexes();
         try {
-            for (TableSchema victim : victims.values()) catalog.unregisterTable(victim.tableName());
-            catalog.save(); // commit point: after this the tables are gone for good
+            for (TableSchema child : dependents) {
+                List<ForeignKeySpec> kept = child.foreignKeys().stream().filter(fk -> !fk.referencedTable().equalsIgnoreCase(root.tableName())).toList();
+                catalog.replaceSchema(new TableSchema(child.tableId(), child.tableName(), child.columns(), child.primaryKey(), kept));
+            }
+            catalog.unregisterTable(root.tableName());
+            catalog.save(); 
         } catch (StorageException e) {
             catalog.restore(savedSchemas, savedIndexes);
             throw e;
         }
 
-        for (TableSchema victim : victims.values()) {
-            if (statistics != null) statistics.forget(victim.tableName());
-        }
+        if (statistics != null) statistics.forget(root.tableName());
         BlockManager files = blocks != null ? blocks : statistics == null ? null : statistics.getBlocks();
         if (files == null) return;
         StorageException failure = null;
         List<String> ids = new ArrayList<>(indexFileIds);
-        for (TableSchema victim : victims.values()) ids.add(victim.tableId());
+        ids.add(root.tableId());
         for (String id : ids) {
             if (!FILE_ID.matcher(id).matches()) continue; // index name that never had a file
             try {
@@ -205,6 +197,11 @@ public final class StorageManager implements IStorageManager {
             }
         }
         if (failure != null) throw failure; // catalog is already consistent; only orphan files remain
+    }
+
+    @Override
+    public List<TableSchema> getReferencingTables(String table) throws StorageException {
+        return catalog.dependents(table);
     }
 
     public synchronized void onSnapshotRestored() throws StorageException {

@@ -93,6 +93,15 @@ public class CatalogManager {
         indexes.put(copy.indexName(), copy);
     }
 
+    public synchronized String generateTableId(String tableName) throws StorageException {
+        String base = "tbl_" + key(tableName).replaceAll("[^a-z0-9_-]", "_");
+        Set<String> used = new HashSet<>();
+        for (TableSchema schema : schemas.values()) used.add(schema.tableId().toLowerCase(Locale.ROOT));
+        String candidate = base;
+        for (int n = 2; used.contains(candidate); n++) candidate = base + "_" + n;
+        return candidate;
+    }
+
     // Removes the index entry only (memory)
     public synchronized IndexMetadata unregisterIndex(String indexName) throws StorageException {
         String wanted = key(indexName);
@@ -107,6 +116,16 @@ public class CatalogManager {
         for (IndexMetadata index : getIndexes(schema.tableName())) unregisterIndex(index.indexName());
         schemas.remove(schema.tableName());
         return schema;
+    }
+
+    // Replaces an existing table's schema (same tableId and name) in memory
+    public synchronized void replaceSchema(TableSchema schema) throws StorageException {
+        TableSchema copy = checkedSchema(schema);
+        TableSchema old = getSchema(copy.tableName());
+        if (!old.tableId().equals(copy.tableId())) {
+            throw new StorageException(INVALID_VALUE, "tableId cannot change: " + copy.tableName());
+        }
+        schemas.put(old.tableName(), copy);
     }
 
     // Other tables whose foreign keys reference (self references excluded)

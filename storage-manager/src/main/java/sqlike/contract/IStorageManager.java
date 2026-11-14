@@ -53,6 +53,10 @@ public interface IStorageManager {
         throw new StorageException(StorageErrorCode.UNSUPPORTED_OPERATION, "dropTable is not supported");
     }
 
+    default List<TableSchema> getReferencingTables(String table) throws StorageException {
+        throw new StorageException(StorageErrorCode.UNSUPPORTED_OPERATION, "getReferencingTables is not supported");
+    }
+
     void flushAll() throws StorageException;
 
     void close() throws StorageException;
