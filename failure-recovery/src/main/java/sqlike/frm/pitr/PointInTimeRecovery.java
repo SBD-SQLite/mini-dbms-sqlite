@@ -2,6 +2,7 @@ package sqlike.frm.pitr;
 
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -28,6 +29,7 @@ public class PointInTimeRecovery {
     private final HistoricalRecoveryPlanner planner;
     private final long idleTimeoutMs;
     private final Lock maintenanceLock;
+    private final Optional<PitrMarker> marker;
 
     public PointInTimeRecovery(
             SmPort storageManager,
@@ -48,6 +50,21 @@ public class PointInTimeRecovery {
             CheckpointManager checkpointManager,
             long idleTimeoutMs,
             Lock maintenanceLock) {
+        this(storageManager, concurrencyControl, historicalLog, snapshotCatalog, checkpointManager,
+                idleTimeoutMs, maintenanceLock, null);
+    }
+
+    /** A null {@code marker} disables detection of an interrupted restore. */
+    public PointInTimeRecovery(
+            SmPort storageManager,
+            CcmPort concurrencyControl,
+            HistoricalLogPort historicalLog,
+            SnapshotCatalog snapshotCatalog,
+            CheckpointManager checkpointManager,
+            long idleTimeoutMs,
+            Lock maintenanceLock,
+            PitrMarker marker) {
+        this.marker = Optional.ofNullable(marker);
         this.storageManager = Objects.requireNonNull(storageManager, "storageManager");
         this.concurrencyControl = Objects.requireNonNull(concurrencyControl, "concurrencyControl");
         this.historicalLog = Objects.requireNonNull(historicalLog, "historicalLog");
@@ -76,18 +93,11 @@ public class PointInTimeRecovery {
 
                 List<LogRecord> history = historicalLog.readHistory();
                 HistoricalRecoveryPlan plan = planner.plan(target, history);
-                long lastLsn = history.isEmpty() ? 0L : history.get(history.size() - 1).lsn();
 
+                marker.ifPresent(flag -> flag.write(target));
                 dataTouched = true;
-                storageManager.restoreSnapshot(plan.snapshotId());
-                replay(plan);
-                storageManager.flushAll();
-
-                historicalLog.separateHistory(plan.snapshotId(), plan.targetLSN());
-                if (lastLsn > plan.targetLSN()) {
-                    snapshotCatalog.recordAbandoned(plan.targetLSN() + 1, lastLsn);
-                }
-                checkpointManager.checkpointWhileQuiesced();
+                restore(plan, history);
+                marker.ifPresent(PitrMarker::clear);
 
                 concurrencyControl.initAfterRecovery(plan.maxTxId());
                 concurrencyControl.resumeTransactions();
@@ -101,6 +111,47 @@ public class PointInTimeRecovery {
         } finally {
             maintenanceLock.unlock();
         }
+    }
+
+    /** Runs an interrupted restore again and returns its plan, or empty when none was interrupted. */
+    public Optional<HistoricalRecoveryPlan> resumeInterrupted() {
+        if (marker.isEmpty()) {
+            return Optional.empty();
+        }
+        Optional<RecoveryTarget> target = marker.get().read();
+        if (target.isEmpty()) {
+            return Optional.empty();
+        }
+        maintenanceLock.lock();
+        try {
+            List<LogRecord> history = historicalLog.readHistory();
+            HistoricalRecoveryPlan plan = planner.plan(target.get(), history);
+            restore(plan, history);
+            marker.get().clear();
+            return Optional.of(plan);
+        } finally {
+            maintenanceLock.unlock();
+        }
+    }
+
+    /** True while a restore is flagged as in progress. */
+    public boolean isInterrupted() {
+        return marker.isPresent() && marker.get().read().isPresent();
+    }
+
+    /** Replaces the data, separates the timeline, and checkpoints the restored state. */
+    private void restore(HistoricalRecoveryPlan plan, List<LogRecord> history) {
+        long lastLsn = history.isEmpty() ? 0L : history.get(history.size() - 1).lsn();
+
+        storageManager.restoreSnapshot(plan.snapshotId());
+        replay(plan);
+        storageManager.flushAll();
+
+        historicalLog.separateHistory(plan.snapshotId(), plan.targetLSN());
+        if (lastLsn > plan.targetLSN()) {
+            snapshotCatalog.recordAbandoned(plan.targetLSN() + 1, lastLsn);
+        }
+        checkpointManager.checkpointWhileQuiesced();
     }
 
     private void replay(HistoricalRecoveryPlan plan) {

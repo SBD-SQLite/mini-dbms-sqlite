@@ -7,6 +7,9 @@ public record JoinSpec(
         JoinType joinType,
         Optional<Expression> condition,
         JoinAlgorithm algorithm,
-        List<String> commonColumns
-) {
+        List<String> commonColumns) {
+    public JoinSpec {
+        condition = condition == null ? Optional.empty() : condition;
+        commonColumns = commonColumns == null ? List.of() : List.copyOf(commonColumns);
+    }
 }

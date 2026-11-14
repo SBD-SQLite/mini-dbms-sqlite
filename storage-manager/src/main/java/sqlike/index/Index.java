@@ -3,6 +3,7 @@ package sqlike.index;
 import java.util.List;
 
 import sqlike.shared.RID;
+import sqlike.shared.IndexStatistics;
 import sqlike.shared.Value;
 import sqlike.storage.StorageException;
 
@@ -11,5 +12,6 @@ public interface Index {
     public void insert(Value key, RID rid, long lsn) throws StorageException;
     public void remove(Value key, RID rid, long lsn) throws StorageException;
     public void flush() throws StorageException;
+    public IndexStatistics getStatistics() throws StorageException;
 
 }

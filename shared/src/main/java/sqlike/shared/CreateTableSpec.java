@@ -8,4 +8,10 @@ public record CreateTableSpec(
         List<String> primaryKey,
         List<ForeignKeySpec> foreignKeys
 ) {
+    public CreateTableSpec {
+        columns = columns == null ? List.of() : List.copyOf(columns);
+        primaryKey = primaryKey == null ? List.of() : List.copyOf(primaryKey);
+        foreignKeys = foreignKeys == null ? List.of() : List.copyOf(foreignKeys);
+    }
 }
+

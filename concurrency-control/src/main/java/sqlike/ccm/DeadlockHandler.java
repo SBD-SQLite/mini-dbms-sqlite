@@ -18,6 +18,11 @@ public class DeadlockHandler {
 
     private final Map<Long, Set<Long>> waitFor = new HashMap<>();
 
+    /** True when no transaction is waiting for another. */
+    public synchronized boolean isEmpty() {
+        return waitFor.values().stream().allMatch(Set::isEmpty);
+    }
+
     public synchronized List<Long> detectCycle() {
         Set<Long> finished = new HashSet<>();
         Map<Long, Integer> visiting = new HashMap<>();

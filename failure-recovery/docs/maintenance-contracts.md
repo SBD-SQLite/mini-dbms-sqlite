@@ -343,7 +343,7 @@ log.simulateDurabilityFailure(true);   // uji kegagalan ensureDurable
 log.activeLog();                  // isi log aktif setelah separateHistory
 ```
 
-Menjalankan pengujian fitur (JDK 17+), dari folder `failure-recovery/`:
+Menjalankan pengujian fitur (JDK 21+), dari folder `failure-recovery/`:
 
 ```bash
 ./run-maintenance-tests.sh

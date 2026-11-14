@@ -2,6 +2,7 @@ package sqlike.frm.port;
 
 import sqlike.shared.RID;
 import sqlike.shared.RecordImage;
+import sqlike.shared.SchemaImage;
 
 /**
  * What FRM needs from Storage Manager; the real SM is plugged in through an adapter (DIP).
@@ -15,6 +16,12 @@ public interface SmPort {
 
     /** Puts the record at {@code rid} into the given state, used by undo and redo (keeps the RID). */
     void writeAt(String table, RID rid, RecordImage image, long lsn);
+
+    /**
+     * Restores a table's catalog schema, indexes, and optional data snapshot to the given state,
+     * used by undo and redo for DDL operations ({@code SCHEMA_CHANGE}).
+     */
+    void restoreSchema(SchemaImage image, long lsn);
 
     /** Writes every dirty page to disk (checkpoint). */
     void flushAll();

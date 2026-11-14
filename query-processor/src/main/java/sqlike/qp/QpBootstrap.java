@@ -32,10 +32,18 @@ public final class QpBootstrap {
         this.concurrency = null;
         this.processor = Objects.requireNonNull(processor, "QueryProcessor cannot be null in QpBootstrap");
         this.server = Objects.requireNonNull(server, "QueryServer cannot be null in QpBootstrap");
+        if (server.getProcessor() != processor) throw new IllegalArgumentException("Bootstrap and server must use the same QueryProcessor");
         this.state = new AtomicReference<>(SystemState.STARTING);
     }
 
-    public void start() {
+    public static QpBootstrap forComponents(sqlike.contract.IQueryOptimizer optimizer,
+            sqlike.contract.IStorageManager storage, sqlike.contract.IConcurrencyControlManager concurrency,
+            sqlike.contract.IFailureRecoveryManager recovery, QpConfiguration configuration) {
+        QueryProcessor processor = new QueryProcessor(optimizer, storage, concurrency, recovery, configuration);
+        return new QpBootstrap(processor, new QueryServer(processor, configuration));
+    }
+
+    public synchronized void start() {
         if (state.get() == SystemState.READY) {
             return;
         }
@@ -53,21 +61,23 @@ public final class QpBootstrap {
             }
             server.start();
             state.set(SystemState.READY);
-        } catch (RuntimeException e) {
+        } catch (RuntimeException | LinkageError e) {
             state.set(SystemState.FAILED);
             throw e;
         }
     }
 
-    public void stop() {
+    public synchronized void stop() {
+        RuntimeException failure = null;
+        try { server.stop(); } catch (RuntimeException e) { failure = e; }
         try {
-            server.stop();
-            if (server.getProcessor() instanceof QueryProcessor qp) {
-                qp.shutdown();
-            }
-        } finally {
-            state.set(SystemState.STOPPED);
+            if (server.getProcessor() instanceof QueryProcessor qp) qp.shutdown();
+        } catch (RuntimeException e) {
+            if (failure == null) failure = e;
+            else if (failure != e) failure.addSuppressed(e);
         }
+        state.set(failure == null ? SystemState.STOPPED : SystemState.FAILED);
+        if (failure != null) throw failure;
     }
 
     public SystemState getState() {

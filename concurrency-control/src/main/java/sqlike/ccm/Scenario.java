@@ -74,6 +74,7 @@ public class Scenario {
     private final List<ScheduleOperation> manualSchedule;
     private final Map<ResourceId, Integer> initialValues;
     private final Optional<String> expectedVictimLabel;
+    private String script;
 
     public Scenario(
             String name,
@@ -257,7 +258,28 @@ public class Scenario {
             }
         }
 
-        return new Scenario(name, protocol, deadlock, steps, expectedSerializable, seeds, expectedVictim);
+        Scenario scenario = new Scenario(name, protocol, deadlock, steps, expectedSerializable, seeds, expectedVictim);
+        scenario.script = script;
+        return scenario;
+    }
+
+    /**
+     * The same script run under {@code other}, for scenarios whose expectations do not depend on how
+     * the protocol resolves conflicts (WAL failures, rollback, serial execution). Empty for scenarios
+     * not built from a script.
+     */
+    public Optional<Scenario> asProtocol(ProtocolType other) {
+        if (script == null) {
+            return Optional.empty();
+        }
+        String header = other == ProtocolType.TIMESTAMP_BASED ? "# protokol: timestamp" : "# protokol: lock";
+        String rewritten = script.replaceAll("(?im)^(\\s*)#\\s*proto(?:kol|col):.*$", "$1" + header);
+        return Optional.of(fromScript(name + " [" + other + "]", rewritten, expectedSerializable));
+    }
+
+    /** True when a COMMIT step injects a WAL failure: its outcome is unknown, so its locks stay until recovery. */
+    public boolean expectsUnresolvedCommit() {
+        return steps.stream().anyMatch(step -> step.action() == ActionType.COMMIT && step.injectWalFailure());
     }
 
     public static ResourceId parseResource(String symbol) {

@@ -2,8 +2,10 @@ package sqlike.contract;
 
 import java.util.List;
 import java.util.Optional;
+import sqlike.shared.DropBehavior;
 import sqlike.shared.IndexCondition;
 import sqlike.shared.IndexMetadata;
+import sqlike.shared.IndexStatistics;
 import sqlike.shared.InsertReservation;
 import sqlike.shared.RID;
 import sqlike.shared.Record;
@@ -12,6 +14,7 @@ import sqlike.shared.RecordImage;
 import sqlike.shared.TableSchema;
 import sqlike.shared.TableStatistics;
 import sqlike.shared.Value;
+import sqlike.storage.StorageErrorCode;
 import sqlike.storage.StorageException;
 
 public interface IStorageManager {
@@ -27,6 +30,8 @@ public interface IStorageManager {
 
     void delete(String table, RID rid, long lsn) throws StorageException;
 
+    int clearTable(String table) throws StorageException;
+
     void releaseReservation(InsertReservation reservation) throws StorageException;
 
     void restoreRecord(String table, RID rid, RecordImage image, long lsn) throws StorageException;
@@ -41,7 +46,21 @@ public interface IStorageManager {
 
     List<IndexMetadata> getIndexes(String table) throws StorageException;
 
+    IndexStatistics getIndexStatistics(String name) throws StorageException;
+
     List<RID> lookupIndex(String name, IndexCondition condition) throws StorageException;
+
+    default void createTable(TableSchema schema) throws StorageException {
+        throw new StorageException(StorageErrorCode.UNSUPPORTED_OPERATION, "createTable is not supported");
+    }
+
+    default void dropTable(String table, DropBehavior behavior) throws StorageException {
+        throw new StorageException(StorageErrorCode.UNSUPPORTED_OPERATION, "dropTable is not supported");
+    }
+
+    default List<TableSchema> getReferencingTables(String table) throws StorageException {
+        throw new StorageException(StorageErrorCode.UNSUPPORTED_OPERATION, "getReferencingTables is not supported");
+    }
 
     void flushAll() throws StorageException;
 

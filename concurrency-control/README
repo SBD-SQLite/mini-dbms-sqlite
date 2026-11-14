@@ -65,3 +65,18 @@ The tests are standalone classes in src/test/java/sqlike/ccm (LockBasedProtocolT
 TimestampProtocolTest, TransactionManagerTest, TransactionTest, CCMConfigTest, MockFRMTest,
 FRMBridgeTest, ConcurrencyControlManagerTest). run-tests.sh runs every *Test class, then the driver.
 FRM is a MockFRM here; integration with the real FRM and QP is Milestone 3.
+
+QP integration (Milestone 3), from the repository root:
+  ./concurrency-control/run-qp-integration.sh
+This compiles shared, query-processor, query-optimizer, concurrency-control and failure-recovery
+together and runs src/integration/java/sqlike/ccm/QpIntegrationDriver.java: the real QP
+ConcurrencyAdapter on the real CCM and the real FRM (WAL, rollback, recovery, checkpoint), with
+FRM's MockStorageManager as the data store. Each scenario runs on a fresh data directory, under
+both protocols where the behavior does not depend on the protocol, and must leave no lock or
+protocol data behind (ConcurrencyControlManager.leftoverState). It covers the PRD startup order
+(FRM.recover, then initAfterRecovery), the two-stage write (requestWriteAccess, requestWrite,
+beginApply/endApply with the SM write stamped with the LSN), undo of an aborted write in the SM,
+deadlock, WAL and commit failures, DDL, restart recovery, the FRM checkpoint timeout and eight
+concurrent clients checked against the serializability verifier. A known gap is printed as
+[CELAH]: FRM cannot roll back a DDL transaction until SmPort has restoreSchema.
+Every module ships its own sqlike.contract copy, so the script uses only the QP copy.

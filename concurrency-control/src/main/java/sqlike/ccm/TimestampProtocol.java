@@ -96,6 +96,36 @@ public class TimestampProtocol implements IConcurrencyProtocol {
         }
     }
 
+    /**
+     * Committed read and write timestamps stay by design, because later transactions are validated
+     * against them. Only marks that belong to unfinished transactions count as leftovers.
+     */
+    @Override
+    public String leftoverState() {
+        lock.lock();
+        try {
+            StringBuilder left = new StringBuilder();
+            if (!writtenBy.isEmpty()) {
+                left.append("writtenBy=").append(writtenBy.keySet()).append(' ');
+            }
+            if (!readBy.isEmpty()) {
+                left.append("readBy=").append(readBy.keySet()).append(' ');
+            }
+            for (Map.Entry<ResourceId, Entry> item : timestamps.entrySet()) {
+                Entry entry = item.getValue();
+                if (entry.writerTxId != NO_WRITER) {
+                    left.append("uncommittedWriter=").append(entry.writerTxId).append('@').append(item.getKey()).append(' ');
+                }
+                if (!entry.readers.isEmpty()) {
+                    left.append("readers=").append(entry.readers.keySet()).append('@').append(item.getKey()).append(' ');
+                }
+            }
+            return left.toString().trim();
+        } finally {
+            lock.unlock();
+        }
+    }
+
     @Override
     public void reset() {
         lock.lock();

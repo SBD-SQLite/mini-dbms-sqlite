@@ -93,6 +93,87 @@ public class CatalogManager {
         indexes.put(copy.indexName(), copy);
     }
 
+    public synchronized String generateTableId(String tableName) throws StorageException {
+        String base = "tbl_" + key(tableName).replaceAll("[^a-z0-9_-]", "_");
+        Set<String> used = new HashSet<>();
+        for (TableSchema schema : schemas.values()) used.add(schema.tableId().toLowerCase(Locale.ROOT));
+        String candidate = base;
+        for (int n = 2; used.contains(candidate); n++) candidate = base + "_" + n;
+        return candidate;
+    }
+
+    // Removes the index entry only (memory)
+    public synchronized IndexMetadata unregisterIndex(String indexName) throws StorageException {
+        String wanted = key(indexName);
+        String found = indexes.keySet().stream().filter(name -> keyUnchecked(name).equals(wanted)).findFirst().orElse(null);
+        if (found == null) throw new StorageException(INDEX_NOT_FOUND, "Index not found: " + indexName);
+        return indexes.remove(found);
+    }
+
+    // Removes the table and every index on it (memory)
+    public synchronized TableSchema unregisterTable(String table) throws StorageException {
+        TableSchema schema = getSchema(table);
+        for (IndexMetadata index : getIndexes(schema.tableName())) unregisterIndex(index.indexName());
+        schemas.remove(schema.tableName());
+        return schema;
+    }
+
+    // Replaces an existing table's schema (same tableId and name) in memory
+    public synchronized void replaceSchema(TableSchema schema) throws StorageException {
+        TableSchema copy = checkedSchema(schema);
+        TableSchema old = getSchema(copy.tableName());
+        if (!old.tableId().equals(copy.tableId())) {
+            throw new StorageException(INVALID_VALUE, "tableId cannot change: " + copy.tableName());
+        }
+        schemas.put(old.tableName(), copy);
+    }
+
+    // Other tables whose foreign keys reference (self references excluded)
+    public synchronized List<TableSchema> dependents(String table) throws StorageException {
+        String name = getSchema(table).tableName();
+        return schemas.values().stream()
+                .filter(other -> !other.tableName().equalsIgnoreCase(name))
+                .filter(other -> other.foreignKeys().stream().anyMatch(fk -> fk.referencedTable().equalsIgnoreCase(name)))
+                .sorted(Comparator.comparing(TableSchema::tableName, String.CASE_INSENSITIVE_ORDER)).toList();
+    }
+
+    public synchronized void checkForeignKeyTargets(TableSchema schema) throws StorageException {
+        TableSchema checked = checkedSchema(schema);
+        for (ForeignKeySpec fk : checked.foreignKeys()) {
+            TableSchema target = fk.referencedTable().equalsIgnoreCase(checked.tableName()) ? checked : getSchema(fk.referencedTable());
+            for (int i = 0; i < fk.columnNames().size(); i++) {
+                ColumnSchema local = column(checked, fk.columnNames().get(i));
+                ColumnSchema remote = column(target, fk.referencedColumns().get(i));
+                if (remote == null) {
+                    throw new StorageException(INVALID_VALUE, "Foreign key references unknown column "
+                            + target.tableName() + "." + fk.referencedColumns().get(i));
+                }
+                if (local.dataType() != remote.dataType()) {
+                    throw new StorageException(INVALID_VALUE, "Foreign key type mismatch: " + local.name()
+                            + " -> " + target.tableName() + "." + remote.name());
+                }
+            }
+            List<String> wanted = fk.referencedColumns().stream().map(CatalogManager::keyUnchecked).toList();
+            List<String> primary = target.primaryKey().stream().map(CatalogManager::keyUnchecked).toList();
+            if (!wanted.equals(primary)) {
+                throw new StorageException(INVALID_VALUE, "Foreign key must reference the primary key of " + target.tableName());
+            }
+        }
+    }
+
+    private static ColumnSchema column(TableSchema schema, String name) {
+        return schema.columns().stream().filter(c -> c.name().equalsIgnoreCase(name)).findFirst().orElse(null);
+    }
+
+    public synchronized Map<String, TableSchema> snapshotSchemas() { return new LinkedHashMap<>(schemas); }
+
+    public synchronized Map<String, IndexMetadata> snapshotIndexes() { return new LinkedHashMap<>(indexes); }
+
+    public synchronized void restore(Map<String, TableSchema> savedSchemas, Map<String, IndexMetadata> savedIndexes) {
+        schemas = new LinkedHashMap<>(savedSchemas);
+        indexes = new LinkedHashMap<>(savedIndexes);
+    }
+
     public synchronized void load() throws StorageException {
         if (Files.notExists(catalogFile)) {
             schemas = new LinkedHashMap<>();

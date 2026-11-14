@@ -33,8 +33,34 @@ public class MutationCoordinator {
         return storage;
     }
 
+    public IConcurrencyControl getConcurrency() {
+        return concurrency;
+    }
+
+    public void requireWalContext(ExecutionContext context) {
+        context.check();
+        if (storage == null || concurrency == null) throw failure("WAL-backed writes require storage and CCM");
+        if (concurrency.getState(new TxId(context.txId)) != TransactionState.ACTIVE) throw failure("Write requires an active transaction");
+    }
+
+    public void applySchemaChange(SchemaChange change, ExecutionContext context, java.util.function.LongConsumer apply) {
+        requireWalContext(context);
+        context.requireGrant("__catalog__", AccessMode.WRITE);
+        for (SchemaImage image : change.before()) context.requireGrant(image.tableName(), AccessMode.WRITE);
+        for (SchemaImage image : change.after()) context.requireGrant(image.tableName(), AccessMode.WRITE);
+        SchemaChangeRecord record = new SchemaChangeRecord(context.nextChangeId(), new TxId(context.txId), change);
+        WritePermit permit = concurrency.authorizeSchemaChange(record);
+        requirePermit(record.id(), permit);
+        try (WriteLease lease = concurrency.acquireApplyLease(permit)) {
+            Objects.requireNonNull(lease);
+            context.check();
+            apply.accept(permit.lsn().value());
+            concurrency.confirmApplied(record.id());
+        }
+    }
+
     public Rid insert(TableId tableId, Row row, ExecutionContext context) {
-        if (storage == null) throw failure("Storage manager is not initialized in MutationCoordinator");
+        requireWalContext(context);
         AccessGrant writeGrant = context.requireGrant(tableId, AccessMode.WRITE);
         Row values = storage.getSchema(tableId).validate(row);
         enforceInsertOrUpdateConstraints(tableId, values, null, context);
@@ -59,7 +85,7 @@ public class MutationCoordinator {
     }
 
     public boolean update(TableId tableId, StoredRecord before, Row after, ExecutionContext context) {
-        if (storage == null) throw failure("Storage manager is not initialized in MutationCoordinator");
+        requireWalContext(context);
         context.requireGrant(tableId, AccessMode.WRITE);
         Row values = storage.getSchema(tableId).validate(after);
         if (before.row().equals(values)) return false;
@@ -75,6 +101,7 @@ public class MutationCoordinator {
     }
 
     public void delete(TableId tableId, StoredRecord before, ExecutionContext context) {
+        requireWalContext(context);
         context.requireGrant(tableId, AccessMode.WRITE);
         enforceParentReferenceProtection(tableId, before.row(), null, context);
         apply(new ChangeRecord(context.nextChangeId(), new TxId(context.txId), new DataChange(ChangeOperation.DELETE,
@@ -89,25 +116,20 @@ public class MutationCoordinator {
     }
 
     private void apply(ChangeRecord change, ExecutionContext context) {
-        context.check();
-        if (concurrency != null) {
-            if (concurrency.getState(new TxId(context.txId)) != TransactionState.ACTIVE) {
-                throw failure("Write requires an active transaction");
-            }
-            WritePermit permit = concurrency.authorizeChange(change);
-            if (!change.id().equals(permit.changeId())) {
-                throw failure("Mismatched write permit");
-            }
-            try (WriteLease lease = concurrency.acquireApplyLease(permit)) {
-                Objects.requireNonNull(lease);
-                context.check();
-                if (storage != null) {
-                    storage.applyChange(change, permit);
-                }
-                concurrency.confirmApplied(change.id());
-            }
-        } else if (storage != null) {
-            storage.applyChange(change, new WritePermit(change.id(), new Lsn(0)));
+        requireWalContext(context);
+        WritePermit permit = concurrency.authorizeChange(change);
+        requirePermit(change.id(), permit);
+        try (WriteLease lease = concurrency.acquireApplyLease(permit)) {
+            Objects.requireNonNull(lease);
+            context.check();
+            storage.applyChange(change, permit);
+            concurrency.confirmApplied(change.id());
+        }
+    }
+
+    private static void requirePermit(ChangeId id, WritePermit permit) {
+        if (permit == null || !id.equals(permit.changeId()) || permit.lsn() == null || permit.lsn().value() <= 0) {
+            throw failure("Invalid WAL write permit");
         }
     }
 
@@ -115,6 +137,15 @@ public class MutationCoordinator {
         if (storage != null) {
             storage.releaseReservation(tableId, rid, txId);
         }
+    }
+
+    private TableSchema requireTableSchema(TableId tableId) {
+        TableSchema schema = storage.getTableSchema(tableId);
+        if (schema == null) {
+            throw new QpException(new ErrorInfo(ErrorCode.IO_ERROR, ComponentType.SM,
+                    "Storage manager returned no schema for table '" + tableId.value() + "'", Optional.empty()));
+        }
+        return schema;
     }
 
     private void enforceInsertOrUpdateConstraints(
@@ -125,15 +156,7 @@ public class MutationCoordinator {
         if (storage == null) {
             return;
         }
-        TableSchema tableSchema;
-        try {
-            tableSchema = storage.getTableSchema(tableId);
-        } catch (RuntimeException e) {
-            return;
-        }
-        if (tableSchema == null) {
-            return;
-        }
+        TableSchema tableSchema = requireTableSchema(tableId);
         Schema qpSchema = Schema.fromTableSchema(tableSchema);
 
         if (!tableSchema.primaryKey().isEmpty()) {
@@ -166,7 +189,7 @@ public class MutationCoordinator {
 
         for (ForeignKeySpec fk : tableSchema.foreignKeys()) {
             TableId refTableId = new TableId(fk.referencedTable());
-            TableSchema refTableSchema = storage.getTableSchema(refTableId);
+            TableSchema refTableSchema = requireTableSchema(refTableId);
             Schema refQpSchema = Schema.fromTableSchema(refTableSchema);
             List<Integer> localOffsets = fk.columnNames().stream()
                     .map(col -> qpSchema.findColumnOffset(null, col))
@@ -219,30 +242,21 @@ public class MutationCoordinator {
         if (storage == null) {
             return;
         }
-        List<String> allTables;
-        try {
-            allTables = storage.listTables();
-        } catch (RuntimeException e) {
+        List<String> allTables = storage.listTables();
+        if (allTables == null) {
+            throw new QpException(new ErrorInfo(ErrorCode.IO_ERROR, ComponentType.SM,
+                    "Storage manager returned no table list", Optional.empty()));
+        }
+        if (allTables.isEmpty()) {
             return;
         }
-        if (allTables == null || allTables.isEmpty()) {
-            return;
-        }
-        TableSchema parentSchema;
-        try {
-            parentSchema = storage.getTableSchema(parentTableId);
-        } catch (RuntimeException e) {
-            return;
-        }
-        if (parentSchema == null) {
-            return;
-        }
+        TableSchema parentSchema = requireTableSchema(parentTableId);
         Schema parentQpSchema = Schema.fromTableSchema(parentSchema);
 
         for (String childTableName : allTables) {
             TableId childTableId = new TableId(childTableName);
-            TableSchema childSchema = storage.getTableSchema(childTableId);
-            if (childSchema == null || childSchema.foreignKeys().isEmpty()) {
+            TableSchema childSchema = requireTableSchema(childTableId);
+            if (childSchema.foreignKeys().isEmpty()) {
                 continue;
             }
             Schema childQpSchema = Schema.fromTableSchema(childSchema);

@@ -20,6 +20,7 @@ import sqlike.frm.maintenance.WalRecoveryLog;
 import sqlike.frm.port.CcmPort;
 import sqlike.frm.port.RollbackPort;
 import sqlike.frm.port.SmPort;
+import sqlike.frm.recovery.RecoveryException;
 import sqlike.frm.recovery.RecoveryManager;
 import sqlike.frm.rollback.RollbackManager;
 import sqlike.shared.DataChange;
@@ -27,6 +28,8 @@ import sqlike.shared.ErrorCode;
 import sqlike.shared.RecoveryResult;
 import sqlike.shared.RecoveryTarget;
 import sqlike.shared.RecoveryTargetKind;
+import sqlike.shared.SchemaChange;
+import sqlike.shared.SchemaImage;
 
 /**
  * Single entry point of FRM (FR1, PRD v1.0 §3.5). Validates the request, checks the lifecycle
@@ -122,6 +125,23 @@ public class FailureRecoveryManager
         return logged("logChange(" + txId + ")", () -> logManager.logChange(txId, change));
     }
 
+    /**
+     * Logs a DDL change (PRD v1.0 §3.5). QP reaches this through CCM's {@code requestSchemaWrite},
+     * so the returned LSN is the one SM stamps on the catalog page it writes.
+     *
+     * <p>Undo is not supported yet: FR3 rejects the rollback of a transaction holding a
+     * SCHEMA_CHANGE with {@code UNSUPPORTED_OPERATION}, because {@code SmPort} has no
+     * {@code restoreSchema}. The record is written anyway, so recovery and the log view see the
+     * DDL, and the caller finds out at rollback instead of silently losing the change.
+     */
+    @Override
+    public long logSchemaChange(long txId, SchemaChange change) {
+        requireReady("logSchemaChange");
+        requireTxId(txId);
+        validateSchemaChange(change);
+        return logged("logSchemaChange(" + txId + ")", () -> logManager.logSchemaChange(txId, change));
+    }
+
     /** Returns only after COMMIT and every earlier record of the transaction are durable. */
     @Override
     public void logCommit(long txId) {
@@ -208,36 +228,29 @@ public class FailureRecoveryManager
             throw new FrmException(ErrorCode.INVALID_STATE, "recovery is already running");
         }
         state = RecoveryState.RUNNING;
-        RecoveryResult result;
         try {
-            result = recoveryManager.recover();
-        } catch (Exception error) {
-            state = RecoveryState.FAILED;
-            throw new FrmException(ErrorCode.RECOVERY_FAILURE,
-                    "crash recovery failed: " + error.getMessage(), error);
-        }
-        if (result == null) {
-            state = RecoveryState.FAILED;
-            throw new FrmException(ErrorCode.RECOVERY_FAILURE, "crash recovery returned no result");
-        }
-        // FR5 only reads the active epoch; after PITR the old txIds live in archived epochs,
-        // so take FR2's max over every epoch too (txIds must never be reused).
-        long lastTxId = Math.max(Math.max(0L, result.lastTxId()), logManager.getMaxTxId());
-        // PRD §14: one generator, logical timestamp = txId (not the wall-clock time of the log).
-        lastRecovery = new RecoveryResult(lastTxId, lastTxId,
-                Math.max(0L, result.lastRecoveredLSN()), result.checkpointLSN());
-        try {
+            RecoveryResult result = recoveryManager.recover();
+            if (result == null) {
+                throw new IllegalStateException("recovery returned no result");
+            }
+
+            // FR5 only reads the active epoch; after PITR the old txIds live in archived epochs,
+            // so take FR2's max over every epoch too (txIds must never be reused).
+            long lastTxId = Math.max(Math.max(0L, result.lastTxId()), logManager.getMaxTxId());
+            // PRD §14: one generator, logical timestamp = txId (not the wall-clock time of the log).
+            lastRecovery = new RecoveryResult(lastTxId, lastTxId,
+                    Math.max(0L, result.lastRecoveredLSN()), result.checkpointLSN());
+
             ensureBaselineSnapshot();
+            if (!config.checkpointInterval().isZero()) {
+                maintenance.startPeriodicCheckpoints();
+            }
+            state = RecoveryState.READY;
+            return lastRecovery;
         } catch (RuntimeException error) {
             state = RecoveryState.FAILED;
-            throw new FrmException(ErrorCode.RECOVERY_FAILURE,
-                    "cannot create the baseline snapshot for PITR: " + error.getMessage(), error);
+            throw recoveryFailure(error);
         }
-        state = RecoveryState.READY;
-        if (!config.checkpointInterval().isZero()) {
-            maintenance.startPeriodicCheckpoints();
-        }
-        return lastRecovery;
     }
 
     // ------------------------------------------------------------------ maintenance (FR4)
@@ -367,6 +380,37 @@ public class FailureRecoveryManager
         maintenance.stopPeriodicCheckpoints();
     }
 
+    private static FrmException recoveryFailure(RuntimeException error) {
+        RecoveryException phaseFailure = findCause(error, RecoveryException.class);
+        WalException walFailure = findCause(error, WalException.class);
+        FrmException frmFailure = findCause(error, FrmException.class);
+        ErrorCode code = walFailure != null
+                || (frmFailure != null && frmFailure.getCode() == ErrorCode.WAL_FAILURE)
+                ? ErrorCode.WAL_FAILURE
+                : ErrorCode.RECOVERY_FAILURE;
+
+        String message = "crash recovery failed";
+        if (phaseFailure != null) {
+            message += " during " + phaseFailure.getRecoveryError();
+        }
+        if (error.getMessage() != null) {
+            message += ": " + error.getMessage();
+        }
+        boolean commitUnknown = walFailure != null
+                ? walFailure.isCommitUnknown()
+                : frmFailure != null && frmFailure.isCommitUnknown();
+        return new FrmException(code, message, error, commitUnknown);
+    }
+
+    private static <T extends Throwable> T findCause(Throwable error, Class<T> type) {
+        for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+            if (type.isInstance(cause)) {
+                return type.cast(cause);
+            }
+        }
+        return null;
+    }
+
     private boolean hasLogRecord(long txId, LogType type) {
         for (LogRecord record : logManager.readLogs(txId)) {
             if (record.type() == type) {
@@ -430,6 +474,33 @@ public class FailureRecoveryManager
                 || (!after && !change.after().values().isEmpty())) {
             throw new FrmException(ErrorCode.INVALID_VALUE,
                     "an absent RecordImage must have no values: " + change);
+        }
+    }
+
+    /**
+     * PRD §4: a schema change is a list of before/after image pairs, one pair per table. The
+     * record itself enforces matching unique table names, so this only has to reject what a
+     * caller can still get wrong before the record is built.
+     */
+    private static void validateSchemaChange(SchemaChange change) {
+        if (change == null || change.before() == null || change.after() == null) {
+            throw new FrmException(ErrorCode.INVALID_VALUE, "incomplete SchemaChange: " + change);
+        }
+        if (change.before().isEmpty() || change.before().size() != change.after().size()) {
+            throw new FrmException(ErrorCode.INVALID_VALUE,
+                    "SchemaChange needs one before/after image per table: " + change);
+        }
+        for (int i = 0; i < change.before().size(); i++) {
+            SchemaImage before = change.before().get(i);
+            SchemaImage after = change.after().get(i);
+            if (before == null || after == null) {
+                throw new FrmException(ErrorCode.INVALID_VALUE,
+                        "SchemaChange has an empty image at index " + i + ": " + change);
+            }
+            if (before.schema().isEmpty() && after.schema().isEmpty()) {
+                throw new FrmException(ErrorCode.INVALID_VALUE, "schema change for "
+                        + before.tableName() + " has no schema on either side: " + change);
+            }
         }
     }
 

@@ -7,6 +7,8 @@ public record IndexCondition(
         Value key,
         Optional<Value> upperBound,
         boolean lowerInclusive,
-        boolean upperInclusive
-) {
+        boolean upperInclusive) {
+    public IndexCondition {
+        upperBound = upperBound == null ? Optional.empty() : upperBound;
+    }
 }

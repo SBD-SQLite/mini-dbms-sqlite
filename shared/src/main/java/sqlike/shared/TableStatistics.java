@@ -7,6 +7,8 @@ public record TableStatistics(
         long blockCount,
         double averageRecordSize,
         int blockingFactor,
-        Map<String, Long> distinctCounts
-) {
+        Map<String, Long> distinctCounts) {
+    public TableStatistics {
+        distinctCounts = distinctCounts == null ? Map.of() : Map.copyOf(distinctCounts);
+    }
 }

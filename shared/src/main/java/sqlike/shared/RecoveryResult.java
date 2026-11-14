@@ -6,6 +6,6 @@ public record RecoveryResult(
         long lastTxId,
         long lastTimestamp,
         long lastRecoveredLSN,
-        Optional<Long> checkpointLSN
-) {
+        Optional<Long> checkpointLSN) {
 }
+

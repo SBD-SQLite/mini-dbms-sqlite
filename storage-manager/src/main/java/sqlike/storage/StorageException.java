@@ -1,6 +1,6 @@
 package sqlike.storage;
 
-public class StorageException extends Exception {
+public class StorageException extends RuntimeException {
     private final StorageErrorCode code;
 
     public StorageException(StorageErrorCode code, String message) {

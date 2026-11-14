@@ -276,7 +276,7 @@ public final class LogManager implements IWalDurability, CheckpointLogPort, Auto
             case BEGIN -> "<" + tx + " start>";
             case COMMIT -> "<" + tx + " commit>";
             case ABORT -> "<" + tx + " abort>";
-            case CHECKPOINT -> "<checkpoint " + activeTransactionsBefore(record.lsn()) + ">";
+            case CHECKPOINT -> "<checkpoint " + activeTransactionsBefore(record.lsn()) + "> " + record.checkpoint().orElseThrow();
             case SCHEMA_CHANGE -> "<" + tx + ", schema, " + record.schemaChange().orElseThrow() + ">";
             case COMPENSATION -> {
                 if (record.change().isPresent()) {

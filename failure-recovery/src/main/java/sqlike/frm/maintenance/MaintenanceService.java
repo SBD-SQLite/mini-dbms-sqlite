@@ -16,6 +16,7 @@ import sqlike.frm.checkpoint.CheckpointScheduler;
 import sqlike.frm.checkpoint.SnapshotCatalog;
 import sqlike.frm.pitr.HistoricalLogPort;
 import sqlike.frm.pitr.HistoricalRecoveryPlan;
+import sqlike.frm.pitr.PitrMarker;
 import sqlike.frm.pitr.PointInTimeRecovery;
 import sqlike.frm.port.CcmPort;
 import sqlike.frm.port.SmPort;
@@ -30,6 +31,7 @@ import sqlike.shared.RecoveryTarget;
 public class MaintenanceService implements AutoCloseable {
 
     public static final String SNAPSHOT_CATALOG_FILE = "snapshots.catalog";
+    public static final String PITR_MARKER_FILE = "pitr.inprogress";
 
     public record PeriodicFailure(Instant at, RuntimeException error) {
     }
@@ -61,7 +63,9 @@ public class MaintenanceService implements AutoCloseable {
                 storage, concurrency, checkpointLog, snapshotCatalog, idleTimeoutMs, maintenanceGate);
         this.pointInTimeRecovery = new PointInTimeRecovery(
                 storage, concurrency, historicalLog, snapshotCatalog, checkpointManager,
-                idleTimeoutMs, maintenanceGate);
+                idleTimeoutMs, maintenanceGate,
+                // No catalog file means an in-memory setup, so no marker is needed.
+                catalogPath == null ? null : new PitrMarker(catalogPath.resolveSibling(PITR_MARKER_FILE)));
         this.scheduler = new CheckpointScheduler(
                 Objects.requireNonNull(periodicInterval, "periodicInterval"), this::periodicCheckpoint);
     }
@@ -84,6 +88,16 @@ public class MaintenanceService implements AutoCloseable {
 
     public HistoricalRecoveryPlan recoverTo(RecoveryTarget target) {
         return pointInTimeRecovery.recoverTo(target);
+    }
+
+    /** Completes an interrupted point-in-time recovery; call at startup before crash recovery. */
+    public Optional<HistoricalRecoveryPlan> resumeInterruptedRecovery() {
+        return pointInTimeRecovery.resumeInterrupted();
+    }
+
+    /** True while a point-in-time restore is flagged as in progress. */
+    public boolean isRecoveryInterrupted() {
+        return pointInTimeRecovery.isInterrupted();
     }
 
     public void startPeriodicCheckpoints() {

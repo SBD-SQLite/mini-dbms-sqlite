@@ -10,5 +10,6 @@ public enum StorageErrorCode {
     UNSUPPORTED_OPERATION,
     CORRUPTED_DATA,
     IO_ERROR,
-    WAL_FAILURE
+    WAL_FAILURE,
+    BUFFER_FULL
 }

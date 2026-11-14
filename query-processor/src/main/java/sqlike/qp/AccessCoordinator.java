@@ -17,6 +17,11 @@ public final class AccessCoordinator {
         return txId != null && concurrency.getState(txId) == TransactionState.ACTIVE;
     }
 
+    public void acquireCatalog(boolean write, ExecutionContext context) {
+        context.addGrant(acquireOne(ResourceKey.table(new TableId("__catalog__")),
+                write ? AccessMode.WRITE : AccessMode.READ, context));
+    }
+
     /** Acquire planned grants before opening operators, in table order with WRITE taking precedence. */
     public void acquireAll(PreparedStatement statement, ExecutionContext context) {
         if (statement == null || statement.accesses() == null || statement.accesses().isEmpty()) {
@@ -24,22 +29,18 @@ public final class AccessCoordinator {
         }
 
         Map<TableId, AccessMode> mergedByTable = new TreeMap<>(Comparator.comparing(TableId::value));
-        Map<TableId, ResourceKey> resourceByTable = new LinkedHashMap<>();
 
         for (AccessRequest request : statement.accesses()) {
             TableId table = request.resource().tableId();
             mergedByTable.merge(table, request.mode(), (oldMode, newMode) ->
                     (oldMode == AccessMode.WRITE || newMode == AccessMode.WRITE) ? AccessMode.WRITE : AccessMode.READ
             );
-            resourceByTable.merge(table, request.resource(), (oldRes, newRes) ->
-                    oldRes.rid().isEmpty() ? oldRes : newRes
-            );
         }
 
         for (Map.Entry<TableId, AccessMode> entry : mergedByTable.entrySet()) {
             TableId table = entry.getKey();
             AccessMode mode = entry.getValue();
-            ResourceKey resource = resourceByTable.getOrDefault(table, ResourceKey.table(table));
+            ResourceKey resource = ResourceKey.table(table);
             context.addGrant(acquireOne(resource, mode, context));
         }
     }
