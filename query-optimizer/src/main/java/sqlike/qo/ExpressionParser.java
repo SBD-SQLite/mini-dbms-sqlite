@@ -1,5 +1,6 @@
 package sqlike.qo;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import sqlike.shared.*;
@@ -25,7 +26,7 @@ public class ExpressionParser {
         if (ts.peek().isKeyword(Keyword.IN)) {
             Token in = ts.next();
             if (ts.peek().isSymbol("(") && ts.peek(1).isKeyword(Keyword.SELECT))
-                throw QoErrors.unsupported("subqueries are not part of the agreed contract", in.offset());
+                return subquery(ts, SubqueryType.IN, List.of(expression));
             throw QoErrors.unsupported("IN predicates are not part of the agreed contract", in.offset());
         }
         ExpressionOperator operator = comparisonOperator(ts.peek());
@@ -84,9 +85,9 @@ public class ExpressionParser {
     private Expression parseAtom(TokenStream ts) {
         Token token = ts.peek();
         if (ts.peek().isSymbol("(") && ts.peek(1).isKeyword(Keyword.SELECT))
-            throw QoErrors.unsupported("subqueries are not part of the agreed contract", token.offset());
-        if (token.isKeyword(Keyword.EXISTS))
-            throw QoErrors.unsupported("subqueries are not part of the agreed contract", token.offset());
+            return subquery(ts, SubqueryType.SCALAR, List.of());
+        if (ts.matchKeyword(Keyword.EXISTS))
+            return subquery(ts, SubqueryType.EXISTS, List.of());
         if (ts.matchSymbol("(")) {
             Expression expression = parseExpression(ts);
             ts.expectSymbol(")");
@@ -118,6 +119,27 @@ public class ExpressionParser {
             return new Expression(ExpressionKind.COLUMN, Optional.empty(), Optional.of(column), Optional.empty(), List.of());
         }
         throw QoErrors.syntax("expected literal, column reference, or parenthesized expression", token.offset());
+    }
+
+    private Expression subquery(TokenStream ts, SubqueryType type, List<Expression> operands) {
+        ts.expectSymbol("(");
+        List<Token> tokens = new ArrayList<>();
+        int depth = 0;
+        while (!ts.isAtEnd()) {
+            Token token = ts.peek();
+            if (token.isSymbol(")") && depth == 0) break;
+            if (token.isSymbol(";")) throw ts.unexpected("semicolon is not allowed inside a subquery");
+            if (token.isSymbol("(")) depth++;
+            else if (token.isSymbol(")")) depth--;
+            tokens.add(ts.next());
+        }
+        if (ts.isAtEnd()) throw ts.unexpected("expected ')' after subquery");
+        tokens.add(new Token(TokenType.EOF, "", ts.peek().offset(), 0, null));
+        PlanNode root = new SelectParser(this).parseSelect(new TokenStream(tokens)).root().orElseThrow();
+        ts.expectSymbol(")");
+        // Correlation requires name resolution against the enclosing scope in the binder.
+        return new Expression(ExpressionKind.SUBQUERY, Optional.empty(), Optional.empty(), Optional.empty(),
+                operands, Optional.of(new SubquerySpec(type, root, false)));
     }
 
     private double parseFiniteFloat(Token token) {
