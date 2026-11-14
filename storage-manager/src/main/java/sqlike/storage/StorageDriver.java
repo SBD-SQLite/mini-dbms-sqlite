@@ -100,6 +100,7 @@ public final class StorageDriver {
             var stats = storage.getStatistics(table);
             check(stats.recordCount() == records.size() && stats.blockCount() > 0 && stats.blockingFactor() > 0,
                     "Invalid table statistics for " + table);
+            check(stats.blockCount() < records.size(), "Sample records did not share pages for " + table);
         }
     }
 
@@ -109,11 +110,17 @@ public final class StorageDriver {
         List<Value> values = List.of(integer(1000), text(DataType.VARCHAR, "Driver category"), text(DataType.CHAR, "TEST"));
 
         InsertReservation cancelled = storage.reserveInsert(table, values);
+        InsertReservation other = storage.reserveInsert(table, values);
+        check(cancelled.rid().pageId().equals(other.rid().pageId()) && !cancelled.rid().equals(other.rid()),
+                "Active reservations did not get distinct slots on the same page");
         check(storage.fetch(table, cancelled.rid()).isEmpty(), "Reservation was visible before insert");
         storage.releaseReservation(cancelled);
         expectError(StorageErrorCode.INVALID_RESERVATION, () -> storage.insert(cancelled, ++lsn));
 
         InsertReservation reservation = storage.reserveInsert(table, values);
+        check(reservation.rid().equals(cancelled.rid()), "Released slot was not reused");
+        storage.releaseReservation(cancelled);
+        storage.releaseReservation(other);
         RID rid = storage.insert(reservation, ++lsn);
         check(rid.equals(reservation.rid()), "Insert changed the reserved RID");
         check(storage.fetch(table, rid).equals(Optional.of(new Record(rid, values))), "Inserted record differs");
@@ -272,7 +279,7 @@ public final class StorageDriver {
             CatalogManager catalog = new CatalogManager(directory.resolve("catalog.bin"));
             catalog.load();
             blocks = new BlockManager(directory);
-            buffer = new BufferPoolManager(blocks, wal, new LRUReplacementPolicy(), 16);
+            buffer = new BufferPoolManager(blocks, wal, new LRUReplacementPolicy(), 4);
             RecordSerializer serializer = new RecordSerializer();
             RecordManager records = new RecordManager(buffer, serializer, catalog);
             IndexManager indexes = new IndexManager(catalog, records, buffer, serializer, () -> ++lsn);
