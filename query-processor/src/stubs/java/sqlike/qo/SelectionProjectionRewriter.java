@@ -159,15 +159,23 @@ public final class SelectionProjectionRewriter {
             else return null;
         }
         for (String name : commonColumns) {
-            ColumnRef common = ColumnRef.of(null, name);
-            leftNeeded.add(common);
-            rightNeeded.add(common);
+            leftNeeded.add(commonColumnRef(join.children().get(0), name));
+            rightNeeded.add(commonColumnRef(join.children().get(1), name));
         }
 
         if (leftNeeded.isEmpty() || rightNeeded.isEmpty()) return null;
         PlanNode left = pushProjection(join.children().get(0), List.copyOf(leftNeeded));
         PlanNode right = pushProjection(join.children().get(1), List.copyOf(rightNeeded));
         return copyUnary(outerProject, copyBinary(join, left, right));
+    }
+
+    private ColumnRef commonColumnRef(PlanNode input, String name) {
+        var matches = input.outputColumns().stream()
+                .filter(column -> column.name().equalsIgnoreCase(name)
+                        || column.source().map(source -> source.columnName().equalsIgnoreCase(name)).orElse(false))
+                .toList();
+        if (matches.size() == 1 && matches.get(0).source().isPresent()) return matches.get(0).source().get();
+        return ColumnRef.of(null, name);
     }
 
     private boolean isAvailableAboveProject(Expression expression, List<ColumnRef> projection) {

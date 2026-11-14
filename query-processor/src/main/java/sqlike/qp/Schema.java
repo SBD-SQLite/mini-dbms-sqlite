@@ -112,37 +112,21 @@ public final class Schema {
                 ? null
                 : targetTable.trim().toLowerCase(Locale.ROOT);
 
-        if (normTable != null) {
-            for (int i = 0; i < columns.size(); i++) {
-                ColumnSchema col = columns.get(i);
-                if (matchesColumnName(col.name(), normTable, normCol)) {
-                    Set<String> owners = columnTableNames.get(i);
-                    if (owners.contains(normTable)
-                            || (tableName.isPresent() && tableName.get().equalsIgnoreCase(normTable))) {
-                        return i;
-                    }
-                }
-            }
-            boolean anyOwnerKnown = tableName.isPresent()
-                    || columnTableNames.stream().anyMatch(s -> !s.isEmpty());
-            if (!anyOwnerKnown) {
-                for (int i = 0; i < columns.size(); i++) {
-                    if (matchesColumnName(columns.get(i).name(), normTable, normCol)) {
-                        return i;
-                    }
-                }
-            }
-            throw new IllegalArgumentException(
-                    "Column not found in schema: " + targetTable + "." + targetColumn);
-        }
-
+        boolean anyOwnerKnown = tableName.isPresent()
+                || columnTableNames.stream().anyMatch(owners -> !owners.isEmpty());
+        int found = -1;
         for (int i = 0; i < columns.size(); i++) {
-            ColumnSchema col = columns.get(i);
-            if (matchesColumnName(col.name(), null, normCol)) {
-                return i;
+            if (matchesColumnName(columns.get(i).name(), normTable, normCol)
+                    && (normTable == null || !anyOwnerKnown || columnTableNames.get(i).contains(normTable))) {
+                if (found >= 0) {
+                    throw new QpException(sqlike.shared.ErrorCode.SEMANTIC_ERROR, "Ambiguous column in schema: " + targetColumn);
+                }
+                found = i;
             }
         }
-        throw new IllegalArgumentException("Column not found in schema: " + targetColumn);
+        if (found >= 0) return found;
+        throw new IllegalArgumentException("Column not found in schema: "
+                + (normTable == null ? "" : targetTable + ".") + targetColumn);
     }
 
     private static boolean matchesColumnName(String schemaColName, String targetTable, String targetCol) {

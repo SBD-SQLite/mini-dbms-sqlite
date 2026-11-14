@@ -66,6 +66,7 @@ public final class Qp5AcceptanceTest {
     }
 
     private static void runQoIntegrationChecks() {
+        test("QP-05/QP-08/QP-09/QP-13 QO layouts and index access", Qp5AcceptanceTest::qoOperatorLayouts);
         test("QP-03 QO plans execute through the public QP facade", Qp5AcceptanceTest::qoCorePipeline);
         test("QP-01 QO errors retain code, component, position, and transaction", Qp5AcceptanceTest::qoErrorsPreserved);
     }
@@ -73,6 +74,40 @@ public final class Qp5AcceptanceTest {
     private static void reportResults() {
         System.out.println("RESULT: " + passed + " passed, " + failed + " failed");
         if (failed > 0) throw new AssertionError("Acceptance checks failed");
+    }
+
+    private static void qoOperatorLayouts() throws Exception {
+        var runtime = StubQpRuntime.open(Files.createTempDirectory("qp-qo-layouts-"), QpConfiguration.defaults());
+        runtime.storage.define(new TableSchema("3", "grades", List.of(
+                new ColumnSchema("id", DataType.INTEGER, Optional.empty()),
+                new ColumnSchema("name", DataType.VARCHAR, Optional.of(30)),
+                new ColumnSchema("score", DataType.INTEGER, Optional.empty()))));
+        var loader = new SessionState();
+        assertAffected(1, runtime.runner.execute(loader, "INSERT INTO grades VALUES (1, 'Ani', 9);"));
+        assertAffected(1, runtime.runner.execute(loader, "INSERT INTO grades VALUES (2, 'Other', 8);"));
+        runtime.recover();
+        var processor = runtime.processor; var session = processor.openSession();
+        try {
+            var natural = processor.execute("SELECT * FROM student NATURAL JOIN grades ORDER BY student.id;", session);
+            assertEquals(ResultKind.ROWS, natural.kind());
+            assertEquals(List.of("id", "name", "gpa", "score"), natural.columns().stream().map(ResultColumn::name).toList());
+            assertEquals(List.of(List.of(1, "Ani", 3.5, 9)), natural.rows().stream()
+                    .map(row -> row.stream().map(value -> payload(value)).toList()).toList());
+            var hiddenSort = processor.execute("SELECT name FROM student ORDER BY gpa DESC;", session);
+            assertEquals(ResultKind.ROWS, hiddenSort.kind());
+            assertEquals(List.of("Cici", "Ani", "Budi"), hiddenSort.rows().stream()
+                    .map(row -> row.get(0).textValue().orElseThrow()).toList());
+            assertEquals(ResultKind.AFFECTED_ROWS, processor.execute("CREATE INDEX idx_layout_id ON student (id);", session).kind());
+            var begin = processor.execute("BEGIN;", session);
+            long tx = begin.transaction().orElseThrow().txId();
+            var index = sqlike.qo.PlanNodes.indexScan("student", "idx_layout_id",
+                    new IndexCondition(IndexOperator.EQ, sqlike.qo.Literals.integer(2), Optional.empty(), true, true));
+            var indexed = processor.executePlan(new QueryPlan(index, 0), tx);
+            assertEquals(ResultKind.ROWS, indexed.kind());
+            assertEquals(List.of(List.of(2, "Budi", 3.2)), indexed.rows().stream()
+                    .map(row -> row.stream().map(value -> payload(value)).toList()).toList());
+            assertEquals(ResultKind.TRANSACTION, processor.execute("ABORT;", session).kind());
+        } finally { processor.closeSession(session.sessionId()); processor.shutdown(); }
     }
 
     private static void qoCorePipeline() throws Exception {

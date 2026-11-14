@@ -29,7 +29,12 @@ public final class StorageAdapter implements IStorageManager {
     }
     @Override public Schema getSchema(TableId table) {
         try {
-            return Schema.fromTableSchema(storage.getSchema(table.value()));
+            var metadata = storage.getSchema(table.value());
+            if (metadata == null) {
+                throw new QpException(new sqlike.shared.ErrorInfo(sqlike.shared.ErrorCode.IO_ERROR,
+                        sqlike.shared.ComponentType.SM, "Missing schema for table: " + table.value(), Optional.empty()));
+            }
+            return Schema.fromTableSchema(metadata);
         } catch (StorageException e) {
             throw failure(e.getMessage());
         }
