@@ -10,12 +10,12 @@ import static sqlike.qp.port.QpContracts.failure;
  * Execution context carrying transaction ID, session info, grants, and runtime state during query execution.
  */
 public final class ExecutionContext {
-    public final long txId;
-    public final Optional<String> sessionId;
-    public final boolean implicit;
     private final AtomicLong sequence;
     private final CancellationToken cancellation;
     private final Map<ResourceKey, AccessGrant> grants = new ConcurrentHashMap<>();
+    public final long txId;
+    public final Optional<String> sessionId;
+    public final boolean implicit;
 
     public ExecutionContext(long txId, Optional<String> sessionId) {
         this(txId, sessionId, true, new AtomicLong(), new CancellationToken());
@@ -60,6 +60,9 @@ public final class ExecutionContext {
     }
 
     public void check() {
+        if (Thread.currentThread().isInterrupted()) {
+            throw failure("Execution interrupted");
+        }
         if (cancellation != null) {
             cancellation.check();
         }
@@ -86,10 +89,6 @@ public final class ExecutionContext {
         check();
         ResourceKey key = ResourceKey.table(new TableId(tableName));
         AccessGrant grant = grants.get(key);
-        if (grant == null && grants.isEmpty()) {
-            grant = new AccessGrant(new TxId(txId), key, mode);
-            grants.put(key, grant);
-        }
         if (grant == null || (mode == AccessMode.WRITE && grant.mode() != AccessMode.WRITE)) {
             throw failure("Missing " + mode + " grant for " + tableName);
         }

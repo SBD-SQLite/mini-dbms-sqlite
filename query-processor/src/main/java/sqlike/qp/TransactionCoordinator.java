@@ -1,6 +1,10 @@
 package sqlike.qp;
 
 import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicLong;
 import sqlike.qp.port.QpContracts.*;
 import static sqlike.qp.port.QpContracts.failure;
 
@@ -9,10 +13,17 @@ public final class TransactionCoordinator {
 
     private final IConcurrencyControl concurrency;
     private final QpConfiguration configuration;
+    private final IStorageManager storage;
+    private final ConcurrentMap<Long, AtomicLong> sequences = new ConcurrentHashMap<>();
 
     public TransactionCoordinator(IConcurrencyControl concurrency, QpConfiguration configuration) {
+        this(concurrency, configuration, null);
+    }
+
+    public TransactionCoordinator(IConcurrencyControl concurrency, QpConfiguration configuration, IStorageManager storage) {
         this.concurrency = Objects.requireNonNull(concurrency);
         this.configuration = Objects.requireNonNull(configuration);
+        this.storage = storage;
     }
 
     public TxId beginExplicit(SessionState session) {
@@ -31,13 +42,22 @@ public final class TransactionCoordinator {
             session.attachTransaction(concurrency.begin(session.sessionId()).value(), false);
         }
         TxId tx = new TxId(session.getCurrentTxId().orElseThrow());
-        return new ExecutionContext(session.sessionId(), tx, !session.isExplicitTransaction(), session.sequence, concurrency.getCancellationToken(tx));
+        return new ExecutionContext(session.sessionId(), tx, !session.isExplicitTransaction(), sequences.computeIfAbsent(tx.value(), id -> new AtomicLong()), concurrency.getCancellationToken(tx));
+    }
+
+    public ExecutionContext externalContext(long txId) {
+        return new ExecutionContext(txId, Optional.empty(), false,
+                sequences.computeIfAbsent(txId, id -> new AtomicLong()),
+                concurrency.getCancellationToken(new TxId(txId)));
     }
 
     public TransactionState commit(SessionState session) {
         TxId tx = new TxId(session.getCurrentTxId().orElseThrow(() -> failure("No transaction to commit")));
-        if (concurrency.getState(tx) == TransactionState.PARTIALLY_COMMITTED) {
-            return TransactionState.PARTIALLY_COMMITTED;
+        TransactionState previous = concurrency.getState(tx);
+        if (previous == TransactionState.PARTIALLY_COMMITTED) return previous;
+        if (previous == TransactionState.COMMITTED || previous == TransactionState.ABORTED) {
+            clearCompleted(session, previous);
+            return previous;
         }
         TransactionState state = concurrency.commit(tx);
         clearCompleted(session, state);
@@ -46,8 +66,11 @@ public final class TransactionCoordinator {
 
     public TransactionState abort(SessionState session, String reason) {
         TxId tx = new TxId(session.getCurrentTxId().orElseThrow(() -> failure("No transaction to abort")));
-        if (concurrency.getState(tx) == TransactionState.PARTIALLY_COMMITTED) {
-            return TransactionState.PARTIALLY_COMMITTED;
+        TransactionState previous = concurrency.getState(tx);
+        if (previous == TransactionState.PARTIALLY_COMMITTED) return previous;
+        if (previous == TransactionState.COMMITTED || previous == TransactionState.ABORTED) {
+            clearCompleted(session, previous);
+            return previous;
         }
         TransactionState state = concurrency.abort(tx, reason);
         clearCompleted(session, state);
@@ -134,6 +157,8 @@ public final class TransactionCoordinator {
 
     private void clearCompleted(SessionState session, TransactionState state) {
         if (state == TransactionState.COMMITTED || state == TransactionState.ABORTED) {
+            if (storage != null && session.getCurrentTxId().isPresent()) storage.releaseReservations(new TxId(session.getCurrentTxId().orElseThrow()));
+            session.getCurrentTxId().ifPresent(sequences::remove);
             session.clearTransaction();
         }
     }

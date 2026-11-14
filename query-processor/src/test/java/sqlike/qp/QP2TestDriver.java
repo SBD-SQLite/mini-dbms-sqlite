@@ -51,6 +51,7 @@ public class QP2TestDriver {
             testPlanTranslatorRealOperatorsAndExecutors();
             testPlanTranslatorBonusOperatorsAndSubqueries();
             testPlanTranslatorErrorHandling();
+            testProductionPlanBoundaries();
 
             System.out.println("\n--------------------------------------------------");
             System.out.println("RESULT: All " + testsPassed + " / " + testsRun + " tests PASSED successfully!");
@@ -86,6 +87,95 @@ public class QP2TestDriver {
 
     private static void assertFalse(boolean condition, String message) {
         assertTrue(!condition, message);
+    }
+
+    private static void rejects(Runnable action, String message) {
+        try { action.run(); throw new AssertionError(message); }
+        catch (IllegalArgumentException | IllegalStateException | QpException expected) {
+            testsRun++; testsPassed++;
+        }
+    }
+
+    private static void testProductionPlanBoundaries() {
+        System.out.println("[TEST] Production plan and schema boundaries...");
+        var storage = (IStorageManager) java.lang.reflect.Proxy.newProxyInstance(
+                IStorageManager.class.getClassLoader(), new Class<?>[]{IStorageManager.class},
+                (proxy, method, args) -> {
+                    if (method.getName().equals("getSchema")) return null;
+                    throw new AssertionError("Unexpected storage call: " + method.getName());
+                });
+        var translator = new PlanTranslator(storage, null, null, null, null, null, null);
+        var scan = sqlike.qo.PlanNodes.scan("t");
+        try {
+            translator.translateSelect(scan);
+            throw new AssertionError("Missing metadata became an empty scan schema");
+        } catch (QpException expected) {
+            assertEquals(sqlike.shared.ErrorCode.IO_ERROR, expected.getErrorInfo().code(), "Missing metadata is an I/O error");
+        }
+        var adapter = new sqlike.qp.port.StorageAdapter(storage);
+        try {
+            adapter.getSchema(new sqlike.qp.port.QpContracts.TableId("t"));
+            throw new AssertionError("Missing adapter metadata accepted");
+        } catch (QpException expected) {
+            assertEquals(sqlike.shared.ErrorCode.IO_ERROR, expected.getErrorInfo().code(), "Adapter reports missing metadata");
+        }
+        var value = new Value(DataType.INTEGER, Optional.of(1), Optional.empty(), Optional.empty());
+        rejects(() -> translator.translateCommand(sqlike.qo.PlanNodes.insert(
+                new MutationSpec("t", List.of(value), Optional.empty(), Optional.empty()))), "Production DML became a mock");
+        Schema duplicate = Schema.of(List.of(new ColumnSchema("id", DataType.INTEGER, Optional.empty()),
+                new ColumnSchema("id", DataType.INTEGER, Optional.empty())));
+        rejects(() -> duplicate.findColumnOffset(ColumnRef.of(null, "id")), "Ambiguous column chose first slot");
+        try {
+            new ExpressionEvaluator(new ValueComparator()).evaluate(new Expression(ExpressionKind.COLUMN,
+                    Optional.empty(), Optional.of(ColumnRef.of(null, "id")), Optional.empty(), List.of()), Row.of(value, value), duplicate);
+            throw new AssertionError("Ambiguous expression was evaluated");
+        } catch (QpException expected) {
+            assertEquals(sqlike.shared.ErrorCode.SEMANTIC_ERROR, expected.getErrorInfo().code(), "Ambiguity is a semantic error");
+        }
+        Operator rows = new MockOperator(PlanNodeKind.SCAN, duplicate, List.of()) {
+            private boolean emitted;
+            @Override public Optional<RowEnvelope> next() {
+                if (emitted) return Optional.empty();
+                emitted = true;
+                return Optional.of(RowEnvelope.of(Row.of(value,
+                        new Value(DataType.INTEGER, Optional.of(2), Optional.empty(), Optional.empty()))));
+            }
+        };
+        var wildcard = new ProjectOperator(rows, new ProjectSpec(List.of(ColumnRef.of(null, "*"))));
+        assertEquals(List.of(0, 1), wildcard.getOffsets(), "Wildcard preserves distinct physical slots");
+        wildcard.open(ExecutionContext.of(1));
+        assertEquals(List.of(1, 2), wildcard.next().orElseThrow().row().values().stream()
+                .map(v -> v.integerValue().orElseThrow()).toList(), "Wildcard preserves duplicate-name values");
+        wildcard.close();
+        Schema qualified = Schema.of("t", duplicate.columns());
+        rejects(() -> qualified.findColumnOffset(ColumnRef.of("t", "id")), "Qualified ambiguous column chose first slot");
+        var metadata = new sqlike.shared.TableSchema("1", "t", List.of(
+                duplicate.getColumn(0), new ColumnSchema("other", DataType.INTEGER, Optional.empty())));
+        var withSchema = (IStorageManager) java.lang.reflect.Proxy.newProxyInstance(
+                IStorageManager.class.getClassLoader(), new Class<?>[]{IStorageManager.class},
+                (proxy, method, args) -> { if (method.getName().equals("getSchema")) return metadata;
+                    throw new AssertionError("Unexpected storage call"); });
+        var joinTranslator = new PlanTranslator(withSchema, null, null, null, null, null, null);
+        rejects(() -> joinTranslator.translateSelect(sqlike.qo.PlanNodes.join(scan, scan,
+                new JoinSpec(JoinType.NATURAL, Optional.empty(), JoinAlgorithm.BLOCK_NESTED_LOOP, List.of("id")))),
+                "NATURAL JOIN ignored another shared column");
+
+        var validator = new PlanValidator();
+        var indexedScan = new PlanNode(PlanNodeKind.SCAN, List.of(), List.of(), Optional.empty(),
+                Optional.of(new ScanSpec("t", Optional.of("idx"), Optional.empty())), Optional.empty(),
+                List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
+        rejects(() -> validator.validate(indexedScan), "SCAN silently ignored index payload");
+        var missingCondition = new PlanNode(PlanNodeKind.INDEX_SCAN, List.of(), List.of(), Optional.empty(),
+                indexedScan.scan(), Optional.empty(), List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
+        rejects(() -> validator.validate(missingCondition), "INDEX_SCAN omitted condition");
+        rejects(() -> PreparedStatement.of(new QueryPlan(missingCondition, 0)), "Invalid plan reached access collection");
+        var ignoredPredicate = new PlanNode(PlanNodeKind.SCAN, List.of(), List.of(), Optional.empty(), scan.scan(),
+                Optional.of(new Expression(ExpressionKind.LITERAL, Optional.of(value), Optional.empty(), Optional.empty(), List.of())), List.of(), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
+        rejects(() -> validator.validate(ignoredPredicate), "SCAN silently ignored predicate");
+        var badUnary = new Expression(ExpressionKind.UNARY, Optional.empty(), Optional.empty(),
+                Optional.of(ExpressionOperator.EQ), List.of(new Expression(ExpressionKind.LITERAL,
+                        Optional.of(value), Optional.empty(), Optional.empty(), List.of())));
+        rejects(() -> validator.validate(sqlike.qo.PlanNodes.filter(scan, badUnary)), "Invalid unary operator accepted");
     }
 
     // =========================================================================

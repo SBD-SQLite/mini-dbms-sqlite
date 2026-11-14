@@ -14,37 +14,177 @@
 
     <artifactId>sqlike-query-processor</artifactId>
 
+    <properties>
+        <maven.test.skip>false</maven.test.skip>
+        <skipTests>${maven.test.skip}</skipTests>
+        <qp.test.output>test-classes-real-qo</qp.test.output>
+    </properties>
+
     <dependencies>
         <dependency>
             <groupId>sqlike</groupId>
             <artifactId>sqlike-shared</artifactId>
             <version>${project.version}</version>
         </dependency>
+        <dependency>
+            <groupId>sqlike</groupId>
+            <artifactId>sqlike-query-optimizer</artifactId>
+            <version>${project.version}</version>
+        </dependency>
     </dependencies>
 
     <build>
+        <testOutputDirectory>${project.build.directory}/${qp.test.output}</testOutputDirectory>
         <plugins>
-            <!-- Stub QO/storage di src/stubs/java dibutuhkan oleh kode utama QP. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <testExcludes>
+                        <testExclude>**/M1ContractTestDriver.java</testExclude>
+                    </testExcludes>
+                </configuration>
+            </plugin>
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
-                <artifactId>build-helper-maven-plugin</artifactId>
-                <version>3.6.0</version>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.1.0</version>
+                <configuration>
+                    <executable>${java.home}/bin/java</executable>
+                    <classpathScope>test</classpathScope>
+                    <skip>${skipTests}</skip>
+                    <workingDirectory>${project.basedir}</workingDirectory>
+                    <arguments>
+                        <argument>-ea</argument>
+                        <argument>-classpath</argument>
+                        <classpath/>
+                    </arguments>
+                </configuration>
                 <executions>
                     <execution>
-                        <id>add-stub-sources</id>
-                        <phase>generate-sources</phase>
-                        <goals>
-                            <goal>add-source</goal>
-                        </goals>
+                        <id>qp1-driver</id>
+                        <phase>test</phase>
+                        <goals><goal>exec</goal></goals>
                         <configuration>
-                            <sources>
-                                <source>src/stubs/java</source>
-                            </sources>
+                            <arguments combine.children="append">
+                                <argument>sqlike.qp.QP1Driver</argument>
+                                <argument>--test</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>qp2-driver</id>
+                        <phase>test</phase>
+                        <goals><goal>exec</goal></goals>
+                        <configuration>
+                            <arguments combine.children="append">
+                                <argument>sqlike.qp.QP2TestDriver</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>qp3-driver</id>
+                        <phase>test</phase>
+                        <goals><goal>exec</goal></goals>
+                        <configuration>
+                            <arguments combine.children="append">
+                                <argument>sqlike.qp.QP3TestDriver</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>qp4-driver</id>
+                        <phase>test</phase>
+                        <goals><goal>exec</goal></goals>
+                        <configuration>
+                            <arguments combine.children="append">
+                                <argument>sqlike.qp.QP4TestDriver</argument>
+                            </arguments>
                         </configuration>
                     </execution>
                 </executions>
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <profile>
+            <id>qp-real-qo</id>
+            <activation><activeByDefault>true</activeByDefault></activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>qp5-real-qo</id>
+                                <phase>test</phase>
+                                <goals><goal>exec</goal></goals>
+                                <configuration>
+                                    <arguments combine.children="append">
+                                        <argument>sqlike.qp.Qp5AcceptanceTest</argument>
+                                        <argument>--qo-integration</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
+            <id>qp-isolated</id>
+            <properties>
+                <qp.test.output>test-classes-isolated</qp.test.output>
+            </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>build-helper-maven-plugin</artifactId>
+                        <version>3.6.0</version>
+                        <executions>
+                            <execution>
+                                <id>add-test-qo-stubs</id>
+                                <phase>generate-test-sources</phase>
+                                <goals><goal>add-test-source</goal></goals>
+                                <configuration>
+                                    <sources><source>src/stubs/java</source></sources>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>qp1-script-isolated</id>
+                                <phase>test</phase>
+                                <goals><goal>exec</goal></goals>
+                                <configuration>
+                                    <arguments combine.children="append">
+                                        <argument>sqlike.qp.QP1ScriptDriver</argument>
+                                        <argument>${project.basedir}/test-scripts/qp14-acceptance.sql</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                            <execution>
+                                <id>qp5-isolated</id>
+                                <phase>test</phase>
+                                <goals><goal>exec</goal></goals>
+                                <configuration>
+                                    <arguments combine.children="append">
+                                        <argument>sqlike.qp.Qp5AcceptanceTest</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 
 </project>

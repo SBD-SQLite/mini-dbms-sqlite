@@ -9,11 +9,7 @@ import java.util.Optional;
 import java.util.Set;
 import sqlike.qp.port.QpContracts.AccessMode;
 import sqlike.qp.port.QpContracts.IConcurrencyControl;
-import sqlike.qp.port.QpContracts.SchemaChangeRecord;
 import sqlike.qp.port.QpContracts.TableId;
-import sqlike.qp.port.QpContracts.TxId;
-import sqlike.qp.port.QpContracts.WriteLease;
-import sqlike.qp.port.QpContracts.WritePermit;
 import sqlike.shared.ColumnSchema;
 import sqlike.shared.CreateTableSpec;
 import sqlike.shared.DataType;
@@ -22,40 +18,29 @@ import sqlike.shared.ForeignKeySpec;
 import sqlike.shared.SchemaChange;
 import sqlike.shared.SchemaImage;
 import sqlike.shared.TableSchema;
-import sqlike.storage.StorageException;
 
 /**
  * Physical command executor for CREATE TABLE (QP-15* / PRD §12).
  * Validates table name, column definitions, primary key, and foreign key references,
- * logs SchemaChange when concurrency control is present, and creates the table in Storage Manager.
+ * logs SchemaChange before applying the table creation under CCM protection.
  */
 public final class CreateTableExecutor extends AbstractCommandExecutor {
     private final CreateTableSpec spec;
-    private final sqlike.contract.IStorageManager storageContract;
     private final sqlike.qp.port.QpContracts.IStorageManager qpStorage;
-    private final IConcurrencyControl concurrency;
+    private final MutationCoordinator mutations;
 
     public CreateTableExecutor(CreateTableSpec spec, sqlike.contract.IStorageManager storage) {
-        this(spec, Objects.requireNonNull(storage), null, null);
+        this(spec, new MutationCoordinator(Objects.requireNonNull(storage)));
     }
 
-    public CreateTableExecutor(
-            CreateTableSpec spec,
-            sqlike.qp.port.QpContracts.IStorageManager qpStorage,
-            IConcurrencyControl concurrency) {
-        this(spec, null, Objects.requireNonNull(qpStorage), concurrency);
+    public CreateTableExecutor(CreateTableSpec spec, sqlike.qp.port.QpContracts.IStorageManager storage, IConcurrencyControl concurrency) {
+        this(spec, new MutationCoordinator(Objects.requireNonNull(storage), concurrency));
     }
 
-    private CreateTableExecutor(
-            CreateTableSpec spec,
-            sqlike.contract.IStorageManager storageContract,
-            sqlike.qp.port.QpContracts.IStorageManager qpStorage,
-            IConcurrencyControl concurrency) {
-        super();
-        this.spec = Objects.requireNonNull(spec, "CreateTableSpec cannot be null");
-        this.storageContract = storageContract;
-        this.qpStorage = qpStorage;
-        this.concurrency = concurrency;
+    public CreateTableExecutor(CreateTableSpec spec, MutationCoordinator mutations) {
+        this.spec = Objects.requireNonNull(spec);
+        this.mutations = Objects.requireNonNull(mutations);
+        this.qpStorage = Objects.requireNonNull(mutations.getStorage());
     }
 
     public CreateTableSpec getSpec() {
@@ -69,6 +54,9 @@ public final class CreateTableExecutor extends AbstractCommandExecutor {
                     ErrorCode.INVALID_STATE,
                     "CREATE TABLE is not allowed within an explicit transaction");
         }
+        mutations.requireWalContext(context);
+        context.requireGrant("__catalog__", AccessMode.WRITE);
+        context.requireGrant(spec.tableName(), AccessMode.WRITE);
         TableSchema newSchema = validateAndBuildSchema();
         TableId tableId = new TableId(newSchema.tableName());
         var grant = context.requireGrant(tableId, AccessMode.WRITE);
@@ -77,25 +65,7 @@ public final class CreateTableExecutor extends AbstractCommandExecutor {
         SchemaImage afterImg = new SchemaImage(newSchema.tableName(), Optional.of(newSchema), List.of(), Optional.empty());
         SchemaChange schemaChange = new SchemaChange(List.of(beforeImg), List.of(afterImg));
 
-        if (concurrency != null && qpStorage != null) {
-            SchemaChangeRecord record = new SchemaChangeRecord(
-                    context.nextChangeId(), new TxId(context.txId), schemaChange);
-            WritePermit permit = concurrency.authorizeSchemaChange(record);
-            try (WriteLease lease = concurrency.acquireApplyLease(permit)) {
-                Objects.requireNonNull(lease);
-                context.check();
-                qpStorage.createTable(newSchema, context, grant, permit.lsn().value());
-                concurrency.confirmApplied(record.id());
-            }
-        } else if (qpStorage != null) {
-            qpStorage.createTable(newSchema, context, grant, 1L);
-        } else if (storageContract != null) {
-            try {
-                storageContract.createTable(newSchema, 1L);
-            } catch (StorageException e) {
-                throw new QpException(ErrorCode.IO_ERROR, "Failed to create table: " + e.getMessage());
-            }
-        }
+        mutations.applySchemaChange(schemaChange, context, lsn -> qpStorage.createTable(newSchema, context, grant, lsn));
         return 0L;
     }
 
@@ -158,7 +128,8 @@ public final class CreateTableExecutor extends AbstractCommandExecutor {
             canonicalPk.add(matched.name());
         }
 
-        TableSchema tentativeSelfSchema = new TableSchema(tableName, tableName, cols, canonicalPk, List.of());
+        String tableId = java.util.UUID.randomUUID().toString();
+        TableSchema tentativeSelfSchema = new TableSchema(tableId, tableName, cols, canonicalPk, List.of());
         List<ForeignKeySpec> canonicalFks = new ArrayList<>();
         for (ForeignKeySpec fk : spec.foreignKeys()) {
             if (fk == null
@@ -186,6 +157,9 @@ public final class CreateTableExecutor extends AbstractCommandExecutor {
                 refSchema = getTableSchema(actualRefName);
             }
 
+            if (refSchema == null || refSchema.primaryKey().isEmpty()) {
+                throw new QpException(ErrorCode.SEMANTIC_ERROR, "FOREIGN KEY must reference a primary key");
+            }
             if (!refSchema.primaryKey().isEmpty()) {
                 if (refSchema.primaryKey().size() != fk.referencedColumns().size()) {
                     throw new QpException(
@@ -228,7 +202,7 @@ public final class CreateTableExecutor extends AbstractCommandExecutor {
             canonicalFks.add(new ForeignKeySpec(localNames, refSchema.tableName(), refNames));
         }
 
-        return new TableSchema(tableName, tableName, cols, canonicalPk, canonicalFks);
+        return new TableSchema(tableId, tableName, cols, canonicalPk, canonicalFks);
     }
 
     private static Optional<ColumnSchema> findColumn(List<ColumnSchema> cols, String name) {
@@ -239,23 +213,11 @@ public final class CreateTableExecutor extends AbstractCommandExecutor {
     }
 
     private List<String> listTables() {
-        if (qpStorage != null) {
-            return qpStorage.listTables();
-        }
-        if (storageContract != null) {
-            return storageContract.listTables();
-        }
-        return List.of();
+        return Objects.requireNonNull(qpStorage.listTables(), "Missing table list");
     }
 
     private TableSchema getTableSchema(String table) {
-        if (qpStorage != null) {
-            return qpStorage.getTableSchema(new TableId(table));
-        }
-        if (storageContract != null) {
-            return storageContract.getSchema(table);
-        }
-        throw new QpException(ErrorCode.SEMANTIC_ERROR, "Unknown table: " + table);
+        return Objects.requireNonNull(qpStorage.getTableSchema(new TableId(table)), "Missing table schema");
     }
 
     @Override

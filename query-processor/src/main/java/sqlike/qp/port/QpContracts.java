@@ -20,7 +20,12 @@ public final class QpContracts {
     public record IndexSearch(IndexCondition value) { }
     public record ChangeRecord(ChangeId id, TxId txId, DataChange value) { }
     public record SchemaChangeRecord(ChangeId id, TxId txId, SchemaChange value) { }
-    public record WritePermit(ChangeId changeId, Lsn lsn) { }
+    public record WritePermit(ChangeId changeId, Lsn lsn) {
+        public WritePermit {
+            Objects.requireNonNull(changeId);
+            if (lsn == null || lsn.value() <= 0) throw failure("Write permit requires a positive WAL LSN");
+        }
+    }
     public record RecoveryReport(boolean success, long lastTxId) { }
     public record LogRecord(ChangeRecord change, Lsn lsn) { }
     public enum RecoveryDirection { UNDO, REDO }
@@ -48,7 +53,7 @@ public final class QpContracts {
         AccessDecision acquireAccess(TxId txId, ResourceKey resource, AccessMode mode);
         AccessDecision waitAccess(UUID requestId); WritePermit authorizeChange(ChangeRecord change);
         default WritePermit authorizeSchemaChange(SchemaChangeRecord change) {
-            return new WritePermit(change.id(), new Lsn(1L));
+            throw new UnsupportedOperationException("Schema WAL authorization is not implemented");
         }
         WriteLease acquireApplyLease(WritePermit permit); void confirmApplied(ChangeId changeId);
         TransactionState getState(TxId txId); CancellationToken getCancellationToken(TxId txId);
@@ -70,14 +75,18 @@ public final class QpContracts {
         void applyChange(ChangeRecord change, WritePermit permit);
         RidCursor findIndex(TableId tableId, String indexId, IndexSearch search, ExecutionContext context, AccessGrant grant);
         void createIndex(CreateIndexSpec spec, ExecutionContext context, AccessGrant grant);
-        void applyRecovery(LogRecord record, RecoveryDirection direction, RecoveryContext context);
-        default List<String> listTables() { return List.of(); }
-        default TableSchema getTableSchema(TableId tableId) {
-            Schema s = getSchema(tableId);
-            return new TableSchema(tableId.value(), tableId.value(), s != null ? s.columns() : List.of());
+        default void createIndex(CreateIndexSpec spec, ExecutionContext context, AccessGrant grant, long lsn) {
+            throw new UnsupportedOperationException("LSN-bearing createIndex is not implemented");
         }
-        default List<IndexMetadata> getIndexes(TableId tableId) { return List.of(); }
-        default String createSnapshot() { return "snap-0"; }
+        void applyRecovery(LogRecord record, RecoveryDirection direction, RecoveryContext context);
+        default List<String> listTables() { throw new UnsupportedOperationException("Catalog metadata is not implemented"); }
+        default TableSchema getTableSchema(TableId tableId) {
+            throw new UnsupportedOperationException("Table schema metadata is not implemented");
+        }
+        default List<IndexMetadata> getIndexes(TableId tableId) {
+            throw new UnsupportedOperationException("Index metadata is not implemented");
+        }
+        default String createSnapshot() { throw new UnsupportedOperationException("Snapshots are not implemented"); }
         default void createTable(TableSchema schema, ExecutionContext context, AccessGrant grant, long lsn) {
             throw failure("createTable is not implemented");
         }

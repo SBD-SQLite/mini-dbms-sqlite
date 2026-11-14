@@ -40,7 +40,7 @@ public interface IFailureRecoveryManager extends IWalDurability {
 
     /** Logs a schema change (CREATE/DROP TABLE, CREATE INDEX, CASCADE FK update) and returns its LSN (PRD §3.5). */
     default long logSchemaChange(long txId, SchemaChange change) {
-        return 1L;
+        throw new UnsupportedOperationException("Schema WAL logging is not implemented");
     }
 }
 

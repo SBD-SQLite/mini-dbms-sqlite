@@ -1,4 +1,6 @@
-package sqlike.shared;
+package sqlike.qo;
+
+import sqlike.shared.ErrorInfo;
 
 /**
  * Domain exception carrying an ErrorInfo */

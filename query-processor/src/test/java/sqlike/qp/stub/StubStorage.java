@@ -15,6 +15,9 @@ import static sqlike.qp.port.QpContracts.*;
 
 /** STUB ONLY: isolated SM fake with transaction overlays, snapshot persistence, and map indexes. */
 public final class StubStorage implements IStorageManager, TransactionScope {
+    private record Snapshot(Map<String, TableSchema> schemas, Map<RID, List<Value>> rows, List<IndexMetadata> indexes) { }
+    private final Map<String, Snapshot> snapshots = new HashMap<>();
+    private final Map<TxId, Snapshot> schemaUndo = new HashMap<>();
     private final Path file;
     private final ThreadLocal<TxId> current = new ThreadLocal<>();
     private final Map<String, TableSchema> schemas = new LinkedHashMap<>();
@@ -26,7 +29,7 @@ public final class StubStorage implements IStorageManager, TransactionScope {
     private final Set<String> reservations = new HashSet<>();
     public final List<String> trace;
     public int scans, lookups, fetches;
-    public boolean failApply, failPersist;
+    public boolean failApply, failPersist, failSchemaApply;
     private int nextRid;
     private long lastTx;
     public StubStorage(Path file, List<String> trace) {
@@ -75,6 +78,7 @@ public final class StubStorage implements IStorageManager, TransactionScope {
     }
     private void stage(RID rid, Optional<List<Value>> values, String operation, long lsn) {
         if (lsn <= 0) throw failure("Write requires a logged LSN");
+        trace.add("SM.LSN." + lsn);
         changes.computeIfAbsent(tx(), key -> new LinkedHashMap<>()).put(rid, values.map(List::copyOf)); trace.add(operation);
         if (failApply) { failApply = false; throw failure("Simulated SM apply failure"); }
     }
@@ -105,14 +109,35 @@ public final class StubStorage implements IStorageManager, TransactionScope {
             throw failure("Index already exists: " + definition.indexName());
         newIndexes.computeIfAbsent(tx(), key -> new ArrayList<>()).add(definition); trace.add("SM.createIndex." + definition.indexType());
     }
+    @Override public void createIndex(IndexMetadata definition, long lsn) {
+        if (lsn <= 0) throw failure("Index write requires a logged LSN");
+        trace.add("SM.LSN." + lsn);
+        createIndex(definition);
+        failSchemaIfRequested();
+    }
+    private Snapshot capture() {
+        return new Snapshot(new LinkedHashMap<>(schemas), new LinkedHashMap<>(rows), List.copyOf(definitions));
+    }
+    @Override public String createSnapshot() {
+        String id = "fixture-snapshot-" + UUID.randomUUID();
+        snapshots.put(id, capture()); trace.add("SM.snapshot"); return id;
+    }
+    public boolean hasSnapshot(String id) { return snapshots.containsKey(id); }
+    private void rememberSchema() { schemaUndo.computeIfAbsent(tx(), key -> capture()); }
+    private void failSchemaIfRequested() {
+        if (failSchemaApply) { failSchemaApply = false; throw failure("Simulated schema apply failure"); }
+    }
     @Override public void createTable(TableSchema schema, long lsn) {
         if (lsn <= 0) throw failure("Schema write requires a logged LSN");
+        rememberSchema(); trace.add("SM.LSN." + lsn);
         if (schemas.containsKey(schema.tableName())) throw failure("Table already exists: " + schema.tableName());
         schemas.put(schema.tableName(), schema);
         trace.add("SM.createTable." + schema.tableName());
+        failSchemaIfRequested();
     }
     @Override public void dropTable(String table, DropBehavior behavior, long lsn) {
         if (lsn <= 0) throw failure("Schema write requires a logged LSN");
+        rememberSchema(); trace.add("SM.LSN." + lsn);
         TableSchema removed = schemas.remove(table);
         if (removed == null) throw failure("Unknown table: " + table);
         rows.keySet().removeIf(rid -> rid.pageId().tableId().equalsIgnoreCase(table));
@@ -133,6 +158,7 @@ public final class StubStorage implements IStorageManager, TransactionScope {
         }
         rebuild();
         trace.add("SM.dropTable." + table + "." + behavior);
+        failSchemaIfRequested();
     }
     @Override public List<RID> lookupIndex(String name, IndexCondition condition) {
         lookups++; trace.add("SM.lookupIndex");
@@ -163,9 +189,15 @@ public final class StubStorage implements IStorageManager, TransactionScope {
         var copy = new LinkedHashMap<>(rows);
         pending(tx).forEach((rid, value) -> { if (value.isPresent()) copy.put(rid, value.get()); else copy.remove(rid); });
         var defs = new ArrayList<>(definitions); defs.addAll(newIndexes.getOrDefault(tx, List.of()));
-        save(copy, defs); rows = copy; definitions = defs; discard(tx); rebuild(); trace.add("SM.persisted");
+        save(copy, defs); rows = copy; definitions = defs; schemaUndo.remove(tx); discard(tx); rebuild(); trace.add("SM.persisted");
     }
     public void discard(TxId tx) {
+        Snapshot before = schemaUndo.remove(tx);
+        if (before != null) {
+            schemas.clear(); schemas.putAll(before.schemas());
+            rows = new LinkedHashMap<>(before.rows()); definitions = new ArrayList<>(before.indexes());
+            rebuild();
+        }
         changes.remove(tx); newIndexes.remove(tx); reservations.removeIf(id -> id.startsWith(tx.value() + ":"));
     }
     private void rebuild() {

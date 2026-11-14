@@ -9,6 +9,7 @@ import static sqlike.qp.port.QpContracts.failure;
 
 /** STUB ONLY: CCM/FRM fake with scripted access, event traces, and overlay rollback; no locks or WAL. */
 public final class StubTransactions implements IConcurrencyControl, IFailureRecovery {
+    private final Set<ChangeId> loggedChanges = ConcurrentHashMap.newKeySet();
     private final StubStorage storage;
     private final List<String> trace;
     private final AtomicLong ids;
@@ -21,12 +22,13 @@ public final class StubTransactions implements IConcurrencyControl, IFailureReco
     private final AtomicLong lsn = new AtomicLong();
     public CountDownLatch enteredWait = new CountDownLatch(1), releaseWait = new CountDownLatch(0);
     public TransactionState nextCommit;
+    public SchemaChangeRecord lastSchemaChange;
     public boolean failLog, failConfirm, failAbort;
     public StubTransactions(StubStorage storage, List<String> trace) { this.storage = storage; this.trace = trace; ids = new AtomicLong(storage.lastTxId()); }
     public void scriptAccess(AccessStatus... statuses) { script.addAll(List.of(statuses)); }
     @Override public void initialize(RecoveryReport report) {
         if (!report.success()) throw failure("Recovery failed");
-        states.clear(); tokens.clear(); permits.clear(); leases.clear(); waits.clear(); ids.set(Math.max(storage.lastTxId(), report.lastTxId()));
+        loggedChanges.clear(); states.clear(); tokens.clear(); permits.clear(); leases.clear(); waits.clear(); ids.set(Math.max(storage.lastTxId(), report.lastTxId()));
     }
     private void log(String event) {
         if (failLog) { failLog = false; throw failure("Simulated FRM log failure"); } trace.add(event);
@@ -37,7 +39,7 @@ public final class StubTransactions implements IConcurrencyControl, IFailureReco
     }
     private void active(TxId tx) { if (getState(tx) != TransactionState.ACTIVE) throw failure("Transaction not active"); }
     @Override public AccessDecision acquireAccess(TxId tx, ResourceKey resource, AccessMode mode) {
-        active(tx); trace.add("CCM.access." + mode); return decide(UUID.randomUUID(), new AccessGrant(tx, resource, mode));
+        active(tx); trace.add((resource.tableId().value().equals("__catalog__") ? "CCM.catalog." : "CCM.access.") + mode); return decide(UUID.randomUUID(), new AccessGrant(tx, resource, mode));
     }
     private AccessDecision decide(UUID request, AccessGrant grant) {
         AccessStatus status = Optional.ofNullable(script.poll()).orElse(AccessStatus.GRANTED);
@@ -53,12 +55,13 @@ public final class StubTransactions implements IConcurrencyControl, IFailureReco
         return getState(grant.txId()) == TransactionState.ACTIVE ? decide(requestId, grant) : new AccessDecision(AccessStatus.ABORTED, Optional.empty(), requestId);
     }
     @Override public WritePermit authorizeChange(ChangeRecord change) {
-        active(change.txId()); log("FRM.CHANGE"); WritePermit permit = new WritePermit(change.id(), new Lsn(lsn.incrementAndGet()));
-        permits.put(change.id(), permit); return permit;
+        active(change.txId()); if (!loggedChanges.add(change.id())) throw failure("Duplicate change ID"); log("FRM.CHANGE"); WritePermit permit = new WritePermit(change.id(), new Lsn(lsn.incrementAndGet()));
+        permits.put(change.id(), permit); trace.add("FRM.LSN." + permit.lsn().value()); return permit;
     }
     @Override public WritePermit authorizeSchemaChange(SchemaChangeRecord change) {
-        active(change.txId()); log("FRM.SCHEMA_CHANGE"); WritePermit permit = new WritePermit(change.id(), new Lsn(lsn.incrementAndGet()));
-        permits.put(change.id(), permit); return permit;
+        lastSchemaChange = change;
+        active(change.txId()); if (!loggedChanges.add(change.id())) throw failure("Duplicate schema change ID"); log("FRM.SCHEMA_CHANGE"); WritePermit permit = new WritePermit(change.id(), new Lsn(lsn.incrementAndGet()));
+        permits.put(change.id(), permit); trace.add("FRM.LSN." + permit.lsn().value()); return permit;
     }
     @Override public WriteLease acquireApplyLease(WritePermit permit) {
         active(permit.changeId().txId());
