@@ -12,11 +12,14 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.OptionalInt;
+import java.util.OptionalLong;
 import java.util.Set;
 
 import sqlike.block.Page;
 import sqlike.buffer.BufferPoolManager;
 import sqlike.shared.IndexMetadata;
+import sqlike.shared.IndexStatistics;
 import sqlike.shared.PageId;
 import sqlike.shared.RID;
 import sqlike.shared.Value;
@@ -130,6 +133,30 @@ public class HashIndex implements Index {
     public synchronized void flush() {
         if (invalid) throw new StorageException(INVALID_STATE, "Index requires rebuild after failed rollback");
         buffer.flushAll();
+    }
+
+    @Override
+    public synchronized IndexStatistics getStatistics() {
+        readDescriptor();
+        ByteBuffer directory = readPage(directoryPageId.pageNumber(), DIRECTORY);
+        if (directory.getInt(20) != bucketCount) throw new StorageException(IO_ERROR, "Directory count mismatch");
+
+        long overflowPages = 0;
+        Set<Long> visited = new HashSet<>();
+        for (int i = 0; i < bucketCount; i++) {
+            long page = directory.getLong();
+            checkPointer(page);
+            boolean first = true;
+            while (page != -1) {
+                if (!visited.add(page)) throw new StorageException(IO_ERROR, "Hash bucket cycle");
+                if (!first) overflowPages++;
+                Bucket bucket = readBucket(page);
+                page = bucket.next;
+                first = false;
+            }
+        }
+        return new IndexStatistics(OptionalInt.empty(), OptionalInt.of(bucketCount),
+                OptionalLong.empty(), OptionalLong.of(overflowPages), false);
     }
 
     // [Helper] Inisialisasi, bucket, dan penyimpanan page

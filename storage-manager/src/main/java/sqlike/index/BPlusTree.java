@@ -12,11 +12,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.LinkedHashMap;
 import java.util.Objects;
+import java.util.OptionalInt;
+import java.util.OptionalLong;
 import java.util.Set;
 import sqlike.block.Page;
 import sqlike.buffer.BufferPoolManager;
 import sqlike.shared.IndexCondition;
 import sqlike.shared.IndexMetadata;
+import sqlike.shared.IndexStatistics;
 import sqlike.shared.IndexOperator;
 import sqlike.shared.PageId;
 import sqlike.shared.RID;
@@ -117,6 +120,31 @@ public class BPlusTree implements Index {
     public synchronized void flush() {
         if (invalid) throw new StorageException(INVALID_STATE, "Index requires rebuild after failed rollback");
         buffer.flushAll();
+    }
+
+    @Override
+    public synchronized IndexStatistics getStatistics() {
+        readDescriptor();
+        Node node = readNode(rootPageId.pageNumber());
+        Set<Long> visited = new HashSet<>();
+        int height = 1;
+        while (!node.leaf) {
+            if (!visited.add(node.id)) throw new StorageException(IO_ERROR, "B+Tree child cycle");
+            node = readNode(node.children.get(0));
+            height++;
+        }
+
+        visited.clear();
+        long leafPages = 0;
+        while (true) {
+            if (!visited.add(node.id)) throw new StorageException(IO_ERROR, "B+Tree leaf cycle");
+            leafPages++;
+            if (node.next == -1) break;
+            node = readNode(node.next);
+            if (!node.leaf) throw new StorageException(IO_ERROR, "Leaf link points to an internal node");
+        }
+        return new IndexStatistics(OptionalInt.of(height), OptionalInt.empty(),
+                OptionalLong.of(leafPages), OptionalLong.empty(), false);
     }
 
     // [Helper] Inisialisasi, mutasi node, dan penyimpanan page.

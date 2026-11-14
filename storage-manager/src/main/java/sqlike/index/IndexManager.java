@@ -15,6 +15,7 @@ import sqlike.record.RecordSerializer;
 import sqlike.shared.IndexCondition;
 import sqlike.shared.IndexMetadata;
 import sqlike.shared.IndexOperator;
+import sqlike.shared.IndexStatistics;
 import sqlike.shared.IndexType;
 import sqlike.shared.RID;
 import sqlike.shared.Record;
@@ -250,6 +251,19 @@ public class IndexManager {
     public void flushAll() throws StorageException {
         synchronized (records) {
             for (Index index : indexes.values()) index.flush();
+        }
+    }
+
+    // 8. Get Index Statistic
+    public IndexStatistics getIndexStatistics(String name) throws StorageException {
+        synchronized (records) {
+            if (name == null || name.isBlank()) throw new StorageException(INVALID_VALUE, "Invalid index name");
+            IndexMetadata definition = catalog.getIndexes().values().stream()
+                    .filter(candidate -> candidate.indexName().equalsIgnoreCase(name)).findFirst().orElse(null);
+            if (definition == null) throw new StorageException(INDEX_NOT_FOUND, "Index not found: " + name);
+            Index index = indexes.get(definition.indexName());
+            if (index == null) throw new StorageException(INVALID_STATE, "Index is not loaded: " + name);
+            return index.getStatistics();
         }
     }
 
