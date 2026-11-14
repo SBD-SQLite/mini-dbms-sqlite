@@ -1,5 +1,7 @@
 package sqlike.storage;
 
+import sqlike.utils.SampleDatabaseLoader;
+
 public final class StorageDriver {
     private final StorageManager storage;
     private final SampleDatabaseLoader loader;
