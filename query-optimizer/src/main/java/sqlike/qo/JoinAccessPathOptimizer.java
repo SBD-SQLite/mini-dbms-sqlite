@@ -10,6 +10,7 @@ import sqlike.shared.PlanNode;
 public class JoinAccessPathOptimizer {
     private final JoinRewriter joinRewriter = new JoinRewriter();
     private final JoinOrderEnumerator joinEnumerator = new JoinOrderEnumerator();
+    private final DynamicProgrammingJoinOptimizer dynamicOptimizer = new DynamicProgrammingJoinOptimizer();
     private final PlanSelector planSelector = new PlanSelector();
     private final CostModel costModel;
     private final AccessPathOptimizer accessOptimizer;
@@ -86,6 +87,7 @@ public class JoinAccessPathOptimizer {
         var candidates = new LinkedHashSet<PlanNode>();
         for (PlanNode candidate : generateCandidates(rewritten))
             candidates.add(normalize(restoreOutputSchema(candidate, plan)));
+        candidates.add(dynamicOptimizer.optimize(rewritten, costModel, this::prepareDynamicCandidate).plan());
         // Include the incoming baseline too; equivalent rewritten plans win equal-cost ties.
         candidates.add(normalize(plan));
         candidates.add(normalize(original));
@@ -108,6 +110,10 @@ public class JoinAccessPathOptimizer {
     private PlanNode prepareGeneticCandidate(PlanNode candidate, PlanNode original) {
         PlanNode accessed = accessOptimizer == null ? candidate : accessOptimizer.chooseAccessPath(candidate, costModel);
         return normalize(restoreOutputSchema(accessed, original));
+    }
+
+    private PlanNode prepareDynamicCandidate(PlanNode candidate) {
+        return normalize(accessOptimizer == null ? candidate : accessOptimizer.chooseAccessPath(candidate, costModel));
     }
 
     private List<PlanNode> generateCandidates(PlanNode plan) {

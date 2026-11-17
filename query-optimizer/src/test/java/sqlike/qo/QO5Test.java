@@ -45,6 +45,7 @@ public final class QO5Test {
         QO5AccessPathTest.run(QO5Test::test);
         QO5GeneticTest.run(QO5Test::test);
         QO5ScopeTest.run(QO5Test::test);
+        QO5DynamicProgrammingTest.run(QO5Test::test);
         System.out.printf("QO5: %d passed, %d failed%n", passed, failed);
         return failed;
     }
