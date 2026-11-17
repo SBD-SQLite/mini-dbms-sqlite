@@ -40,7 +40,7 @@ final class QO5AccessPathTest {
         test.accept("nonjoin facade still applies QO4 rewrites before index selection", QO5AccessPathTest::nonjoinFacade);
         test.accept("index enumeration preserves input and is idempotent on chosen paths", QO5AccessPathTest::immutability);
         test.accept("access path budget includes baseline and stays immutable", QO5AccessPathTest::budget);
-        test.accept("LIMIT and correlated subqueries block access transformations", QO5AccessPathTest::boundaries);
+        test.accept("LIMIT and subquery predicates survive local access transformations", QO5AccessPathTest::boundaries);
         test.accept("access path dependency and argument validation is explicit", QO5AccessPathTest::validation);
         test.accept("metadata failures propagate without a success-shaped fallback", QO5AccessPathTest::catalogFailure);
         test.accept("NATURAL JOIN keeps deduplicated schema after index selection", QO5AccessPathTest::naturalJoin);
@@ -311,12 +311,21 @@ final class QO5AccessPathTest {
     private static void boundaries() {
         Fixture fixture = new Fixture(index("students", "id", IndexType.HASH));
         PlanNode child = rewritten("SELECT name FROM students WHERE id = 3");
-        PlanNode limit = PlanNodes.limit(child, new LimitSpec(1));
-        check(fixture.choose(limit) == limit, "rewrote below LIMIT");
+        PlanNode rawLimit = PlanNodes.limit(child, new LimitSpec(1));
+        PlanNode limit = new PlanNode(rawLimit.kind(), rawLimit.children(), child.outputColumns(), rawLimit.estimatedRows(),
+                rawLimit.scan(), rawLimit.predicate(), rawLimit.projection(), rawLimit.join(), rawLimit.sort(),
+                rawLimit.mutation(), rawLimit.createIndex(), rawLimit.limit(), rawLimit.createTable(), rawLimit.dropTable());
+        PlanNode indexedLimit = fixture.choose(limit);
+        equal(limit.limit(), indexedLimit.limit());
+        equal(1, nodes(indexedLimit, PlanNodeKind.INDEX_SCAN).size());
+        equal(eval(limit, data(), fixture.storage), eval(indexedLimit, data(), fixture.storage));
         Expression subquery = new Expression(ExpressionKind.SUBQUERY, Optional.empty(), Optional.empty(), Optional.empty(),
                 List.of(), Optional.of(new SubquerySpec(SubqueryType.EXISTS, bound("SELECT * FROM dept"), true)));
         PlanNode filter = QO5Plans.filter(child, subquery);
-        equal(List.of(filter), fixture.paths(filter));
+        PlanNode indexedFilter = fixture.choose(filter);
+        equal(ProjectionCleanup.normalize(filter).predicate(), indexedFilter.predicate());
+        equal(1, nodes(indexedFilter, PlanNodeKind.INDEX_SCAN).size());
+        equivalent(filter, indexedFilter, data(), fixture.storage);
     }
 
     private static void validation() {

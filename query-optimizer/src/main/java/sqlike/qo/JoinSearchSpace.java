@@ -22,7 +22,7 @@ final class JoinSearchSpace {
     }
 
     static boolean isRegion(PlanNode plan) {
-        if (QO5Plans.hasSubquery(plan)) return false;
+        if (QO5Scopes.isJoinBoundary(plan)) return false;
         if (QO5Plans.isJoin(plan)) return true;
         return (plan.kind() == PlanNodeKind.PROJECT || plan.kind() == PlanNodeKind.FILTER)
                 && isRegion(plan.children().get(0));

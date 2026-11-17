@@ -39,8 +39,8 @@ final class QO5GeneticTest {
         test.accept("alias index lookup uses physical catalog names and retains aliases", QO5GeneticTest::aliasIndex);
         test.accept("two aliases of the same table remain distinct join inputs", QO5GeneticTest::selfJoin);
         test.accept("alias natural join remains valid with indexed input", QO5GeneticTest::aliasNaturalIndex);
-        test.accept("LIMIT zero and positive preserve their nodes and skip GA search", QO5GeneticTest::limits);
-        test.accept("subquery plans remain search boundaries", QO5GeneticTest::subqueries);
+        test.accept("LIMIT zero and positive preserve their nodes while GA searches children", QO5GeneticTest::limits);
+        test.accept("subquery predicates stay in scope while GA searches local joins", QO5GeneticTest::subqueries);
         test.accept("GA leaves input plans and returned history immutable", QO5GeneticTest::immutability);
         test.accept("QueryOptimizer opt-in GA is never costlier, deterministic, valid and off by default", QO5GeneticTest::facadeGa);
         test.accept("QueryOptimizer reports heuristic and GA costs for a join search", QO5GeneticTest::facadeComparison);
@@ -238,8 +238,8 @@ final class QO5GeneticTest {
             var report = new JoinAccessPathOptimizer(new CostModel(storage), storage, config()).optimizeWithComparison(before);
             equal(PlanNodeKind.LIMIT, report.plan().kind());
             equal(before.limit(), report.plan().limit());
-            check(report.plan() == before, "search crossed LIMIT");
-            equal(0, report.evaluatedIndividuals());
+            check(report.evaluatedIndividuals() > 0, "GA did not search LIMIT child");
+            check(!nodes(report.plan(), PlanNodeKind.INDEX_SCAN).isEmpty(), "LIMIT blocked index selection");
             equal(eval(before, data(), storage), eval(report.plan(), data(), storage));
         }
     }
@@ -250,8 +250,9 @@ final class QO5GeneticTest {
                 List.of(), Optional.of(new SubquerySpec(SubqueryType.EXISTS, bound("SELECT * FROM dept"), false)));
         PlanNode before = QO5Plans.filter(child, sub);
         var result = new GeneticJoinOrderOptimizer(config()).optimize(before, new CostModel(catalog()));
-        equal(0, result.evaluatedIndividuals());
-        check(result.plan() == before, "GA entered subquery scope");
+        check(result.evaluatedIndividuals() > 0, "subquery predicate blocked local joins");
+        equal(sub, result.plan().predicate().orElseThrow());
+        equivalent(before, result.plan(), data());
     }
 
     private static void facadeGa() {

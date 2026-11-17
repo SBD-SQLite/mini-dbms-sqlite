@@ -34,7 +34,7 @@ public class AccessPathOptimizer {
         if (cost == null) throw QoErrors.invalidState("chooseAccessPath requires a cost model");
         // Compare the shapes actually returned to QP, not wrappers that final cleanup would remove.
         List<PlanNode> candidates = enumerateAccessPaths(plan).stream()
-                .map(QO5Plans::simplifyIdentityProjects).toList();
+                .map(QO5Plans::simplifyIdentityProjects).map(ProjectionCleanup::normalize).toList();
         return selector.pickCheapest(candidates, cost);
     }
 
@@ -45,7 +45,6 @@ public class AccessPathOptimizer {
     }
 
     private List<PlanNode> alternatives(PlanNode plan, Catalog catalog) {
-        if (plan.kind() == PlanNodeKind.LIMIT || QO5Plans.hasSubquery(plan)) return List.of(plan);
         PlanNode scan = scanBelow(plan);
         if (scan != null) return scanAlternatives(plan, scan, catalog);
 

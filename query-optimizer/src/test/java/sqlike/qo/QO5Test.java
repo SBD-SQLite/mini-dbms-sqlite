@@ -30,7 +30,7 @@ public final class QO5Test {
         test("QO3 chooses a cheaper outer input", QO5Test::costSelection);
         test("selector keeps first candidate on cost ties", QO5Test::stableTies);
         test("candidate budget and enumeration order are deterministic", QO5Test::budget);
-        test("LIMIT is a rewrite and enumeration boundary", QO5Test::limitBoundary);
+        test("LIMIT retains its position while its child is optimized", QO5Test::limitBoundary);
         test("input tree and output metadata are not mutated", QO5Test::immutability);
         test("invalid inputs report domain errors", QO5Test::invalidInputs);
         test("unsupported subquery predicates stay at their original scope", QO5Test::subqueryBoundary);
@@ -44,6 +44,7 @@ public final class QO5Test {
         test("candidate equivalence holds for varied fixture contents", QO5Test::variedContents);
         QO5AccessPathTest.run(QO5Test::test);
         QO5GeneticTest.run(QO5Test::test);
+        QO5ScopeTest.run(QO5Test::test);
         System.out.printf("QO5: %d passed, %d failed%n", passed, failed);
         return failed;
     }
@@ -198,13 +199,18 @@ public final class QO5Test {
     }
 
     private static void limitBoundary() {
-        PlanNode before = rewritten(TWO);
+        PlanNode before = rewritten(TWO + " ORDER BY students.name");
         PlanNode limit = PlanNodes.limit(before, new LimitSpec(2));
         limit = new PlanNode(limit.kind(), limit.children(), before.outputColumns(), Optional.empty(),
                 limit.scan(), limit.predicate(), limit.projection(), limit.join(), limit.sort(), limit.mutation(),
                 limit.createIndex(), limit.limit(), limit.createTable(), limit.dropTable());
         check(new JoinRewriter().cartesianToJoin(limit) == limit, "rewrote below LIMIT");
-        equal(List.of(limit), candidates(limit));
+        List<PlanNode> alternatives = candidates(limit);
+        check(alternatives.size() > 1, "join search did not enter LIMIT child");
+        for (PlanNode candidate : alternatives) {
+            equal(limit.limit(), candidate.limit());
+            equal(eval(limit, data()), eval(candidate, data()));
+        }
         equal(eval(limit, data()), eval(optimizer().optimize(limit), data()));
     }
 
@@ -231,7 +237,10 @@ public final class QO5Test {
         Expression subquery = new Expression(ExpressionKind.SUBQUERY, Optional.empty(), Optional.empty(), Optional.empty(),
                 List.of(), Optional.of(new SubquerySpec(SubqueryType.EXISTS, bound("SELECT * FROM dept"), true)));
         PlanNode filter = QO5Plans.filter(child, subquery);
-        equal(List.of(filter), candidates(filter));
+        for (PlanNode candidate : candidates(filter)) {
+            equal(subquery, candidate.predicate().orElseThrow());
+            equivalent(filter, candidate, data());
+        }
         check(new JoinRewriter().mergeSelectionIntoJoin(filter).predicate().orElseThrow().equals(subquery), "moved subquery");
     }
 

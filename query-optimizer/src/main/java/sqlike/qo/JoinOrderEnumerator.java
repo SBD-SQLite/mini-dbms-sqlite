@@ -31,7 +31,6 @@ public class JoinOrderEnumerator {
     }
 
     private List<PlanNode> variants(PlanNode plan) {
-        if (plan.kind() == PlanNodeKind.LIMIT || QO5Plans.hasSubquery(plan)) return List.of(plan);
         if (JoinSearchSpace.isRegion(plan)) return enumerateRegion(plan);
         // Preserve SORT and other enclosing operations. Vary one child at a time within the budget.
         Set<PlanNode> result = new LinkedHashSet<>();
