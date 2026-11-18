@@ -421,9 +421,12 @@ public class CCMDriver {
                         threadCount, uniqueIds));
             }
 
+            ProtocolType otherProtocol = scenario.getProtocol() == ProtocolType.LOCK_BASED
+                    ? ProtocolType.TIMESTAMP_BASED
+                    : ProtocolType.LOCK_BASED;
             boolean setProtocolRejected = false;
             try {
-                ccm.setProtocol(ProtocolType.TIMESTAMP_BASED);
+                ccm.setProtocol(otherProtocol);
             } catch (IllegalStateException expected) {
                 setProtocolRejected = true;
             }
@@ -832,7 +835,7 @@ public class CCMDriver {
                 ccmInvariants));
         // Scenarios that do not depend on how a protocol resolves conflicts also run under timestamp ordering (CC-10).
         for (Scenario scenario : List.of(concurrentReadWrite, walFailureAbortsTx, readOldValueAfterAbort,
-                beginLogFailure, commitLogFailure, rollbackRetried)) {
+                beginLogFailure, commitLogFailure, rollbackRetried, ccmInvariants)) {
             scenario.asProtocol(ProtocolType.TIMESTAMP_BASED).ifPresent(all::add);
         }
         return List.copyOf(all);

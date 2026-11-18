@@ -265,11 +265,14 @@ public class Scenario {
 
     /**
      * The same script run under {@code other}, for scenarios whose expectations do not depend on how
-     * the protocol resolves conflicts (WAL failures, rollback, serial execution). Empty for scenarios
-     * not built from a script.
+     * the protocol resolves conflicts (WAL failures, rollback, serial execution). The invariant scenario
+     * (no steps) is copied as is. Empty for other scenarios not built from a script.
      */
     public Optional<Scenario> asProtocol(ProtocolType other) {
         if (script == null) {
+            if (steps.isEmpty() && !standaloneManualSchedule && !deadlockScenario) {
+                return Optional.of(new Scenario(name + " [" + other + "]", other, false, List.of(), expectedSerializable));
+            }
             return Optional.empty();
         }
         String header = other == ProtocolType.TIMESTAMP_BASED ? "# protokol: timestamp" : "# protokol: lock";
