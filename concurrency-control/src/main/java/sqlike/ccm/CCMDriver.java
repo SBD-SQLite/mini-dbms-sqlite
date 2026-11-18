@@ -462,6 +462,9 @@ public class CCMDriver {
             passed = false;
             stepLogs.add("ERROR: " + e.getMessage());
         }
+        if (!checkNoLeftover(scenario, stepLogs)) {
+            passed = false;
+        }
 
         reports.add(new ScenarioReport(
                 scenario.getName(),
