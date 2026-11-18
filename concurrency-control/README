@@ -68,8 +68,8 @@ FRM is a MockFRM here; integration with the real FRM and QP is Milestone 3.
 
 QP integration (Milestone 3), from the repository root:
   ./concurrency-control/run-qp-integration.sh
-This compiles shared, query-processor, query-optimizer, concurrency-control and failure-recovery
-together and runs src/integration/java/sqlike/ccm/QpIntegrationDriver.java: the real QP
+This compiles src/integration/java/sqlike/ccm/QpIntegrationDriver.java and only the classes it
+reaches in shared, query-processor, concurrency-control and failure-recovery, then runs it: the real QP
 ConcurrencyAdapter on the real CCM and the real FRM (WAL, rollback, recovery, checkpoint), with
 FRM's MockStorageManager as the data store. Each scenario runs on a fresh data directory, under
 both protocols where the behavior does not depend on the protocol, and must leave no lock or
@@ -78,5 +78,9 @@ protocol data behind (ConcurrencyControlManager.leftoverState). It covers the PR
 beginApply/endApply with the SM write stamped with the LSN), undo of an aborted write in the SM,
 deadlock, WAL and commit failures, DDL, restart recovery, the FRM checkpoint timeout and eight
 concurrent clients checked against the serializability verifier. A known gap is printed as
-[CELAH]: FRM cannot roll back a DDL transaction until SmPort has restoreSchema.
-Every module ships its own sqlike.contract copy, so the script uses only the QP copy.
+[CELAH]: FRM cannot roll back a DDL transaction until its storage adapters implement
+SmPort.restoreSchema.
+Every module ships its own sqlike.contract copy, so the script puts the shared module first and QP
+second on the javac source path: the QP copy of sqlike.contract and sqlike.storage wins. Sources the
+driver never reaches (the query optimizer, other modules' tests) are not compiled, so a change there
+cannot break this run.
