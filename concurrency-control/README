@@ -84,3 +84,19 @@ Every module ships its own sqlike.contract copy, so the script puts the shared m
 second on the javac source path: the QP copy of sqlike.contract and sqlike.storage wins. Sources the
 driver never reaches (the query optimizer, other modules' tests) are not compiled, so a change there
 cannot break this run.
+
+Real SM integration (Milestone 3), from the repository root:
+  ./concurrency-control/run-sm-integration.sh
+This runs src/integration/java/sqlike/ccm/SmIntegrationDriver.java on the real Storage Manager
+(pages, buffer, RIDs), the real FRM and the real CCM, with nothing mocked. Every RID comes from
+StorageManager.reserveInsert; each write locks the RECORD resource with that RID, logs it through
+requestWrite, and applies it to the SM between beginApply and endApply. It covers INSERT, UPDATE and
+DELETE with commit and with abort (FRM undoes them in the real SM at the same RID), two transactions
+on different RIDs of one table (the second waits, because CCM locks the table per PRD section 9),
+1000 inserts spread over several pages, and a restart that reopens the SM from disk, runs
+FRM.recover and initAfterRecovery, redoes the committed transaction and undoes the active one.
+Both protocols, no lock or protocol data left after any scenario.
+FRM reaches the SM through RealSmPort in the driver, not FRM's StorageManagerAdapter: that adapter
+needs createSnapshot/restoreSnapshot, which the real SM does not have yet, and FRM.recover takes a
+baseline snapshot on first startup. RealSmPort copies the flushed SM data files for that snapshot.
+Tables are created on the SM during setup; DDL rollback is not covered until the SM has restoreSchema.
