@@ -88,7 +88,7 @@ public class StorageManagerAdapter implements SmPort {
             case INVALID_STATE -> ErrorCode.INVALID_STATE;
             case UNSUPPORTED_OPERATION -> ErrorCode.UNSUPPORTED_OPERATION;
             case WAL_FAILURE -> ErrorCode.WAL_FAILURE;
-            case IO_ERROR -> ErrorCode.IO_ERROR;
+            case IO_ERROR, CORRUPTED_DATA, BUFFER_FULL -> ErrorCode.IO_ERROR;
         };
         return new FrmException(code, ComponentType.SM,
                 "SM " + operation + " failed: " + error.getMessage(), error);

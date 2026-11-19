@@ -19,7 +19,7 @@ import sqlike.contract.IStorageManager;
 import sqlike.index.IndexManager;
 import sqlike.record.RecordManager;
 import sqlike.record.RecordSerializer;
-import sqlike.replacement_durability.IWalDurability;
+import sqlike.contract.IWalDurability;
 import sqlike.replacement_durability.LRUReplacementPolicy;
 import sqlike.shared.DataType;
 import sqlike.shared.IndexCondition;

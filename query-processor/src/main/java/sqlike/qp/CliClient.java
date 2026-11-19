@@ -37,12 +37,42 @@ public final class CliClient implements AutoCloseable {
     }
 
     public static void main(String[] args) {
-        String host = args.length > 0 ? args[0] : "localhost";
-        int port;
+        String host = "localhost";
+        int port = QpConfiguration.defaults().getPort();
+        java.nio.file.Path scriptFile = null;
+        int positional = 0;
         try {
-            port = args.length > 1 ? Integer.parseInt(args[1]) : QpConfiguration.defaults().getPort();
-        } catch (NumberFormatException e) {
-            System.err.println("Invalid port: " + args[1]);
+            for (int i = 0; i < args.length; i++) {
+                String arg = args[i];
+                switch (arg) {
+                    case "--host", "-h" -> {
+                        if (i + 1 >= args.length) throw new IllegalArgumentException("Missing value for " + arg);
+                        host = args[++i];
+                    }
+                    case "--port", "-p" -> {
+                        if (i + 1 >= args.length) throw new IllegalArgumentException("Missing value for " + arg);
+                        port = Integer.parseInt(args[++i]);
+                    }
+                    case "-f", "--file" -> {
+                        if (i + 1 >= args.length) throw new IllegalArgumentException("Missing value for " + arg);
+                        scriptFile = java.nio.file.Path.of(args[++i]);
+                    }
+                    default -> {
+                        if (positional == 0) {
+                            host = arg;
+                            positional++;
+                        } else if (positional == 1) {
+                            port = Integer.parseInt(arg);
+                            positional++;
+                        } else {
+                            throw new IllegalArgumentException("Unexpected argument: " + arg);
+                        }
+                    }
+                }
+            }
+        } catch (IllegalArgumentException e) {
+            System.err.println(e.getMessage());
+            System.err.println("Usage: java sqlike.qp.CliClient [host] [port] | [--host H] [--port P] [-f FILE]");
             System.exit(2);
             return;
         }
@@ -50,11 +80,21 @@ public final class CliClient implements AutoCloseable {
         ConsoleResultSink sink = new ConsoleResultSink(console);
         try (CliClient client = new CliClient(new ProtocolCodec(), new StatementReader(), sink)) {
             client.connect(host, port);
-            client.interactive = true;
-            sink.printMessage("Connected to SQLike at " + host + ":" + port
-                    + ". End statements with ';'. Type \\q to quit.");
-            client.run(new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8)));
-            sink.printMessage("Bye.");
+            if (scriptFile != null) {
+                client.interactive = false;
+                try (BufferedReader fileReader = java.nio.file.Files.newBufferedReader(scriptFile, StandardCharsets.UTF_8)) {
+                    client.run(fileReader);
+                } catch (IOException e) {
+                    System.err.println("Failed to read script file " + scriptFile + ": " + e.getMessage());
+                    System.exit(1);
+                }
+            } else {
+                client.interactive = true;
+                sink.printMessage("Connected to SQLike at " + host + ":" + port
+                        + ". End statements with ';'. Type \\help for commands or \\q / EXIT; to quit.");
+                client.run(new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8)));
+                sink.printMessage("Bye.");
+            }
         } catch (UncheckedIOException e) {
             System.err.println("Cannot reach SQLike server at " + host + ":" + port + ": "
                     + Optional.ofNullable(e.getCause()).map(Throwable::getMessage).orElse(e.getMessage()));
@@ -96,8 +136,21 @@ public final class CliClient implements AutoCloseable {
                 if (cmd.equals("q") || cmd.equals("quit") || cmd.equals("exit")) {
                     break;
                 }
-                output.printMessage("Unknown command: " + sql + " (use \\q to quit)");
+                if (cmd.equals("help") || cmd.equals("?")) {
+                    output.printMessage("SQLike CLI commands:");
+                    output.printMessage("  <SQL>;       Execute SQL statement (multi-line supported, end with ';')");
+                    output.printMessage("  BEGIN;       Start an explicit transaction (or BEGIN TRANSACTION;)");
+                    output.printMessage("  COMMIT;      Commit the active explicit transaction");
+                    output.printMessage("  ABORT;       Abort and rollback the active explicit transaction");
+                    output.printMessage("  \\q | EXIT;   Disconnect and exit client");
+                    continue;
+                }
+                output.printMessage("Unknown command: " + sql + " (use \\help or \\q to quit)");
                 continue;
+            }
+            String normalized = sql.trim().toLowerCase(Locale.ROOT);
+            if (normalized.equals("exit") || normalized.equals("quit")) {
+                break;
             }
             try {
                 codec.writeQuery(out, sql);

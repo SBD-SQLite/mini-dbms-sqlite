@@ -6,8 +6,6 @@ package sqlike.contract;
  * <p>SM keeps {@code pageLSN = max(pageLSN, lsn)} and calls {@link #ensureDurable} with that value
  * before writing data, index, or catalog pages to disk, including on eviction. The FRM facade
  * implements this interface, so SM depends on this contract and never on an FRM class.
- *
- * <p>Temporary location: moves to the root {@code contracts/} source set once it exists.
  */
 public interface IWalDurability {
 
