@@ -10,7 +10,7 @@ import java.util.concurrent.locks.ReentrantLock;
 
 import sqlike.block.BlockManager;
 import sqlike.block.Page;
-import sqlike.replacement_durability.IWalDurability;
+import sqlike.contract.IWalDurability;
 import sqlike.replacement_durability.ReplacementPolicy;
 import sqlike.shared.PageId;
 import sqlike.storage.StorageErrorCode;
