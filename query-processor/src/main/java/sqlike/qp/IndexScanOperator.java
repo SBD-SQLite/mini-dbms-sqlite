@@ -245,9 +245,26 @@ public final class IndexScanOperator extends AbstractOperator {
         }
         String ridTable = rid.pageId().tableId();
         if (ridTable != null && !ridTable.isBlank() && !ridTable.equalsIgnoreCase(spec.tableName())) {
-            throw new QpException(
-                    ErrorCode.INVALID_VALUE,
-                    "RID belongs to table '" + ridTable + "', expected '" + spec.tableName() + "'");
+            boolean matchesSchemaId = false;
+            try {
+                if (qpStorage != null) {
+                    var s = qpStorage.getTableSchema(tableId);
+                    if (s != null && ridTable.equalsIgnoreCase(s.tableId())) {
+                        matchesSchemaId = true;
+                    }
+                } else if (storage != null) {
+                    var s = storage.getSchema(spec.tableName());
+                    if (s != null && ridTable.equalsIgnoreCase(s.tableId())) {
+                        matchesSchemaId = true;
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+            if (!matchesSchemaId) {
+                throw new QpException(
+                        ErrorCode.INVALID_VALUE,
+                        "RID belongs to table '" + ridTable + "', expected '" + spec.tableName() + "'");
+            }
         }
     }
 

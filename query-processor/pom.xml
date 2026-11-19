@@ -28,7 +28,22 @@
         </dependency>
         <dependency>
             <groupId>sqlike</groupId>
+            <artifactId>sqlike-storage-manager</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>sqlike</groupId>
             <artifactId>sqlike-query-optimizer</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>sqlike</groupId>
+            <artifactId>sqlike-concurrency-control</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>sqlike</groupId>
+            <artifactId>sqlike-failure-recovery</artifactId>
             <version>${project.version}</version>
         </dependency>
     </dependencies>
@@ -125,58 +140,6 @@
                                     <arguments combine.children="append">
                                         <argument>sqlike.qp.Qp5AcceptanceTest</argument>
                                         <argument>--qo-integration</argument>
-                                    </arguments>
-                                </configuration>
-                            </execution>
-                        </executions>
-                    </plugin>
-                </plugins>
-            </build>
-        </profile>
-        <profile>
-            <id>qp-isolated</id>
-            <properties>
-                <qp.test.output>test-classes-isolated</qp.test.output>
-            </properties>
-            <build>
-                <plugins>
-                    <plugin>
-                        <groupId>org.codehaus.mojo</groupId>
-                        <artifactId>build-helper-maven-plugin</artifactId>
-                        <version>3.6.0</version>
-                        <executions>
-                            <execution>
-                                <id>add-test-qo-stubs</id>
-                                <phase>generate-test-sources</phase>
-                                <goals><goal>add-test-source</goal></goals>
-                                <configuration>
-                                    <sources><source>src/stubs/java</source></sources>
-                                </configuration>
-                            </execution>
-                        </executions>
-                    </plugin>
-                    <plugin>
-                        <groupId>org.codehaus.mojo</groupId>
-                        <artifactId>exec-maven-plugin</artifactId>
-                        <executions>
-                            <execution>
-                                <id>qp1-script-isolated</id>
-                                <phase>test</phase>
-                                <goals><goal>exec</goal></goals>
-                                <configuration>
-                                    <arguments combine.children="append">
-                                        <argument>sqlike.qp.QP1ScriptDriver</argument>
-                                        <argument>${project.basedir}/test-scripts/qp14-acceptance.sql</argument>
-                                    </arguments>
-                                </configuration>
-                            </execution>
-                            <execution>
-                                <id>qp5-isolated</id>
-                                <phase>test</phase>
-                                <goals><goal>exec</goal></goals>
-                                <configuration>
-                                    <arguments combine.children="append">
-                                        <argument>sqlike.qp.Qp5AcceptanceTest</argument>
                                     </arguments>
                                 </configuration>
                             </execution>
