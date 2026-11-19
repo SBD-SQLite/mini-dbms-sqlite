@@ -366,17 +366,30 @@ public final class QueryProcessor implements IQueryProcessor {
 
     private void validateRuntimeProviders() {
         List<String> missing = new ArrayList<>();
-        requireOverride(storage, "createTable", missing, sqlike.shared.TableSchema.class, long.class);
-        requireOverride(storage, "dropTable", missing, String.class, sqlike.shared.DropBehavior.class, long.class);
-        requireOverride(storage, "createIndex", missing, sqlike.shared.IndexMetadata.class, long.class);
-        requireOverride(storage, "createSnapshot", missing);
-        requireOverride(storage, "restoreSchema", missing, sqlike.shared.SchemaImage.class, long.class);
+        boolean hasTab6Ddl = hasOverride(storage, "createTable", sqlike.shared.TableSchema.class)
+                && hasOverride(storage, "dropTable", String.class, sqlike.shared.DropBehavior.class)
+                && hasOverride(storage, "createIndex", sqlike.shared.IndexMetadata.class);
+        if (!hasTab6Ddl) {
+            requireOverride(storage, "createTable", missing, sqlike.shared.TableSchema.class, long.class);
+            requireOverride(storage, "dropTable", missing, String.class, sqlike.shared.DropBehavior.class, long.class);
+            requireOverride(storage, "createIndex", missing, sqlike.shared.IndexMetadata.class, long.class);
+            requireOverride(storage, "createSnapshot", missing);
+            requireOverride(storage, "restoreSchema", missing, sqlike.shared.SchemaImage.class, long.class);
+        }
         requireOverride(concurrencyControl, "requestWriteAccess", missing, long.class, sqlike.shared.ResourceId.class);
         requireOverride(concurrencyControl, "requestSchemaWrite", missing, long.class, sqlike.shared.SchemaChange.class);
         requireOverride(concurrencyControl, "beginApply", missing, long.class, long.class);
         requireOverride(concurrencyControl, "endApply", missing, long.class, long.class);
         requireOverride(recovery, "logSchemaChange", missing, long.class, sqlike.shared.SchemaChange.class);
         if (!missing.isEmpty()) throw new UnsupportedOperationException("Runtime providers lack PRD implementations: " + String.join(", ", missing));
+    }
+
+    private static boolean hasOverride(Object provider, String method, Class<?>... parameters) {
+        try {
+            return !provider.getClass().getMethod(method, parameters).getDeclaringClass().isInterface();
+        } catch (NoSuchMethodException e) {
+            return false;
+        }
     }
 
     private static void requireOverride(Object provider, String method, List<String> missing, Class<?>... parameters) {

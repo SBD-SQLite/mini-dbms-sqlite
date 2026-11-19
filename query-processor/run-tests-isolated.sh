@@ -3,9 +3,9 @@
 # SQLike Query Processor - Isolated Test Runner (Bash, stub QO/SM/CCM/FRM)
 # ==============================================================================
 # Usage:
-#   ./query-processor/run-tests.sh         # Runs all test drivers
-#   ./query-processor/run-tests.sh qp2     # Runs QP2 unit tests only
-#   ./query-processor/run-tests.sh qp1     # Runs QP1 test scenarios only
+#   ./query-processor/run-tests-isolated.sh         # Runs all test drivers
+#   ./query-processor/run-tests-isolated.sh qp2     # Runs QP2 unit tests only
+#   ./query-processor/run-tests-isolated.sh qp1     # Runs QP1 test scenarios only
 # ==============================================================================
 
 set -euo pipefail
@@ -54,14 +54,10 @@ echo -e "\n${BOLD}[1/2] Compiling sources...${RESET}"
 # Collect source files
 SOURCE_DIRS=(
     "${REPO_ROOT}/shared/src/main/java"
+    "${REPO_ROOT}/query-optimizer/src/main/java/sqlike/qo"
     "${REPO_ROOT}/query-processor/src/main/java"
     "${REPO_ROOT}/query-processor/src/test/java"
 )
-
-# Include stubs if directory exists
-if [ -d "${REPO_ROOT}/query-processor/src/stubs/java" ]; then
-    SOURCE_DIRS+=("${REPO_ROOT}/query-processor/src/stubs/java")
-fi
 
 SOURCES=()
 for sdir in "${SOURCE_DIRS[@]}"; do

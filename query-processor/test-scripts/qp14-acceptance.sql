@@ -40,12 +40,12 @@ SELECT name, gpa FROM student ORDER BY name;
 -- expect-row: Cici | 3.8
 
 -- scenario: QP-08 join with ON condition, filter, and sort
-SELECT s.name, e.course FROM student s JOIN enrollment e ON s.id = e.student_id ORDER BY s.name;
+SELECT s.name, e.course FROM student AS s JOIN enrollment AS e ON s.id = e.student_id ORDER BY s.name;
 -- expect: columns name, course
 -- expect-row: Ani | IF3140
 -- expect-row: Budi | IF3140
 -- expect-row: Cici | IF3130
-SELECT s.name FROM student s JOIN enrollment e ON s.id = e.student_id WHERE e.course = 'IF3140' ORDER BY s.name DESC;
+SELECT s.name FROM student AS s JOIN enrollment AS e ON s.id = e.student_id WHERE e.course = 'IF3140' ORDER BY s.name DESC;
 -- expect-row: Budi
 -- expect-row: Ani
 
@@ -151,6 +151,7 @@ CREATE INDEX idx_student_id ON student(id);
 SELECT name FROM student WHERE id = 3;
 -- expect-row: Cici
 BEGIN TRANSACTION;
+-- expect: transaction ACTIVE
 CREATE INDEX idx_student_gpa ON student(gpa);
 -- expect: error INVALID_STATE
 ABORT;

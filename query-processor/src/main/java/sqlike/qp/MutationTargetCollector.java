@@ -152,9 +152,26 @@ public class MutationTargetCollector {
         }
         String ridTable = rid.pageId().tableId();
         if (ridTable != null && !ridTable.isBlank() && !ridTable.equalsIgnoreCase(tableName)) {
-            throw new QpException(
-                    ErrorCode.INVALID_VALUE,
-                    "Target RID belongs to table '" + ridTable + "', expected '" + tableName + "'");
+            boolean matchesSchemaId = false;
+            try {
+                if (qpStorage != null) {
+                    var s = qpStorage.getTableSchema(new TableId(tableName));
+                    if (s != null && ridTable.equalsIgnoreCase(s.tableId())) {
+                        matchesSchemaId = true;
+                    }
+                } else if (storage != null) {
+                    var s = storage.getSchema(tableName);
+                    if (s != null && ridTable.equalsIgnoreCase(s.tableId())) {
+                        matchesSchemaId = true;
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+            if (!matchesSchemaId) {
+                throw new QpException(
+                        ErrorCode.INVALID_VALUE,
+                        "Target RID belongs to table '" + ridTable + "', expected '" + tableName + "'");
+            }
         }
         return rid;
     }

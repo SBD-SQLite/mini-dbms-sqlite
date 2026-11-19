@@ -132,14 +132,17 @@ public class QP2TestDriver {
         } catch (QpException expected) {
             assertEquals(sqlike.shared.ErrorCode.SEMANTIC_ERROR, expected.getErrorInfo().code(), "Ambiguity is a semantic error");
         }
-        Operator rows = new MockOperator(PlanNodeKind.SCAN, duplicate, List.of()) {
+        Operator rows = new Operator() {
             private boolean emitted;
+            @Override public Schema schema() { return duplicate; }
+            @Override public void open(ExecutionContext context) { emitted = false; }
             @Override public Optional<RowEnvelope> next() {
                 if (emitted) return Optional.empty();
                 emitted = true;
                 return Optional.of(RowEnvelope.of(Row.of(value,
                         new Value(DataType.INTEGER, Optional.of(2), Optional.empty(), Optional.empty()))));
             }
+            @Override public void close() {}
         };
         var wildcard = new ProjectOperator(rows, new ProjectSpec(List.of(ColumnRef.of(null, "*"))));
         assertEquals(List.of(0, 1), wildcard.getOffsets(), "Wildcard preserves distinct physical slots");
@@ -504,11 +507,23 @@ public class QP2TestDriver {
         ExpressionEvaluator evaluator = new ExpressionEvaluator(comparator);
         PlanValidator validator = new PlanValidator();
         RowSizeEstimator estimator = new RowSizeEstimator();
-        MutationCoordinator mutations = new MutationCoordinator(null);
-        MutationTargetCollector collector = new MutationTargetCollector(null);
+        java.nio.file.Path snap;
+        try {
+            snap = java.nio.file.Files.createTempDirectory("qp2-select-").resolve("sm.stub");
+        } catch (java.io.IOException e) {
+            throw new RuntimeException(e);
+        }
+        sqlike.qp.stub.StubStorage stubSm = new sqlike.qp.stub.StubStorage(snap, new java.util.ArrayList<>());
+        stubSm.define(new sqlike.shared.TableSchema("1", "employee", List.of(
+                new ColumnSchema("id", DataType.INTEGER, Optional.empty()),
+                new ColumnSchema("name", DataType.VARCHAR, Optional.of(50)),
+                new ColumnSchema("salary", DataType.INTEGER, Optional.empty())
+        )));
+        MutationCoordinator mutations = new MutationCoordinator(stubSm);
+        MutationTargetCollector collector = new MutationTargetCollector(stubSm);
 
         PlanTranslator translator = new PlanTranslator(
-                null, evaluator, comparator, mutations, collector, estimator, validator);
+                stubSm, evaluator, comparator, mutations, collector, estimator, validator);
 
         // SCAN node
         PlanNode scanNode = new PlanNode(PlanNodeKind.SCAN, List.of(), List.of(), Optional.empty(),
@@ -533,19 +548,20 @@ public class QP2TestDriver {
 
         // Translate SELECT tree
         Operator rootOp = translator.translateSelect(projectNode);
-        assertTrue(rootOp instanceof MockOperator, "Returns MockOperator");
-        MockOperator mockOp = (MockOperator) rootOp;
-        assertEquals(PlanNodeKind.PROJECT, mockOp.getKind(), "Root is PROJECT operator");
-        assertEquals(1, mockOp.getChildren().size(), "PROJECT has 1 child");
-        assertEquals(PlanNodeKind.FILTER, ((MockOperator) mockOp.getChildren().get(0)).getKind(), "Child is FILTER operator");
+        assertTrue(rootOp instanceof ProjectOperator, "Returns ProjectOperator");
+        ProjectOperator projOp = (ProjectOperator) rootOp;
+        assertTrue(projOp.getChild() instanceof FilterOperator, "Child is FilterOperator");
 
         // Test Operator lifecycle methods
+        stubSm.useTransaction(new sqlike.qp.port.QpContracts.TxId(1L));
         ExecutionContext ctx = ExecutionContext.of(1L, "sess-01");
+        ctx.addGrant(new sqlike.qp.port.QpContracts.AccessGrant(
+                new sqlike.qp.port.QpContracts.TxId(1L),
+                sqlike.qp.port.QpContracts.ResourceKey.table(new sqlike.qp.port.QpContracts.TableId("employee")),
+                sqlike.qp.port.QpContracts.AccessMode.READ));
         rootOp.open(ctx);
-        assertTrue(mockOp.isOpened(), "Operator opened");
-        assertEquals(Optional.empty(), rootOp.next(), "Mock next() returns empty");
+        assertEquals(Optional.empty(), rootOp.next(), "Empty table next() returns empty");
         rootOp.close();
-        assertTrue(mockOp.isClosed(), "Operator closed");
     }
 
     // =========================================================================
@@ -558,11 +574,23 @@ public class QP2TestDriver {
         ExpressionEvaluator evaluator = new ExpressionEvaluator(comparator);
         PlanValidator validator = new PlanValidator();
         RowSizeEstimator estimator = new RowSizeEstimator();
-        MutationCoordinator mutations = new MutationCoordinator(null);
-        MutationTargetCollector collector = new MutationTargetCollector(null);
+        java.nio.file.Path snap;
+        try {
+            snap = java.nio.file.Files.createTempDirectory("qp2-cmd-").resolve("sm.stub");
+        } catch (java.io.IOException e) {
+            throw new RuntimeException(e);
+        }
+        sqlike.qp.stub.StubStorage stubSm = new sqlike.qp.stub.StubStorage(snap, new java.util.ArrayList<>());
+        stubSm.define(new sqlike.shared.TableSchema("1", "employee", List.of(
+                new ColumnSchema("id", DataType.INTEGER, Optional.empty()),
+                new ColumnSchema("name", DataType.VARCHAR, Optional.of(50)),
+                new ColumnSchema("salary", DataType.INTEGER, Optional.empty())
+        )));
+        MutationCoordinator mutations = new MutationCoordinator(stubSm);
+        MutationTargetCollector collector = new MutationTargetCollector(stubSm);
 
         PlanTranslator translator = new PlanTranslator(
-                null, evaluator, comparator, mutations, collector, estimator, validator);
+                stubSm, evaluator, comparator, mutations, collector, estimator, validator);
 
         // 1. INSERT command
         Value v1 = new Value(DataType.INTEGER, Optional.of(1), Optional.empty(), Optional.empty());
@@ -571,12 +599,8 @@ public class QP2TestDriver {
                 Optional.of(new MutationSpec("employee", List.of(v1), Optional.empty(), Optional.empty())), Optional.empty());
 
         CommandExecutor insertExec = translator.translateCommand(insertNode);
-        assertTrue(insertExec instanceof MockCommandExecutor, "INSERT CommandExecutor created");
-        MockCommandExecutor mockInsert = (MockCommandExecutor) insertExec;
-        assertEquals(PlanNodeKind.INSERT, mockInsert.getKind(), "Kind is INSERT");
-        assertEquals(0L, insertExec.execute(ExecutionContext.of(1L)), "Execution returns 0L affected rows");
+        assertTrue(insertExec instanceof InsertExecutor, "INSERT CommandExecutor created");
         insertExec.close();
-        assertTrue(mockInsert.isClosed(), "Executor closed");
 
         // 2. CREATE_INDEX command
         IndexMetadata indexMeta = new IndexMetadata("idx_salary", "employee", "salary", IndexType.BPLUS_TREE);
@@ -585,7 +609,7 @@ public class QP2TestDriver {
                 Optional.empty(), Optional.of(indexMeta));
 
         CommandExecutor indexExec = translator.translateCommand(createIndexNode);
-        assertEquals(PlanNodeKind.CREATE_INDEX, ((MockCommandExecutor) indexExec).getKind(), "Kind is CREATE_INDEX");
+        assertTrue(indexExec instanceof CreateIndexExecutor, "Kind is CreateIndexExecutor");
     }
 
     // =========================================================================
