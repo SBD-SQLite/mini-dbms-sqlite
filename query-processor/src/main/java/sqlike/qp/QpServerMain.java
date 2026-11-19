@@ -169,7 +169,7 @@ public final class QpServerMain {
             ClassLoader cl = QpServerMain.class.getClassLoader();
             Class<?> blockManagerClass = Class.forName("sqlike.block.BlockManager", true, cl);
             Class<?> catalogManagerClass = Class.forName("sqlike.catalog.CatalogManager", true, cl);
-            Class<?> smWalClass = Class.forName("sqlike.replacement_durability.IWalDurability", true, cl);
+            Class<?> smWalClass = Class.forName("sqlike.contract.IWalDurability", true, cl);
             Class<?> replacementPolicyClass = Class.forName("sqlike.replacement_durability.ReplacementPolicy", true, cl);
             Class<?> lruPolicyClass = Class.forName("sqlike.replacement_durability.LRUReplacementPolicy", true, cl);
             Class<?> bufferPoolClass = Class.forName("sqlike.buffer.BufferPoolManager", true, cl);

@@ -6,9 +6,7 @@ import sqlike.shared.SchemaChange;
 import sqlike.shared.RecoveryTarget;
 
 /**
- * FRM contract from the SQLike supergroup report (section 2.1), owned by the FRM group.
- *
- * <p>This is the authoritative definition; CCM keeps an identical copy to compile against.
+ * FRM contract from the SQLike supergroup report (section 2.1) and PRD §3.5, owned by the FRM group.
  */
 public interface IFailureRecoveryManager extends IWalDurability {
 
@@ -44,10 +42,8 @@ public interface IFailureRecoveryManager extends IWalDurability {
      * Logs a schema change (CREATE/DROP TABLE, CREATE INDEX, CASCADE FK update) and returns its
      * LSN (PRD v1.0 §3.5).
      *
-     * <p>The default refuses loudly on purpose. The copies QP and CCM compile against return a
-     * fixed {@code 1L}, so an implementation that forgets to override this looks like it logged a
-     * record while the DDL never reaches the WAL. Reconcile the three copies when the root
-     * {@code contracts/} source set is created.
+     * <p>The default refuses loudly on purpose, so an implementation that forgets to override this
+     * cannot look like it logged a record while the DDL never reaches the WAL.
      */
     default long logSchemaChange(long txId, SchemaChange change) {
         throw new UnsupportedOperationException("logSchemaChange is not implemented");

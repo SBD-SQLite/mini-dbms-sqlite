@@ -35,7 +35,7 @@ import sqlike.qp.StatementReader;
 import sqlike.qp.SystemState;
 import sqlike.record.RecordManager;
 import sqlike.record.RecordSerializer;
-import sqlike.replacement_durability.IWalDurability;
+import sqlike.contract.IWalDurability;
 import sqlike.replacement_durability.LRUReplacementPolicy;
 import sqlike.shared.*;
 import sqlike.statistics.StatisticsManager;
