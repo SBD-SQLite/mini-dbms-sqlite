@@ -236,7 +236,7 @@ public final class TableScanOperator extends AbstractOperator {
             case INVALID_STATE, INVALID_RESERVATION -> ErrorCode.INVALID_STATE;
             case UNSUPPORTED_OPERATION -> ErrorCode.UNSUPPORTED_OPERATION;
             case WAL_FAILURE -> ErrorCode.WAL_FAILURE;
-            case IO_ERROR -> ErrorCode.IO_ERROR;
+            case IO_ERROR, CORRUPTED_DATA, BUFFER_FULL -> ErrorCode.IO_ERROR;
         };
         return new QpException(mapped, prefix + ": " + e.getMessage());
     }

@@ -13,7 +13,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Stream;
-import sqlike.qp.stub.StubQpRuntime;
 import sqlike.shared.ErrorInfo;
 import sqlike.shared.QueryResult;
 import sqlike.shared.ResultColumn;
@@ -49,6 +48,28 @@ public final class QP1ScriptDriver {
         this.verbose = verbose;
     }
 
+    public static void runWithProcessor(QueryProcessor processor, Path script, boolean verbose) throws IOException {
+        List<Scenario> scenarios;
+        try {
+            scenarios = parse(script);
+        } catch (ScriptException e) {
+            throw new IllegalStateException("SCRIPT ERROR " + script + ": " + e.getMessage(), e);
+        }
+        System.out.println("QP-14 script " + script + " (" + scenarios.size() + " scenarios)");
+        QP1ScriptDriver driver = new QP1ScriptDriver(processor, verbose);
+        int failedScenarios = 0;
+        for (Scenario scenario : scenarios) {
+            if (!driver.run(scenario)) {
+                failedScenarios++;
+            }
+        }
+        System.out.println("RESULT: " + (scenarios.size() - failedScenarios) + "/" + scenarios.size()
+                + " scenarios PASS, " + driver.checks + " checks");
+        if (failedScenarios > 0) {
+            throw new IllegalStateException("QP-14 script had " + failedScenarios + " failed scenarios");
+        }
+    }
+
     public static void main(String[] args) throws IOException {
         boolean verbose = false;
         List<Path> scripts = new ArrayList<>();
@@ -78,9 +99,8 @@ public final class QP1ScriptDriver {
             System.out.println("QP-14 script " + script + " (" + scenarios.size() + " scenarios)");
             Path dataDir = Files.createTempDirectory("qp14-");
             try {
-                StubQpRuntime runtime = StubQpRuntime.open(dataDir, QpConfiguration.defaults());
-                runtime.recover();
-                QP1ScriptDriver driver = new QP1ScriptDriver(runtime.processor, verbose);
+                QueryProcessor isolatedProcessor = openIsolatedProcessor(dataDir);
+                QP1ScriptDriver driver = new QP1ScriptDriver(isolatedProcessor, verbose);
                 for (Scenario scenario : scenarios) {
                     totalScenarios++;
                     if (!driver.run(scenario)) {
@@ -88,7 +108,7 @@ public final class QP1ScriptDriver {
                     }
                 }
                 totalChecks += driver.checks;
-                runtime.processor.shutdown();
+                isolatedProcessor.shutdown();
             } finally {
                 deleteRecursively(dataDir);
             }
@@ -97,6 +117,18 @@ public final class QP1ScriptDriver {
                 + " scenarios PASS, " + totalChecks + " checks");
         if (failedScenarios > 0) {
             System.exit(1);
+        }
+    }
+
+    private static QueryProcessor openIsolatedProcessor(Path dataDir) {
+        try {
+            Class<?> runtimeClass = Class.forName("sqlike.qp.stub.StubQpRuntime");
+            Object runtime = runtimeClass.getMethod("open", Path.class, QpConfiguration.class)
+                    .invoke(null, dataDir, QpConfiguration.defaults());
+            runtimeClass.getMethod("recover").invoke(runtime);
+            return (QueryProcessor) runtimeClass.getField("processor").get(runtime);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Failed to initialize isolated StubQpRuntime", e);
         }
     }
 

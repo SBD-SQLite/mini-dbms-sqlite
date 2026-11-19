@@ -84,6 +84,15 @@ public final class QpBootstrap {
         return state.get();
     }
 
+    public QueryProcessor getProcessor() {
+        return processor != null ? processor
+                : (server.getProcessor() instanceof QueryProcessor qp ? qp : null);
+    }
+
+    public QueryServer getServer() {
+        return server;
+    }
+
     private void validateRecovery(RecoveryReport report) {
         if (report == null || !report.success()) {
             throw new IllegalStateException("Startup recovery failed");

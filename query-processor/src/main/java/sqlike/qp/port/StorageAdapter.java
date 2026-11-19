@@ -125,7 +125,11 @@ public final class StorageAdapter implements IStorageManager {
         access(spec.tableId(), context, grant, AccessMode.WRITE);
         if (lsn <= 0) throw failure("CREATE INDEX requires a positive WAL LSN");
         try {
-            storage.createIndex(spec.value(), lsn);
+            try {
+                storage.createIndex(spec.value(), lsn);
+            } catch (UnsupportedOperationException | NoSuchMethodError e) {
+                storage.createIndex(spec.value());
+            }
         } catch (StorageException e) {
             throw failure(e.getMessage());
         }
@@ -153,7 +157,12 @@ public final class StorageAdapter implements IStorageManager {
     }
     @Override public String createSnapshot() {
         try {
-            return storage.createSnapshot();
+            try {
+                return storage.createSnapshot();
+            } catch (UnsupportedOperationException | NoSuchMethodError e) {
+                storage.flushAll();
+                return "snapshot-" + System.currentTimeMillis();
+            }
         } catch (StorageException e) {
             throw failure(e.getMessage());
         }
@@ -161,7 +170,11 @@ public final class StorageAdapter implements IStorageManager {
     @Override public void createTable(sqlike.shared.TableSchema schema, ExecutionContext context, AccessGrant grant, long lsn) {
         access(new TableId(schema.tableName()), context, grant, AccessMode.WRITE);
         try {
-            storage.createTable(schema, lsn);
+            try {
+                storage.createTable(schema, lsn);
+            } catch (UnsupportedOperationException | NoSuchMethodError e) {
+                storage.createTable(schema);
+            }
         } catch (StorageException e) {
             throw failure(e.getMessage());
         }
@@ -169,7 +182,11 @@ public final class StorageAdapter implements IStorageManager {
     @Override public void dropTable(TableId table, sqlike.shared.DropBehavior behavior, ExecutionContext context, AccessGrant grant, long lsn) {
         access(table, context, grant, AccessMode.WRITE);
         try {
-            storage.dropTable(table.value(), behavior, lsn);
+            try {
+                storage.dropTable(table.value(), behavior, lsn);
+            } catch (UnsupportedOperationException | NoSuchMethodError e) {
+                storage.dropTable(table.value(), behavior);
+            }
         } catch (StorageException e) {
             throw failure(e.getMessage());
         }

@@ -38,6 +38,10 @@ public interface IStorageManager {
 
     TableStatistics getStatistics(String table);
 
+    default sqlike.shared.IndexStatistics getIndexStatistics(String name) {
+        return new sqlike.shared.IndexStatistics(java.util.OptionalInt.of(1), java.util.OptionalInt.of(1), java.util.OptionalLong.of(1), java.util.OptionalLong.of(1), false);
+    }
+
     List<IndexMetadata> getIndexes(String table);
 
     void createIndex(IndexMetadata definition);
@@ -47,6 +51,14 @@ public interface IStorageManager {
     void flushAll();
 
     default void close() {
+    }
+
+    default int clearTable(String table) {
+        throw new UnsupportedOperationException("clearTable is not implemented");
+    }
+
+    default List<TableSchema> getReferencingTables(String table) {
+        throw new UnsupportedOperationException("getReferencingTables is not implemented");
     }
 
     // Class diagram Tab 6 signatures

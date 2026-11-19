@@ -248,8 +248,7 @@ public class PlanTranslator {
     private Operator buildScan(PlanNode node, ScanSpec spec) {
         String qualifier = spec.alias().filter(a -> !a.isBlank()).orElse(spec.tableName());
         if (!hasStorage()) {
-            Schema outputSchema = Schema.of(qualifier, List.of());
-            return new MockOperator(PlanNodeKind.SCAN, outputSchema, List.of());
+            throw new IllegalStateException("Storage manager is required to translate SCAN");
         }
         Schema baseSchema = resolveTableSchema(spec.tableName());
         Schema outputSchema = Schema.of(qualifier, baseSchema.columns());
@@ -269,8 +268,7 @@ public class PlanTranslator {
                 ? alias.get()
                 : spec.tableName();
         if (!hasStorage()) {
-            Schema outputSchema = Schema.of(qualifier, List.of());
-            return new MockOperator(PlanNodeKind.INDEX_SCAN, outputSchema, List.of());
+            throw new IllegalStateException("Storage manager is required to translate INDEX_SCAN");
         }
         Schema baseSchema = resolveTableSchema(spec.tableName());
         Schema outputSchema = Schema.of(qualifier, baseSchema.columns());
@@ -282,17 +280,11 @@ public class PlanTranslator {
 
     private Operator buildFilter(PlanNode node, FilterSpec spec) {
         Operator child = translateRead(node.children().get(0));
-        if (!hasStorage()) {
-            return new MockOperator(PlanNodeKind.FILTER, child.schema(), List.of(child));
-        }
         return new FilterOperator(child, spec, evaluator, child.schema());
     }
 
     private Operator buildProject(PlanNode node, ProjectSpec spec) {
         Operator child = translateRead(node.children().get(0));
-        if (!hasStorage()) {
-            return new MockOperator(PlanNodeKind.PROJECT, child.schema(), List.of(child));
-        }
         if (spec.columns().size() == 1
                 && spec.columns().get(0).columnName().equals("*")
                 && spec.columns().get(0).tableName().isEmpty()) {
@@ -305,7 +297,7 @@ public class PlanTranslator {
         Operator leftChild = translateRead(node.children().get(0));
         Operator rightChild = translateRead(node.children().get(1));
         if (!hasStorage()) {
-            return new MockOperator(node.kind(), Schema.of(List.of()), List.of(leftChild, rightChild));
+            throw new IllegalStateException("Storage manager is required to translate JOIN");
         }
         List<ColumnSchema> leftCols = leftChild.schema().getColumns();
         List<ColumnSchema> rightCols = rightChild.schema().getColumns();
@@ -369,24 +361,18 @@ public class PlanTranslator {
 
     private Operator buildSort(PlanNode node, SortSpec spec) {
         Operator child = translateRead(node.children().get(0));
-        if (!hasStorage()) {
-            return new MockOperator(PlanNodeKind.SORT, child.schema(), List.of(child));
-        }
         RowComparator rowComp = new RowComparator(child.schema(), spec.column(), spec.direction(), comparator);
         return new SortOperator(child, spec, rowComp, child.schema());
     }
 
     private Operator buildLimit(PlanNode node, sqlike.shared.LimitSpec spec) {
         Operator child = translateRead(node.children().get(0));
-        if (!hasStorage()) {
-            return new MockOperator(PlanNodeKind.LIMIT, child.schema(), List.of(child));
-        }
         return new LimitOperator(child, spec, child.schema());
     }
 
     private CommandExecutor buildInsert(PlanNode node, InsertSpec spec) {
         if (!hasStorage() || mutations == null) {
-            return new MockCommandExecutor(PlanNodeKind.INSERT);
+            throw new IllegalStateException("Storage manager and MutationCoordinator are required to translate INSERT");
         }
         return new InsertExecutor(spec, mutations);
     }
@@ -394,7 +380,7 @@ public class PlanTranslator {
     private CommandExecutor buildUpdate(PlanNode node, UpdateSpec spec) {
         Operator source = !node.children().isEmpty() ? translateRead(node.children().get(0)) : null;
         if (!hasStorage() || source == null || collector == null || evaluator == null || mutations == null) {
-            return new MockCommandExecutor(PlanNodeKind.UPDATE);
+            throw new IllegalStateException("Storage manager, collector, evaluator, and mutations are required to translate UPDATE");
         }
         Schema tableSchema = resolveTableSchema(spec.tableName());
         return new UpdateExecutor(source, spec, tableSchema, collector, evaluator, mutations);
@@ -403,28 +389,28 @@ public class PlanTranslator {
     private CommandExecutor buildDelete(PlanNode node, DeleteSpec spec) {
         Operator source = !node.children().isEmpty() ? translateRead(node.children().get(0)) : null;
         if (!hasStorage() || source == null || collector == null || mutations == null) {
-            return new MockCommandExecutor(PlanNodeKind.DELETE);
+            throw new IllegalStateException("Storage manager, collector, and mutations are required to translate DELETE");
         }
         return new DeleteExecutor(source, spec, collector, mutations);
     }
 
     private CommandExecutor buildCreateIndex(PlanNode node, CreateIndexSpec spec) {
-        if (!hasStorage()) {
-            return new MockCommandExecutor(PlanNodeKind.CREATE_INDEX);
+        if (!hasStorage() || mutations == null) {
+            throw new IllegalStateException("Storage manager and mutations are required to translate CREATE_INDEX");
         }
         return new CreateIndexExecutor(spec, mutations);
     }
 
     private CommandExecutor buildCreateTable(PlanNode node, sqlike.shared.CreateTableSpec spec) {
-        if (!hasStorage()) {
-            return new MockCommandExecutor(PlanNodeKind.CREATE_TABLE);
+        if (!hasStorage() || mutations == null) {
+            throw new IllegalStateException("Storage manager and mutations are required to translate CREATE_TABLE");
         }
         return new CreateTableExecutor(spec, mutations);
     }
 
     private CommandExecutor buildDropTable(PlanNode node, sqlike.shared.DropTableSpec spec) {
-        if (!hasStorage()) {
-            return new MockCommandExecutor(PlanNodeKind.DROP_TABLE);
+        if (!hasStorage() || mutations == null) {
+            throw new IllegalStateException("Storage manager and mutations are required to translate DROP_TABLE");
         }
         return new DropTableExecutor(spec, mutations);
     }
