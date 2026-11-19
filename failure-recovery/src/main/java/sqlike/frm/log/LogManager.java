@@ -5,6 +5,7 @@ import java.nio.channels.*;
 import java.nio.file.*;
 import java.time.Instant;
 import java.util.*;
+import sqlike.contract.IWalDurability;
 import sqlike.shared.*;
 import sqlike.frm.checkpoint.*;
 import static java.nio.file.StandardOpenOption.*;
