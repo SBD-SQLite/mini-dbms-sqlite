@@ -819,6 +819,12 @@ public class QP3TestDriver {
         }
 
         @Override
+        public sqlike.shared.IndexStatistics getIndexStatistics(String name) {
+            return new sqlike.shared.IndexStatistics(java.util.OptionalInt.of(1), java.util.OptionalInt.of(1),
+                    java.util.OptionalLong.of(1), java.util.OptionalLong.of(1), false);
+        }
+
+        @Override
         public void flushAll() {
         }
 

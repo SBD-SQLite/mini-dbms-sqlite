@@ -101,6 +101,7 @@ public final class StubStorage implements IStorageManager, TransactionScope {
     @Override public TableStatistics getStatistics(String table) {
         getSchema(table); return new TableStatistics(rows.keySet().stream().filter(r -> r.pageId().tableId().equals(table)).count(), 1, 0, 128, Map.of());
     }
+    @Override public IndexStatistics getIndexStatistics(String name) { return new IndexStatistics(OptionalInt.of(1), OptionalInt.of(1), OptionalLong.of(1), OptionalLong.of(1), false); }
     @Override public List<IndexMetadata> getIndexes(String table) { return definitions.stream().filter(i -> i.tableName().equals(table)).toList(); }
     @Override public void createIndex(IndexMetadata definition) {
         new Schema(getSchema(definition.tableName())).offset(ColumnRef.of(definition.tableName(), definition.columnName()));
