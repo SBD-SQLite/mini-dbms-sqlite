@@ -3,7 +3,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"  
 
-mvn -q -pl query-optimizer -am test-compile
+# clean: stale classes of removed sources (e.g. the old sqlike.contract copies) must not shadow shared/.
+mvn -q -pl query-optimizer -am clean test-compile
 
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) SEP=";" ;;

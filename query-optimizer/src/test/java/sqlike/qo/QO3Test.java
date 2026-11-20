@@ -204,6 +204,30 @@ public final class QO3Test {
             expectSemantic(() -> binder.bind(optimizer.parseQuery(
                     "SELECT * FROM students JOIN dept ON students.id = 1 AND students.name")));
         });
+        test("JOIN ON and comma joins reject ambiguous unqualified columns", () -> {
+            for (String sql : List.of(
+                    "SELECT * FROM students JOIN dept ON dept_id = 2",
+                    "SELECT * FROM students JOIN dept ON students.dept_id = dept_id",
+                    "SELECT dept_id FROM students JOIN dept ON students.dept_id = dept.dept_id",
+                    "SELECT * FROM students, dept WHERE dept_id = 2",
+                    "SELECT * FROM students AS s JOIN dept AS d ON s.dept_id = d.dept_id WHERE dept_id = 2"))
+                expectSemanticMessage(sql, "ambiguous", () -> optimizer.optimizeQuery(optimizer.parseQuery(sql)));
+            optimizer.optimizeQuery(optimizer.parseQuery(
+                    "SELECT dname FROM students JOIN dept ON students.dept_id = dept.dept_id WHERE gpa > 3.0"));
+        });
+        test("WHERE rejects non-boolean conditions in every statement", () -> {
+            for (String sql : List.of(
+                    "SELECT * FROM students WHERE id",
+                    "SELECT * FROM students WHERE id + 1",
+                    "SELECT * FROM students WHERE id = 1 AND gpa",
+                    "SELECT * FROM students WHERE name AND id = 1",
+                    "UPDATE students SET gpa = 4.0 WHERE id",
+                    "DELETE FROM students WHERE gpa",
+                    "DELETE FROM takes WHERE course_id = 100 AND grade",
+                    "SELECT * FROM students WHERE EXISTS (SELECT * FROM takes WHERE grade)",
+                    "SELECT * FROM students WHERE id IN (SELECT id FROM takes WHERE course_id)"))
+                expectSemanticMessage(sql, "boolean", () -> optimizer.optimizeQuery(optimizer.parseQuery(sql)));
+        });
         test("ambiguous NATURAL JOIN input column reports semantic error", () -> {
             try {
                 binder.bind(optimizer.parseQuery("SELECT * FROM students JOIN dept ON students.dept_id = dept.dept_id NATURAL JOIN dept"));
@@ -678,6 +702,17 @@ public final class QO3Test {
             throw new AssertionError("expected semantic error");
         } catch (QoException error) {
             if (error.getInfo().code() != ErrorCode.SEMANTIC_ERROR) throw error;
+        }
+    }
+
+    private static void expectSemanticMessage(String sql, String fragment, Runnable action) {
+        try {
+            action.run();
+            throw new AssertionError("expected semantic error for: " + sql);
+        } catch (QoException error) {
+            if (error.getInfo().code() != ErrorCode.SEMANTIC_ERROR
+                    || !error.getMessage().toLowerCase().contains(fragment))
+                throw new AssertionError(sql + " -> " + error.getInfo().code() + ": " + error.getMessage());
         }
     }
 
