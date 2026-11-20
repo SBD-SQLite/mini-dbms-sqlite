@@ -133,10 +133,10 @@ class BonusAndContractTest {
 
         @Test void deletedRecordSpaceIsReclaimedByLaterInserts() {
             List<RID> rids = new java.util.ArrayList<>();
-            for (int k = 0; k < 40; k++) rids.add(db.insert("items", item(k, "name" + k, 1, "C")));
+            for (int k = 0; k < 40; k++) rids.add(db.insert("items", item(k, String.format("name%03d", k), 1, "C")));
             long pages = db.blocks.getPageCount("t_items");
             for (RID rid : rids.subList(0, 20)) db.sm.delete("items", rid, db.next());
-            for (int k = 100; k < 120; k++) db.insert("items", item(k, "name" + k, 1, "C"));
+            for (int k = 100; k < 120; k++) db.insert("items", item(k, String.format("name%03d", k), 1, "C")); // same width as the deleted rows
             assertEquals(40, scan(db.sm, "items").size());
             assertEquals(pages, db.blocks.getPageCount("t_items"), "freed slots should be reused, not new pages");
         }
