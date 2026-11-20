@@ -15,6 +15,7 @@ import sqlike.record.RecordManager;
 import sqlike.catalog.CatalogManager;
 import sqlike.statistics.StatisticsManager;
 import sqlike.index.IndexManager;
+import sqlike.index.IndexHelper;
 import sqlike.buffer.BufferPoolManager;
 import sqlike.shared.IndexCondition;
 import sqlike.shared.IndexMetadata;
@@ -24,6 +25,7 @@ import sqlike.shared.RID;
 import sqlike.shared.Record;
 import sqlike.shared.RecordCursor;
 import sqlike.shared.RecordImage;
+import sqlike.shared.SchemaImage;
 import sqlike.shared.TableSchema;
 import sqlike.shared.TableStatistics;
 import sqlike.shared.Value;
@@ -35,6 +37,7 @@ public final class StorageManager implements IStorageManager {
     private final IndexManager indexes;
     private final BufferPoolManager buffer;
     private BlockManager blocks;
+    private SnapshotManager snapshots;
     private static final Pattern FILE_ID = Pattern.compile("[A-Za-z0-9_-]+");
 
     public StorageManager(
@@ -140,8 +143,19 @@ public final class StorageManager implements IStorageManager {
 
     @Override
     public void restoreRecord(String table, RID rid, RecordImage image, long lsn) throws StorageException {
-        records.restoreRecord(table, rid, image, lsn);
-        invalidateStatistics(table);
+        synchronized (records) {
+            Optional<Record> before = records.fetch(table, rid);
+            records.restoreRecord(table, rid, image, lsn);
+            Optional<Record> after = records.fetch(table, rid);
+            try {
+                if (before.isPresent() || after.isPresent()) indexes.onUpdate(table, before.orElse(null), after.orElse(null), lsn);
+            } catch (RuntimeException failure) {
+                rollbackRecord(table, rid, before.map(record -> new RecordImage(true, record.values()))
+                        .orElseGet(() -> new RecordImage(false, List.of())), lsn, failure);
+                throw failure;
+            }
+            invalidateStatistics(table);
+        }
     }
 
     @Override
@@ -165,6 +179,12 @@ public final class StorageManager implements IStorageManager {
     }
 
     @Override
+    public void createIndex(IndexMetadata definition, long lsn) {
+        ensureDdlDurable(lsn);
+        createIndex(definition);
+    }
+
+    @Override
     public List<IndexMetadata> getIndexes(String table) throws StorageException {
         return catalog.getIndexes(table);
     }
@@ -181,6 +201,53 @@ public final class StorageManager implements IStorageManager {
 
     public void setBlockManager(BlockManager blocks) {
         this.blocks = blocks;
+        this.snapshots = new SnapshotManager(blocks.getDataDirectory(), catalog.getCatalogFile());
+    }
+
+    private void ensureDdlDurable(long lsn) {
+        if (lsn <= 0) throw new StorageException(StorageErrorCode.INVALID_VALUE, "DDL requires positive LSN");
+        buffer.ensureWalDurable(lsn);
+    }
+
+    private SnapshotManager snapshots() {
+        if (snapshots == null) {
+            BlockManager source = blocks != null ? blocks : statistics == null ? null : statistics.getBlocks();
+            if (source == null) throw new StorageException(StorageErrorCode.INVALID_STATE, "Snapshot needs BlockManager");
+            snapshots = new SnapshotManager(source.getDataDirectory(), catalog.getCatalogFile());
+        }
+        return snapshots;
+    }
+
+    @Override
+    public synchronized String createSnapshot() {
+        synchronized (records) {
+            records.ensureIdle();
+            flushAll();
+            return snapshots().createSnapshot();
+        }
+    }
+
+    @Override
+    public synchronized void restoreSnapshot(String snapshotId) {
+        synchronized (records) {
+            snapshots().validate(snapshotId);
+            records.ensureIdle();
+            buffer.discardAllForRestore();
+            snapshots().restoreSnapshot(snapshotId);
+            onSnapshotRestored();
+        }
+    }
+
+    @Override
+    public void createTable(TableSchema schema, long lsn) {
+        ensureDdlDurable(lsn);
+        createTable(schema);
+    }
+
+    @Override
+    public void dropTable(String table, DropBehavior behavior, long lsn) {
+        ensureDdlDurable(lsn);
+        dropTable(table, behavior);
     }
 
     private void invalidateStatistics(String table) throws StorageException {
@@ -234,7 +301,8 @@ public final class StorageManager implements IStorageManager {
 
         // Remember indexes before they disappear from the catalog (their files must go too).
         Set<String> indexFileIds = new LinkedHashSet<>();
-        for (IndexMetadata index : catalog.getIndexes(root.tableName())) indexFileIds.add("idx_" + index.indexName());
+        List<IndexMetadata> oldIndexes = catalog.getIndexes(root.tableName());
+        for (IndexMetadata index : oldIndexes) indexFileIds.add(IndexHelper.storageId(index));
 
         Map<String, TableSchema> savedSchemas = catalog.snapshotSchemas();
         Map<String, IndexMetadata> savedIndexes = catalog.snapshotIndexes();
@@ -251,6 +319,7 @@ public final class StorageManager implements IStorageManager {
         }
 
         if (statistics != null) statistics.forget(root.tableName());
+        indexes.forgetIndexes(oldIndexes);
         BlockManager files = blocks != null ? blocks : statistics == null ? null : statistics.getBlocks();
         StorageException failure = null;
         if (buffer != null) {
@@ -269,6 +338,7 @@ public final class StorageManager implements IStorageManager {
         for (String id : ids) {
             if (!FILE_ID.matcher(id).matches()) continue; // index name that never had a file
             try {
+                if (buffer != null && !id.equals(root.tableId())) buffer.discardFile(id);
                 files.deleteFile(id);
             } catch (StorageException e) {
                 if (failure == null) failure = e; else failure.addSuppressed(e);
@@ -283,11 +353,40 @@ public final class StorageManager implements IStorageManager {
     }
 
     public synchronized void onSnapshotRestored() throws StorageException {
-        catalog.load();
         if (buffer != null) buffer.invalidateAll();
+        catalog.load();
+        records.resetAfterRestore();
+        indexes.reloadAll();
         if (statistics != null) {
             statistics.reset();
             statistics.recomputeAll();
+        }
+    }
+
+    @Override
+    public synchronized void restoreSchema(SchemaImage image, long lsn) {
+        ensureDdlDurable(lsn);
+        synchronized (records) {
+            records.ensureIdle();
+            if (image == null || image.tableName() == null) throw new StorageException(StorageErrorCode.INVALID_VALUE, "Invalid schema image");
+            if (image.schema().isEmpty()) {
+                if (catalog.tableExists(image.tableName())) dropTable(image.tableName(), DropBehavior.CASCADE);
+                return;
+            }
+            TableSchema schema = image.schema().orElseThrow();
+            if (image.snapshotId().isPresent()) {
+                snapshots().validate(image.snapshotId().get());
+                buffer.discardFile(schema.tableId());
+                snapshots().restoreTable(image.snapshotId().get(), schema.tableId());
+            }
+            if (catalog.tableExists(image.tableName())) {
+                for (IndexMetadata old : catalog.getIndexes(image.tableName())) catalog.unregisterIndex(old.indexName());
+                catalog.replaceSchema(schema);
+            } else catalog.registerTable(schema);
+            for (IndexMetadata metadata : image.indexes()) catalog.registerIndex(metadata);
+            catalog.save();
+            indexes.reloadAll();
+            if (statistics != null) statistics.reset();
         }
     }
 

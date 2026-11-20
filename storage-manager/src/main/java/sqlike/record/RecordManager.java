@@ -61,6 +61,17 @@ public class RecordManager {
         return Map.copyOf(reservations);
     }
 
+    public synchronized void ensureIdle() {
+        if (!reservations.isEmpty() || !cursors.isEmpty()) {
+            throw new StorageException(INVALID_STATE, "Active cursor or insert reservation prevents maintenance");
+        }
+    }
+
+    public synchronized void resetAfterRestore() {
+        ensureIdle();
+        finishedReservations.clear();
+    }
+
     // Public Method
     public synchronized RecordCursor scan(String table) throws StorageException {
         TableSchema schema = resolveTable(table);

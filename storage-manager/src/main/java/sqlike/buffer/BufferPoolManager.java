@@ -185,9 +185,28 @@ public class BufferPoolManager{
             }
             frames.clear();
             replacement.clear();
+            unsynced.clear();
         } finally {
             lock.unlock();
         }
+    }
+
+    public void discardAllForRestore() {
+        invalidateAll();
+        blocks.close();
+    }
+
+    public void discardFile(String tableId) {
+        lock.lock();
+        try {
+            discardFrames(tableId);
+            unsynced.remove(tableId);
+        } finally { lock.unlock(); }
+    }
+
+    public void ensureWalDurable(long lsn) {
+        if (lsn <= 0) throw new StorageException(StorageErrorCode.INVALID_VALUE, "Invalid LSN");
+        wal.ensureDurable(lsn);
     }
 
     public void close() throws StorageException {

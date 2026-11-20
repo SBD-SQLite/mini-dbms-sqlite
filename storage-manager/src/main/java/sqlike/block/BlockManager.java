@@ -169,6 +169,10 @@ public class BlockManager {
         return pageSize;
     }
 
+    public Path getDataDirectory() {
+        return dataDirectory.toAbsolutePath().normalize();
+    }
+
     // ------------------------------------------------------------------ helper privat
 
     /** tableId -> path. "idx_*" menjadi .idx, lainnya .tbl. */
