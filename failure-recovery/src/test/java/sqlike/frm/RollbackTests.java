@@ -189,7 +189,7 @@ public final class RollbackTests {
         f.log.logAbort(1);
     }
 
-private static void schemaChangeRolledBack() {
+    private static void schemaChangeRolledBack() {
         Fixture f = new Fixture();
         RecordingSm sm = new RecordingSm(f.sm);
         RollbackManager rollback = new RollbackManager(f.log, sm);
@@ -197,7 +197,7 @@ private static void schemaChangeRolledBack() {
         f.begin(1);
         SchemaImage before = new SchemaImage("t2", Optional.empty(), List.of(), Optional.empty());
         TableSchema created = new TableSchema("t2", "t2",
-                List.of(new ColumnSchema("id", DataType.INTEGER, 4, false)),
+                List.of(new ColumnSchema("id", DataType.INTEGER, Optional.empty())),
                 List.of("id"),
                 List.of());
         SchemaImage after = new SchemaImage("t2", Optional.of(created), List.of(), Optional.empty());
@@ -223,7 +223,7 @@ private static void schemaChangeRolledBack() {
         // 1. DDL: CREATE TABLE t2
         SchemaImage s0 = new SchemaImage("t2", Optional.empty(), List.of(), Optional.empty());
         TableSchema v1 = new TableSchema("t2", "t2",
-                List.of(new ColumnSchema("id", DataType.INTEGER, 4, false)),
+                List.of(new ColumnSchema("id", DataType.INTEGER, Optional.empty())),
                 List.of("id"),
                 List.of());
         SchemaImage s1 = new SchemaImage("t2", Optional.of(v1), List.of(), Optional.empty());
@@ -236,8 +236,8 @@ private static void schemaChangeRolledBack() {
         // 3. DDL: ALTER TABLE t2 (tambah kolom nama)
         TableSchema v2 = new TableSchema("t2", "t2",
                 List.of(
-                        new ColumnSchema("id", DataType.INTEGER, 4, false),
-                        new ColumnSchema("nama", DataType.VARCHAR, 50, true)),
+                        new ColumnSchema("id", DataType.INTEGER, Optional.empty()),
+                        new ColumnSchema("nama", DataType.VARCHAR, Optional.of(50))),
                 List.of("id"),
                 List.of());
         SchemaImage s2 = new SchemaImage("t2", Optional.of(v2), List.of(), Optional.empty());

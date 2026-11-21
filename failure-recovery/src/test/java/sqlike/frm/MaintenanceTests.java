@@ -33,6 +33,7 @@ import sqlike.shared.RID;
 import sqlike.shared.RecordImage;
 import sqlike.shared.RecoveryTarget;
 import sqlike.shared.RecoveryTargetKind;
+import sqlike.shared.SchemaImage;
 import sqlike.shared.Value;
 
 /**
@@ -474,6 +475,10 @@ public final class MaintenanceTests {
             }
         }
 
+        public void restoreSchema(SchemaImage image, long lsn) {
+            throw new UnsupportedOperationException("the maintenance tests do not change schemas");
+        }
+
         public void flushAll() {
             if (failFlushOnce) {
                 failFlushOnce = false;
@@ -584,6 +589,11 @@ public final class MaintenanceTests {
 
         public void writeAt(String table, RID rid, RecordImage image, long lsn) {
             inner.writeAt(table, rid, image, lsn);
+        }
+
+        public void restoreSchema(SchemaImage image, long lsn) {
+            events.add("restoreSchema");
+            inner.restoreSchema(image, lsn);
         }
 
         public void flushAll() {
