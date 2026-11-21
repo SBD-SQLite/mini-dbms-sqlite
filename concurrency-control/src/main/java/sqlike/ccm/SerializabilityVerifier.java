@@ -95,12 +95,13 @@ public class SerializabilityVerifier {
     }
 
     private boolean resourcesOverlap(ResourceId r1, ResourceId r2) {
-        if (r1.equals(r2)) {
-            return true;
-        }
-        if (!r1.tableName().equals(r2.tableName())) {
+        // Both protocols treat table names case-insensitively, so the verifier must do the same.
+        if (!r1.tableName().equalsIgnoreCase(r2.tableName())) {
             return false;
         }
-        return r1.scope() == ResourceScope.TABLE || r2.scope() == ResourceScope.TABLE;
+        if (r1.scope() == ResourceScope.TABLE || r2.scope() == ResourceScope.TABLE) {
+            return true;
+        }
+        return r1.rid().equals(r2.rid());
     }
 }

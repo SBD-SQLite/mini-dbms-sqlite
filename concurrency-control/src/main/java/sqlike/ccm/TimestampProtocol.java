@@ -227,7 +227,9 @@ public class TimestampProtocol implements IConcurrencyProtocol {
             }
             return Resources.catalog();
         }
-        
+        if ((resource.scope() == ResourceScope.RECORD) != resource.rid().isPresent()) {
+            throw new IllegalArgumentException("Only record resources must carry a RID");
+        }
         return new ResourceId(ResourceScope.TABLE, name, Optional.empty());
     }
 

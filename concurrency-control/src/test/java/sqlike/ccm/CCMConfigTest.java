@@ -13,6 +13,7 @@ public final class CCMConfigTest {
         check.test("defaults are documented values", CCMConfigTest::defaults);
         check.test("copies change only their own setting", CCMConfigTest::copies);
         check.test("invalid settings are rejected", CCMConfigTest::invalid);
+        check.test("the deadlock bound sets the wait-for graph check interval", CCMConfigTest::deadlockInterval);
         check.done();
     }
 
@@ -33,6 +34,13 @@ public final class CCMConfigTest {
         require(config.applyDrainTimeoutMs() == 250, "drain copy");
         require(config.protocol() == ProtocolType.LOCK_BASED && config.deadlockTimeoutMs() == 5000L,
                 "other settings are kept");
+    }
+
+    private static void deadlockInterval() {
+        require(CCMConfig.defaults().deadlockCheckIntervalMs() == 100L, "the default bound checks every 100 ms");
+        require(new CCMConfig(ProtocolType.LOCK_BASED, 500L).deadlockCheckIntervalMs() == 50L, "500 ms bound checks every 50 ms");
+        require(new CCMConfig(ProtocolType.LOCK_BASED, 20L).deadlockCheckIntervalMs() == 10L, "never faster than 10 ms");
+        require(new CCMConfig(ProtocolType.LOCK_BASED, 600_000L).deadlockCheckIntervalMs() == 100L, "never slower than 100 ms");
     }
 
     private static void invalid() throws Exception {

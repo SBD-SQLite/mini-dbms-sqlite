@@ -41,6 +41,7 @@ public final class ConcurrencyControlManagerTest {
         check.test("a failed rollback keeps the transaction FAILED and its locks", ConcurrencyControlManagerTest::rollbackStuck);
         check.test("a deadlock victim whose rollback fails is answered ABORTED and the other tx keeps waiting",
                 ConcurrencyControlManagerTest::deadlockVictimRollbackFails);
+        check.test("a malformed resource is rejected without touching the transaction", ConcurrencyControlManagerTest::malformedResource);
         check.test("a failed logAbort keeps the locks until a retry works", ConcurrencyControlManagerTest::logAbortStuck);
         check.test("write access locks without logging", ConcurrencyControlManagerTest::writeAccess);
         check.test("a schema write locks the catalog and logs one schema change", ConcurrencyControlManagerTest::schemaWrite);
@@ -253,6 +254,27 @@ public final class ConcurrencyControlManagerTest {
             granted(get(olderRequest));
         } finally {
             pool.shutdownNow();
+        }
+    }
+
+    private static void malformedResource() {
+        for (ProtocolType protocol : ProtocolType.values()) {
+            Rig r = rig(new CCMConfig(protocol, 5000L, 3, 5L, 300L));
+            long tx = begin(r);
+            ResourceId tableWithRid = new ResourceId(sqlike.shared.ResourceScope.TABLE, "a",
+                    Optional.of(new sqlike.shared.RID(new sqlike.shared.PageId("a", 0L), 1)));
+            ResourceId recordWithoutRid = new ResourceId(sqlike.shared.ResourceScope.RECORD, "a", Optional.empty());
+            for (ResourceId bad : new ResourceId[] {tableWithRid, recordWithoutRid}) {
+                AccessResponse read = r.ccm().requestRead(tx, bad);
+                require(read.status() == AccessStatus.ABORTED && code(read.error()) == ErrorCode.INVALID_VALUE,
+                        protocol + ": a malformed read must be rejected with INVALID_VALUE, got " + read);
+                AccessResponse write = r.ccm().requestWriteAccess(tx, bad);
+                require(write.status() == AccessStatus.ABORTED && code(write.error()) == ErrorCode.INVALID_VALUE,
+                        protocol + ": a malformed write access must be rejected with INVALID_VALUE, got " + write);
+            }
+            granted(r.ccm().requestRead(tx, record("a", 1)));
+            require(r.ccm().commit(tx).status() == TransactionStatus.COMMITTED,
+                    protocol + ": the transaction stays usable after a malformed request");
         }
     }
 

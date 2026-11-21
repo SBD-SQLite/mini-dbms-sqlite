@@ -40,6 +40,14 @@ public record CCMConfig(
         return new CCMConfig(ProtocolType.LOCK_BASED, 5000L);
     }
 
+    /**
+     * How often the wait-for graph is checked while a request waits: a tenth of the deadlock bound, between
+     * 10 ms and 100 ms, so a deadlock is always found well inside {@code deadlockTimeoutMs}.
+     */
+    public long deadlockCheckIntervalMs() {
+        return Math.max(10L, Math.min(100L, deadlockTimeoutMs / 10));
+    }
+
     public CCMConfig withRollbackRetry(int attempts, long delayMs) {
         return new CCMConfig(protocol, deadlockTimeoutMs, attempts, delayMs, applyDrainTimeoutMs);
     }
