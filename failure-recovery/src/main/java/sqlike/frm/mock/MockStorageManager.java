@@ -118,6 +118,7 @@ public class MockStorageManager implements SmPort {
         if (image.schema().isEmpty()) {
             schemas.remove(table);
             tables.remove(table);
+            dirtyPageLsn.remove(table); // otherwise the next flush writes the dropped table back
             try {
                 Files.deleteIfExists(tablesDir.resolve(table + TABLE_SUFFIX));
             } catch (IOException error) {
