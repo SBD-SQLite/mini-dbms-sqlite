@@ -100,6 +100,7 @@ public final class QpIntegrationDriver {
             run(p + "INT-08 Kegagalan WAL pada izin tulis membatalkan transaksi", protocol, QpIntegrationDriver::walFailureOnChange);
             run(p + "INT-09 Kegagalan logCommit: bukan COMMITTED, lock ditahan sampai recovery", protocol, QpIntegrationDriver::commitUnknown);
             run(p + "INT-10 Perubahan skema (DDL) lewat requestSchemaWrite dan WAL FRM", protocol, QpIntegrationDriver::schemaChange);
+            run(p + "INT-16 Abort transaksi DDL: FRM mengundo lewat restoreSchema, tanpa sisa", protocol, QpIntegrationDriver::schemaChangeAbort);
             run(p + "INT-12 Restart: FRM.recover, lalu initAfterRecovery; redo commit, undo aktif", protocol, QpIntegrationDriver::restartRecovery);
             run(p + "INT-13 Checkpoint FRM: timeout idle tidak membocorkan gerbang, lalu sukses", protocol, QpIntegrationDriver::checkpointTimeoutThenSuccess);
             run(p + "INT-14 Akses setelah ABORT ditolak", protocol, QpIntegrationDriver::accessAfterAbort);
@@ -108,7 +109,6 @@ public final class QpIntegrationDriver {
         run("[LOCK_BASED] INT-05 Deadlock: korban termuda ABORTED dan datanya diundo", ProtocolType.LOCK_BASED, QpIntegrationDriver::deadlock);
         run("[TIMESTAMP_BASED] INT-11 Tulis oleh transaksi lebih tua ditolak", ProtocolType.TIMESTAMP_BASED, QpIntegrationDriver::timestampViolation);
 
-        knownGapDdlRollback();
 
         System.out.println();
         System.out.println("Total: " + passed + "/" + (passed + failed) + " skenario integrasi LULUS");
@@ -368,30 +368,17 @@ public final class QpIntegrationDriver {
                 "jadwal committed conflict serializable");
     }
 
-    /**
-     * Known gap, reported but not counted: FRM refuses to roll back a transaction that holds a
-     * SCHEMA_CHANGE (SmPort has no restoreSchema), so CCM keeps that transaction FAILED with its locks.
-     */
-    private static void knownGapDdlRollback() {
-        String outcome;
-        try (Rig r = Rig.open(tempDir(), ProtocolType.LOCK_BASED, true)) {
-            TxId tx = r.begin();
-            WritePermit permit = r.adapter.authorizeSchemaChange(
-                    new SchemaChangeRecord(new ChangeId(tx, 1), tx, createTable("gap")));
-            try (WriteLease lease = r.adapter.acquireApplyLease(permit)) {
-                r.adapter.confirmApplied(permit.changeId());
-            }
-            TransactionState state;
-            try {
-                state = r.adapter.abort(tx, "test");
-            } catch (RuntimeException e) {
-                state = r.adapter.getState(tx);
-            }
-            outcome = "abort transaksi DDL -> " + state + ", sisa CCM: '" + r.ccm.leftoverState() + "'";
-        } catch (Exception e) {
-            outcome = "tidak bisa diperiksa: " + e;
+    /** FRM rolls back a SCHEMA_CHANGE through SmPort.restoreSchema, so a DDL abort ends ABORTED with no lock left. */
+    private static void schemaChangeAbort(Rig r) {
+        TxId tx = r.begin();
+        WritePermit permit = r.adapter.authorizeSchemaChange(
+                new SchemaChangeRecord(new ChangeId(tx, 1), tx, createTable("ddl_abort")));
+        try (WriteLease lease = r.adapter.acquireApplyLease(permit)) {
+            r.adapter.confirmApplied(permit.changeId());
         }
-        System.out.println("[CELAH ] FRM tidak bisa rollback DDL (butuh SmPort.restoreSchema): " + outcome);
+        TransactionState state = r.adapter.abort(tx, "test");
+        expect(state == TransactionState.ABORTED, "abort DDL -> " + state + ", harus ABORTED");
+        expect(r.ccm.leftoverState().isEmpty(), "sisa CCM: '" + r.ccm.leftoverState() + "'");
     }
 
     // ---------------------------------------------------------------- rig

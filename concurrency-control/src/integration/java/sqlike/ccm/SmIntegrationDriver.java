@@ -44,6 +44,7 @@ import sqlike.shared.Record;
 import sqlike.shared.RecordImage;
 import sqlike.shared.RecoveryResult;
 import sqlike.shared.ResourceId;
+import sqlike.shared.SchemaChange;
 import sqlike.shared.SchemaImage;
 import sqlike.shared.TableSchema;
 import sqlike.shared.TransactionStatus;
@@ -63,8 +64,7 @@ import sqlike.storage.StorageManager;
  * <p>FRM reaches the SM through {@link RealSmPort}, which CCM owns: FRM's own StorageManagerAdapter
  * calls createSnapshot/restoreSnapshot, which the real SM does not have yet, and FRM.recover() takes a
  * baseline snapshot on first startup, so RealSmPort copies the SM data files itself. Tables are created
- * directly on the SM during setup, outside any transaction (the SM has no restoreSchema yet, so DDL
- * rollback stays out of scope here). Every scenario runs on a fresh data directory and must leave no
+ * directly on the SM during setup, outside any transaction. Every scenario runs on a fresh data directory and must leave no
  * lock or protocol data behind (ConcurrencyControlManager.leftoverState).
  */
 public final class SmIntegrationDriver {
@@ -93,6 +93,7 @@ public final class SmIntegrationDriver {
             run(p + "SM-04 INSERT lalu ABORT: RID asli kosong lagi", protocol, SmIntegrationDriver::insertAbort);
             run(p + "SM-05 Dua transaksi pada RID berbeda di satu tabel: penulis kedua menunggu (eskalasi ke tabel)", protocol, SmIntegrationDriver::differentRidsSameTable);
             run(p + "SM-06 Banyak INSERT: RID asli unik di beberapa page", protocol, SmIntegrationDriver::manyInserts);
+            run(p + "SM-08 CREATE TABLE lalu ABORT: FRM memanggil restoreSchema di SM asli, tabel hilang", protocol, SmIntegrationDriver::createTableAbort);
             run(p + "SM-07 Restart: SM dibuka ulang, FRM.recover, initAfterRecovery; redo commit, undo aktif", protocol, SmIntegrationDriver::restartRecovery);
         }
 
@@ -140,6 +141,28 @@ public final class SmIntegrationDriver {
         expect(r.value(rid).equals(Optional.of(5)), "record ada sebelum abort");
         expect(r.abort(tx) == TransactionStatus.ABORTED, "abort ABORTED");
         expect(r.value(rid).isEmpty(), "RID " + rid + " kosong lagi setelah undo, dapat " + r.value(rid));
+    }
+
+    private static void createTableAbort(Rig r) {
+        long tx = r.begin();
+        String name = "tabel_baru";
+        TableSchema schema = new TableSchema("77", name, List.of(
+                new ColumnSchema("id", DataType.INTEGER, Optional.empty())));
+        SchemaChange change = new SchemaChange(
+                List.of(new SchemaImage(name, Optional.empty(), List.of(), Optional.empty())),
+                List.of(new SchemaImage(name, Optional.of(schema), List.of(), Optional.empty())));
+        AccessResponse write = untilDecided(() -> r.ccm.requestSchemaWrite(tx, change));
+        expect(write.status() == AccessStatus.GRANTED && write.changeLSN().isPresent(), "requestSchemaWrite GRANTED, dapat " + write);
+        long lsn = write.changeLSN().get();
+        expect(r.ccm.beginApply(tx, lsn), "beginApply diizinkan untuk LSN " + lsn);
+        try {
+            r.sm.createTable(schema, lsn);
+        } finally {
+            r.ccm.endApply(tx, lsn);
+        }
+        expect(r.sm.listTables().contains(name), "tabel ada sebelum abort");
+        expect(r.abort(tx) == TransactionStatus.ABORTED, "abort DDL ABORTED");
+        expect(!r.sm.listTables().contains(name), "tabel hilang setelah restoreSchema");
     }
 
     private static void differentRidsSameTable(Rig r) {
@@ -381,7 +404,7 @@ public final class SmIntegrationDriver {
 
         @Override
         public void restoreSchema(SchemaImage image, long lsn) {
-            throw new UnsupportedOperationException("the real SM has no restoreSchema yet");
+            sm.restoreSchema(image, lsn);
         }
 
         @Override
