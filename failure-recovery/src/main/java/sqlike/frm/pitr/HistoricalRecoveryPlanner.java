@@ -58,7 +58,7 @@ public class HistoricalRecoveryPlanner {
 
         List<LogRecord> changes = new ArrayList<>();
         for (LogRecord record : visible) {
-            if (isDataChange(record.type())
+            if (isReplayable(record.type())
                     && record.lsn() > base.baseLSN()
                     && record.lsn() <= targetLSN
                     && committed.contains(record.txID().orElseThrow())) {
@@ -92,7 +92,8 @@ public class HistoricalRecoveryPlanner {
                 "transaction " + txId + " has no COMMIT on the current timeline");
     }
 
-    private static boolean isDataChange(LogType type) {
-        return type == LogType.INSERT || type == LogType.UPDATE || type == LogType.DELETE;
+    private static boolean isReplayable(LogType type) {
+        return type == LogType.INSERT || type == LogType.UPDATE || type == LogType.DELETE
+                || type == LogType.SCHEMA_CHANGE;
     }
 }

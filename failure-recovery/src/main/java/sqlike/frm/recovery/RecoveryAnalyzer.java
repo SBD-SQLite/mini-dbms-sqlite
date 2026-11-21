@@ -122,7 +122,7 @@ public class RecoveryAnalyzer {
         for (LogRecord rec : records) {
             if (rec.lsn() < plan.startLsn) continue;
             
-            if (rec.type() == LogType.INSERT || rec.type() == LogType.UPDATE || rec.type() == LogType.DELETE) {
+            if (isChangeRecord(rec.type())) {
                 if (rec.txID().isPresent() && plan.committedTx.contains(rec.txID().get())) {
                     plan.redoChanges.add(rec);
                 } else {

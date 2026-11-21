@@ -14,6 +14,7 @@ import sqlike.frm.port.SmPort;
 import sqlike.shared.DataChange;
 import sqlike.shared.RecoveryTarget;
 import sqlike.shared.RecoveryTargetKind;
+import sqlike.shared.SchemaImage;
 
 /**
  * Restores the database to a point in time or to a committed transaction (FR-05). A failure
@@ -156,8 +157,14 @@ public class PointInTimeRecovery {
 
     private void replay(HistoricalRecoveryPlan plan) {
         for (LogRecord record : plan.changesToReplay()) {
-            DataChange change = record.change().orElseThrow();
-            storageManager.writeAt(change.tableName(), change.rid(), change.after(), record.lsn());
+            if (record.schemaChange().isPresent()) {
+                for (SchemaImage image : record.schemaChange().get().after()) {
+                    storageManager.restoreSchema(image, record.lsn());
+                }
+            } else {
+                DataChange change = record.change().orElseThrow();
+                storageManager.writeAt(change.tableName(), change.rid(), change.after(), record.lsn());
+            }
         }
     }
 
