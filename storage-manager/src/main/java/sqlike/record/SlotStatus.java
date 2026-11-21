@@ -4,5 +4,7 @@ public enum SlotStatus {
     EMPTY,
     RESERVED,
     OCCUPIED,
-    DELETED
+    DELETED,
+    FORWARD,
+    MOVED
 }

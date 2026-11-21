@@ -61,6 +61,17 @@ public class RecordManager {
         return Map.copyOf(reservations);
     }
 
+    public synchronized void ensureIdle() {
+        if (!reservations.isEmpty() || !cursors.isEmpty()) {
+            throw new StorageException(INVALID_STATE, "Active cursor or insert reservation prevents maintenance");
+        }
+    }
+
+    public synchronized void resetAfterRestore() {
+        ensureIdle();
+        finishedReservations.clear();
+    }
+
     // Public Method
     public synchronized RecordCursor scan(String table) throws StorageException {
         TableSchema schema = resolveTable(table);
@@ -93,7 +104,7 @@ public class RecordManager {
                             }
                             while (slotId < current.getSlotCount()) {
                                 int slot = slotId++;
-                                Optional<byte[]> bytes = current.getRecordBytes(slot);
+                                Optional<byte[]> bytes = resolve(schema.tableId(), current, slot);
                                 if (bytes.isPresent()) {
                                     next = new Record(new RID(new PageId(schema.tableId(), pageNumber), slot),
                                             serializer.deserialize(bytes.get(), schema));
@@ -157,8 +168,7 @@ public class RecordManager {
         if (rid.pageId().pageNumber() >= buffer.getPageCount(schema.tableId())) return Optional.empty();
         Page page = buffer.fetchPage(rid.pageId());
         try {
-            return readPage(page).getRecordBytes(rid.slotId())
-                    .map(bytes -> new Record(rid, serializer.deserialize(bytes, schema)));
+            return resolve(schema.tableId(), readPage(page), rid.slotId()).map(bytes -> new Record(rid, serializer.deserialize(bytes, schema)));
         } catch (IllegalArgumentException | IllegalStateException failure) {
             throw new StorageException(IO_ERROR, "Page record rusak: " + rid, failure);
         } finally { buffer.unpinPage(rid.pageId()); }
@@ -307,15 +317,21 @@ public class RecordManager {
         Page page = buffer.fetchPage(rid.pageId());
         try {
             SlottedPage slotted = readPage(page);
-            byte[] before = slotted.getRecordBytes(rid.slotId()).orElse(null);
+            byte[] before = resolve(schema.tableId(), slotted, rid.slotId()).orElse(null);
             if (mode == WriteMode.MODIFY && before == null) throw new StorageException(RECORD_NOT_FOUND, "Record tidak ditemukan: " + rid);
             if (before == null && bytes == null) return;
             boolean changed = !Arrays.equals(before, bytes);
-            if (bytes == null) slotted.deleteSlot(rid.slotId());
+            Optional<long[]> forward = slotted.getForward(rid.slotId());
+            if (forward.isPresent() && mode == WriteMode.INSERT) throw new StorageException(INVALID_RESERVATION, "RID reservasi tidak ditemukan: " + rid);
+            if (forward.isPresent()) writeForwarded(schema, rid, slotted, forward.get(), bytes, lsn);
+            else if (bytes == null) slotted.deleteSlot(rid.slotId());
             else if (mode == WriteMode.INSERT) slotted.insertAtSlot(rid.slotId(), bytes);
             else if (mode == WriteMode.MODIFY) {
-                if (!slotted.updateRecordBytes(rid.slotId(), bytes)) throw new StorageException(INVALID_VALUE, "Record membesar melebihi kapasitas page: " + rid);
-            } else slotted.putAtSlot(rid.slotId(), bytes);
+                if (!slotted.updateRecordBytes(rid.slotId(), bytes)) relocate(schema, rid, slotted, bytes, lsn);
+            } else {
+                try { slotted.putAtSlot(rid.slotId(), bytes); }
+                catch (IllegalArgumentException noRoom) { relocate(schema, rid, slotted, bytes, lsn); }
+            }
             slotted.setPageLSN(lsn);
             savePage(page, slotted);
             if (changed) {
@@ -327,6 +343,61 @@ public class RecordManager {
         } catch (IllegalStateException failure) {
             throw new StorageException(IO_ERROR, "Slot record rusak: " + rid, failure);
         } finally { buffer.unpinPage(rid.pageId()); }
+    }
+    private Optional<byte[]> resolve(String tableId, SlottedPage page, int slot) {
+        Optional<byte[]> direct = page.getRecordBytes(slot);
+        if (direct.isPresent()) return direct;
+        Optional<long[]> forward = page.getForward(slot);
+        if (forward.isEmpty()) return Optional.empty();
+        PageId id = new PageId(tableId, forward.get()[0]);
+        Page target = buffer.fetchPage(id);
+        try {
+            return readPage(target).getMovedBytes((int) forward.get()[1]);
+        } finally { buffer.unpinPage(id); }
+    }
+
+    private void writeForwarded(TableSchema schema, RID rid, SlottedPage origin, long[] forward, byte[] bytes, long lsn) {
+        PageId targetId = new PageId(schema.tableId(), forward[0]);
+        int targetSlot = (int) forward[1];
+        Page target = buffer.fetchPage(targetId);
+        try {
+            SlottedPage moved = readPage(target);
+            if (bytes != null && moved.updateRecordBytes(targetSlot, bytes)) {
+                moved.setPageLSN(lsn);
+                savePage(target, moved);
+                return;
+            }
+            moved.deleteSlot(targetSlot);
+            moved.setPageLSN(lsn);
+            savePage(target, moved);
+        } finally { buffer.unpinPage(targetId); }
+        if (bytes == null) origin.deleteSlot(rid.slotId());
+        else relocate(schema, rid, origin, bytes, lsn);
+    }
+
+    private void relocate(TableSchema schema, RID rid, SlottedPage origin, byte[] bytes, long lsn) {
+        if (!SlottedPage.fitsEmptyPage(buffer.getPageSize(), bytes.length)) {
+            throw new StorageException(INVALID_VALUE, "Record tidak muat dalam satu page: " + rid);
+        }
+        String tableId = schema.tableId();
+        long count = buffer.getPageCount(tableId);
+        for (long number = 0; number <= count; number++) {
+            if (number == rid.pageId().pageNumber()) continue;
+            PageId id = new PageId(tableId, number);
+            Page page = number < count ? buffer.fetchPage(id) : buffer.newPage(tableId);
+            try {
+                SlottedPage target = readPage(page);
+                Optional<Integer> slot = target.reserveSlot(bytes.length);
+                if (slot.isEmpty()) continue;
+                target.insertAtSlot(slot.get(), bytes);
+                target.markMoved(slot.get());
+                target.setPageLSN(lsn);
+                savePage(page, target);
+                origin.forwardSlot(rid.slotId(), number, slot.get());
+                return;
+            } finally { buffer.unpinPage(page.getPageId()); }
+        }
+        throw new StorageException(INVALID_STATE, "Gagal memindahkan record: " + rid);
     }
 
     private void savePage(Page page, SlottedPage slotted) {
