@@ -92,9 +92,10 @@ public class PureRealFullAcceptanceTest {
         final QpBootstrap bootstrap;
 
         static RealDbmsStack open(Path rootDir, IndexType defaultIndexType) throws Exception {
-            Files.createDirectories(rootDir);
-            BlockManager blockManager = new BlockManager(rootDir.resolve("data"));
-            CatalogManager catalog = new CatalogManager(rootDir.resolve("catalog.dat"));
+            Path dataDir = rootDir.resolve("data");
+            Files.createDirectories(dataDir);
+            BlockManager blockManager = new BlockManager(dataDir);
+            CatalogManager catalog = new CatalogManager(dataDir.resolve("catalog.dat"));
             catalog.load();
 
             LRUReplacementPolicy policy = new LRUReplacementPolicy();
@@ -126,6 +127,7 @@ public class PureRealFullAcceptanceTest {
             IndexManager indexes = new IndexManager(catalog, records, bufferPool, serializer, buildLsnSupplier);
             StorageManager realSm = new StorageManager(records, catalog, stats, indexes, bufferPool);
             realSm.setBlockManager(blockManager);
+            indexes.loadIndexes();
 
             IConcurrencyControlManager[] ccmHolder = new IConcurrencyControlManager[1];
             CcmPort ccmPort = new CcmPort() {
@@ -808,16 +810,19 @@ public class PureRealFullAcceptanceTest {
                 client.run(new BufferedReader(new StringReader(
                         "\\help\n"
                         + "CREATE TABLE m4_notes (id INTEGER PRIMARY KEY, body VARCHAR(40));\n"
+                        + "CREATE INDEX idx_m4_notes_id ON m4_notes(id);\n"
                         + "INSERT INTO m4_notes VALUES (1, 'PersistAcrossRestart');\n"
                         + "EXIT;\n")));
             }
             String outText = cliOut.toString();
             check(outText.contains("SQLike CLI commands:"), "QP-01 CliClient \\help prints help");
             check(outText.contains("Table m4_notes created successfully"), "M4 TCP CliClient executed CREATE TABLE");
+            check(outText.contains("Index idx_m4_notes_id created successfully"), "M4 TCP CliClient executed CREATE INDEX");
             check(!outText.contains("ERROR"), "QP-01 CliClient EXIT; disconnects cleanly without syntax error");
         }
 
         // Restart QpServerMain on the SAME directory -> SampleDatabaseLoader must NOT overwrite user data (PRD §14/§16)
+        // and persisted index idx_m4_notes_id must be loaded cleanly before crash recovery / queries.
         try (sqlike.qp.QpServerMain.RunningServer restarted = sqlike.qp.QpServerMain.start(
                 lockDir, ephemeralCfg, ProtocolType.LOCK_BASED, true)) {
             Session s = restarted.processor().openSession();
@@ -826,7 +831,25 @@ public class PureRealFullAcceptanceTest {
                     "SELECT body FROM m4_notes WHERE id = 1;", 1);
             check(persisted.rows().get(0).get(0).textValue().orElse("").equals("PersistAcrossRestart"),
                     "User data ('PersistAcrossRestart') preserved across QpServerMain restart");
-            restarted.processor().closeSession(s.sessionId());
+            // Simulate an uncommitted write on an indexed table followed by an abrupt crash.
+            expectOk(restarted.processor(), s, "M4 QpServerMain BEGIN before crash on indexed table", "BEGIN;");
+            expectAffected(restarted.processor(), s, "M4 QpServerMain uncommitted INSERT on indexed m4_notes",
+                    "INSERT INTO m4_notes VALUES (2, 'UncommittedCrashRow');", 1);
+            restarted.storage().flushAll();
+            restarted.simulateCrash();
+        }
+
+        // Restart again after crash on indexed table -> loadIndexes() + FRM.recover() must undo row 2 cleanly.
+        try (sqlike.qp.QpServerMain.RunningServer recovered = sqlike.qp.QpServerMain.start(
+                lockDir, ephemeralCfg, ProtocolType.LOCK_BASED, true)) {
+            Session s = recovered.processor().openSession();
+            expectRows(recovered.processor(), s,
+                    "M4 QpServerMain crash recovery preserves committed row 1 on indexed m4_notes",
+                    "SELECT body FROM m4_notes WHERE id = 1;", 1);
+            expectRows(recovered.processor(), s,
+                    "M4 QpServerMain crash recovery undoes uncommitted row 2 on indexed m4_notes",
+                    "SELECT body FROM m4_notes WHERE id = 2;", 0);
+            recovered.processor().closeSession(s.sessionId());
         }
 
         // 15b. Production QpServerMain with TIMESTAMP_BASED protocol (CC-02 & CC-08) + 2 concurrent clients
