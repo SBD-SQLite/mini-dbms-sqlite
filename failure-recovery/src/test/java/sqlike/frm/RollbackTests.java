@@ -16,13 +16,16 @@ import sqlike.frm.mock.RecordCodec;
 import sqlike.frm.port.SmPort;
 import sqlike.frm.rollback.RollbackManager;
 import sqlike.shared.ChangeOperation;
+import sqlike.shared.ColumnSchema;
 import sqlike.shared.DataChange;
+import sqlike.shared.DataType;
 import sqlike.shared.ErrorCode;
 import sqlike.shared.PageId;
 import sqlike.shared.RID;
 import sqlike.shared.RecordImage;
 import sqlike.shared.SchemaChange;
 import sqlike.shared.SchemaImage;
+import sqlike.shared.TableSchema;
 import sqlike.shared.Value;
 
 /**
@@ -57,8 +60,8 @@ public final class RollbackTests {
         run("aborted transaction is left unchanged", RollbackTests::abortedIsNoOp);
         run("SM failure is propagated, not swallowed", RollbackTests::smFailurePropagates);
         run("retry after a failure part-way gives the correct result", RollbackTests::retryAfterFailure);
-        run("schema change is rejected with UNSUPPORTED_OPERATION", RollbackTests::schemaChangeRejected);
-        run("schema change is rejected before any compensation is logged", RollbackTests::schemaChangeRejectedFirst);
+        run("schema change rollback restores before-image schema and logs CLR", RollbackTests::schemaChangeRolledBack);
+        run("mixed DML and DDL rollback undoes in reverse order", RollbackTests::mixedDmlAndSchemaChangeRolledBack);
 
         System.out.printf("%n%d passed, %d failed%n", passed, failures.size());
         failures.forEach(f -> System.out.println("  FAIL " + f));
@@ -186,26 +189,72 @@ public final class RollbackTests {
         f.log.logAbort(1);
     }
 
-    private static void schemaChangeRejected() {
+private static void schemaChangeRolledBack() {
         Fixture f = new Fixture();
+        RecordingSm sm = new RecordingSm(f.sm);
+        RollbackManager rollback = new RollbackManager(f.log, sm);
+
         f.begin(1);
-        f.log.logSchemaChange(1, schemaChange());
-        expectError(() -> f.rollback.rollback(1), ErrorCode.UNSUPPORTED_OPERATION);
+        SchemaImage before = new SchemaImage("t2", Optional.empty(), List.of(), Optional.empty());
+        TableSchema created = new TableSchema("t2", "t2",
+                List.of(new ColumnSchema("id", DataType.INTEGER, 4, false)),
+                List.of("id"),
+                List.of());
+        SchemaImage after = new SchemaImage("t2", Optional.of(created), List.of(), Optional.empty());
+        f.sm.restoreSchema(after, 1L);
+
+        long ddlLsn = f.log.logSchemaChange(1, new SchemaChange(List.of(before), List.of(after)));
+        rollback.rollback(1);
+        f.log.logAbort(1);
+
+        expect(f.sm.getSchemaImage("t2"), Optional.empty(), "t2 schema removed on rollback");
+        expect(sm.restoredSchemas, List.of(before), "restoreSchema received before-image");
+        List<LogRecord> clrs = f.records(1, LogType.COMPENSATION);
+        expect(clrs.size(), 1, "one COMPENSATION for DDL");
+        expect(clrs.get(0).undoOfLSN().orElseThrow(), ddlLsn, "CLR points to DDL LSN");
     }
 
-    private static void schemaChangeRejectedFirst() {
+    private static void mixedDmlAndSchemaChangeRolledBack() {
         Fixture f = new Fixture();
-        f.begin(1);
-        f.log.logSchemaChange(1, schemaChange());
-        f.update(1, R1, row(1, "Ani", 1.0));
-        expectError(() -> f.rollback.rollback(1), ErrorCode.UNSUPPORTED_OPERATION);
-        expect(f.records(1, LogType.COMPENSATION).size(), 0, "COMPENSATION records");
-        expect(f.value(R1), row(1, "Ani", 1.0), "R1 untouched");
-    }
+        RecordingSm sm = new RecordingSm(f.sm);
+        RollbackManager rollback = new RollbackManager(f.log, sm);
 
-    private static SchemaChange schemaChange() {
-        SchemaImage absent = new SchemaImage("t2", Optional.empty(), List.of(), Optional.empty());
-        return new SchemaChange(List.of(absent), List.of(absent));
+        f.begin(1);
+        // 1. DDL: CREATE TABLE t2
+        SchemaImage s0 = new SchemaImage("t2", Optional.empty(), List.of(), Optional.empty());
+        TableSchema v1 = new TableSchema("t2", "t2",
+                List.of(new ColumnSchema("id", DataType.INTEGER, 4, false)),
+                List.of("id"),
+                List.of());
+        SchemaImage s1 = new SchemaImage("t2", Optional.of(v1), List.of(), Optional.empty());
+        long ddl1 = f.log.logSchemaChange(1, new SchemaChange(List.of(s0), List.of(s1)));
+        f.sm.restoreSchema(s1, ddl1);
+
+        // 2. DML: UPDATE R1 di tabel account
+        long dml1 = f.update(1, R1, row(1, "Ani", 50.0));
+
+        // 3. DDL: ALTER TABLE t2 (tambah kolom nama)
+        TableSchema v2 = new TableSchema("t2", "t2",
+                List.of(
+                        new ColumnSchema("id", DataType.INTEGER, 4, false),
+                        new ColumnSchema("nama", DataType.VARCHAR, 50, true)),
+                List.of("id"),
+                List.of());
+        SchemaImage s2 = new SchemaImage("t2", Optional.of(v2), List.of(), Optional.empty());
+        long ddl2 = f.log.logSchemaChange(1, new SchemaChange(List.of(s1), List.of(s2)));
+        f.sm.restoreSchema(s2, ddl2);
+
+        rollback.rollback(1);
+        f.log.logAbort(1);
+
+        // Verifikasi urutan undo: ddl2 -> dml1 -> ddl1
+        List<LogRecord> clrs = f.records(1, LogType.COMPENSATION);
+        expect(clrs.stream().map(r -> r.undoOfLSN().orElseThrow()).toList(),
+                List.of(ddl2, dml1, ddl1),
+                "COMPENSATION order (newest first)");
+        expect(f.value(R1), row(1, "Ani", 100.0), "R1 restored");
+        expect(f.sm.getSchemaImage("t2"), Optional.empty(), "t2 removed at the end");
+        expect(sm.restoredSchemas, List.of(s1, s0), "schema restored in reverse steps");
     }
 
     // ------------------------------------------------------------------ fixture
@@ -267,9 +316,10 @@ public final class RollbackTests {
         }
     }
 
-    /** Records the LSN of every write. */
+    /** Records the LSN of every write and schema restore. */
     private static final class RecordingSm extends DelegatingSm {
         final List<Long> lsns = new ArrayList<>();
+        final List<SchemaImage> restoredSchemas = new ArrayList<>();
 
         RecordingSm(SmPort inner) {
             super(inner);
@@ -279,6 +329,13 @@ public final class RollbackTests {
         public void writeAt(String table, RID rid, RecordImage image, long lsn) {
             lsns.add(lsn);
             super.writeAt(table, rid, image, lsn);
+        }
+
+        @Override
+        public void restoreSchema(SchemaImage image, long lsn) {
+            lsns.add(lsn);
+            restoredSchemas.add(image);
+            super.restoreSchema(image, lsn);
         }
     }
 
@@ -316,6 +373,11 @@ public final class RollbackTests {
         @Override
         public void writeAt(String table, RID rid, RecordImage image, long lsn) {
             inner.writeAt(table, rid, image, lsn);
+        }
+
+        @Override
+        public void restoreSchema(SchemaImage image, long lsn) {
+            inner.restoreSchema(image, lsn);
         }
 
         @Override
