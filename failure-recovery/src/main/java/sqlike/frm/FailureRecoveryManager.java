@@ -47,7 +47,9 @@ import sqlike.shared.SchemaImage;
  * {@link #ensureDurable(long)} is never gated, because SM must flush while recovery runs.
  *
  * <p>Startup ownership (PRD §14): only QP calls {@code CCM.initAfterRecovery(lastTxId)} with the
- * {@link RecoveryResult} returned here. For PITR, FRM calls it through {@link CcmPort}.
+ * {@link RecoveryResult} returned here. For PITR, FRM calls it through {@link CcmPort}. FRM and CCM
+ * need each other at construction; {@link sqlike.frm.adapter.DeferredCcmPort} connects them and
+ * describes the agreed startup order.
  *
  * <p>Errors leave as {@link FrmException} with an {@code ErrorInfo}; nothing is swallowed. A WAL
  * failure that FR2 marks as needing recovery, including a COMMIT whose outcome is unknown, moves
@@ -129,10 +131,8 @@ public class FailureRecoveryManager
      * Logs a DDL change (PRD v1.0 §3.5). QP reaches this through CCM's {@code requestSchemaWrite},
      * so the returned LSN is the one SM stamps on the catalog page it writes.
      *
-     * <p>Undo is not supported yet: FR3 rejects the rollback of a transaction holding a
-     * SCHEMA_CHANGE with {@code UNSUPPORTED_OPERATION}, because {@code SmPort} has no
-     * {@code restoreSchema}. The record is written anyway, so recovery and the log view see the
-     * DDL, and the caller finds out at rollback instead of silently losing the change.
+     * <p>A rollback undoes it like a data change: FR3 writes a COMPENSATION record, then restores
+     * the before-images through {@code SmPort.restoreSchema}, newest first.
      */
     @Override
     public long logSchemaChange(long txId, SchemaChange change) {
