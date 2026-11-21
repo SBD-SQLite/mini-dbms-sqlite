@@ -84,6 +84,21 @@ second on the javac source path: the QP copy of sqlike.contract and sqlike.stora
 driver never reaches (the query optimizer, other modules' tests) are not compiled, so a change there
 cannot break this run.
 
+End-to-end test through the real server (Milestone 3 and Final), from the repository root:
+  ./concurrency-control/run-e2e.sh [name filter, such as EE-02]
+This compiles QP, QO, CCM, SM, and FRM and starts the server as one process, with every client a separate
+CLI process over TCP (needs JDK 21 and python3, standard library only). Each case runs under both protocols
+where it applies and prints LULUS or GAGAL. It covers kill -9 of the server (a committed change survives, an
+uncommitted one is gone, txId continues, no stale lock), a deadlock of three clients and an S to X upgrade
+deadlock (youngest victim, within 5 seconds, data undone), a second writer that waits for the first, a client
+that disconnects mid-transaction, ABORT restoring the old value, a timestamp violation followed by a retry with
+a newer txId, no dirty read, eight clients on one counter without lost updates, aborted CREATE TABLE and
+DROP TABLE (rows restored from the snapshot), a clean SIGINT restart, and random money transfers between
+tables with the server killed in the middle (the total balance must stay the same).
+RandomScheduleTest (part of run-tests.sh) runs random concurrent transactions through the facade on both
+protocols, with and without injected WAL and rollback failures. Use -Dseeds=N to run more seeds: 3000 seeds
+per protocol passed.
+
 Real SM integration (Milestone 3), from the repository root:
   ./concurrency-control/run-sm-integration.sh
 This runs src/integration/java/sqlike/ccm/SmIntegrationDriver.java on the real Storage Manager
