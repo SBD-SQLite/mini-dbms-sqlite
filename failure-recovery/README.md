@@ -90,7 +90,7 @@ loan(id INTEGER, account_id INTEGER, amount FLOAT)                page 0, slot 0
 |---|---|---|
 | `startup-gate` | in-process | Log ditolak sebelum `recover()`, `ensureDurable` tetap boleh, `recover()` bisa diulang, `initAfterRecovery` dipanggil sekali oleh pemilik startup (QP) |
 | `log-view` | in-process | LSN unik dan naik, BEGIN/INSERT/UPDATE/DELETE/COMMIT per transaksi, isi before/after dan RID, filter txId, membaca log tidak mengubahnya (FR-01–FR-03) |
-| `schema-change-log` | in-process | `logSchemaChange` menulis record SCHEMA_CHANGE dengan isi `SchemaImage` utuh dan urut LSN bersama record data; rollback transaksi berisi perubahan skema ditolak `UNSUPPORTED_OPERATION` tanpa menulis COMPENSATION; permintaan tidak valid ditolak sebelum ada record |
+| `schema-change-log` | in-process | `logSchemaChange` menulis record SCHEMA_CHANGE dengan isi `SchemaImage` utuh dan urut LSN bersama record data; rollback transaksi berisi DROP TABLE dan UPDATE menulis COMPENSATION untuk keduanya dari yang terbaru, mengembalikan before-image skema lewat `restoreSchema`, dan mengembalikan data; permintaan tidak valid ditolak sebelum ada record |
 | `rollback` | in-process | Undo urutan terbalik pada RID yang sama, transaksi lain aman, ABORT final hanya satu, rollback ulang tidak mengubah data, rollback transaksi committed/tidak dikenal ditolak (FR-04) |
 | `checkpoint-timeout` | in-process | Checkpoint batal saat ada transaksi aktif tanpa flush, gate CCM selalu dibuka lagi, lalu berhasil dan mem-flush semua halaman (FR-06) |
 | `committed-not-flushed` | crash | Redo tiga transaksi committed yang halamannya belum di-flush, termasuk dua UPDATE pada record yang sama |
@@ -128,8 +128,9 @@ Di Windows, ganti `:` pada `-cp` dengan `;`.
 ## Integrasi dengan CCM asli
 
 `CcmIntegrationTests` (`src/integration/java`) menjalankan FRM bersama `ConcurrencyControlManager`
-asli, bukan `MockCCM`, untuk skenario PRD no. 6, 7, dan 9. Setiap skenario dijalankan dengan
-protokol `LOCK_BASED` dan `TIMESTAMP_BASED`.
+asli, bukan `MockCCM`, untuk skenario PRD no. 6, 7, dan 9, abort transaksi DDL, dan urutan
+startup. Setiap skenario, kecuali urutan startup, dijalankan dengan protokol `LOCK_BASED` dan
+`TIMESTAMP_BASED`.
 
 ```bash
 failure-recovery/run-ccm-integration.sh      # Linux / macOS / Git Bash
@@ -146,13 +147,13 @@ pada `shared`. Exit code `0` hanya jika semua skenario PASS.
 | PRD-7 abort setelah apply | Halaman berisi nilai uncommitted sudah di-evict ke disk; abort menulis before-image kembali; dengan `LOCK_BASED` transaksi kedua menunggu sampai abort selesai lalu mendapat record; setelah crash tanpa flush nilai di disk dikembalikan dan T1 tidak di-undo dua kali |
 | PRD-9 kegagalan WAL pada `requestWrite` | `requestWrite` ditolak tanpa LSN dengan `WAL_FAILURE`; FRM FAILED (fail-stop); CCM menahan T1 dan lock-nya karena rollback ditolak; transaksi baru ditolak; setelah restart recovery menutup T1 dengan ABORT dan txId berlanjut |
 | PRD-9 kegagalan WAL pada COMMIT | CCM tidak melaporkan COMMITTED (tetap `PARTIALLY_COMMITTED`) dan tidak meng-undo; lock ditahan; setelah restart recovery meng-undo nilai T1 di disk karena COMMIT tidak pernah durable |
+| Abort transaksi DDL | CREATE TABLE lewat `requestSchemaWrite` lalu UPDATE, kemudian abort: kedua perubahan mendapat COMPENSATION dari yang terbaru, tabel baru hilang (juga setelah flush), data kembali, CCM melepas katalog, dan DDL berikutnya mendapat katalog lalu commit |
+| Urutan startup | Sebelum `recover()` FRM menolak `logBegin` (`INVALID_STATE`) dan CCM menolak transaksi baru; `DeferredCcmPort` menolak dipakai sebelum `bind` dan menolak `bind` kedua; `recover()` pada startup pertama sebelum `bind` gagal (FRM FAILED) dengan pesan yang menyebut `bind`; urutan yang benar berakhir dengan transaksi yang commit |
 
 Kegagalan WAL adalah kegagalan I/O sungguhan di FR2: channel WAL ditutup di bawah `LogManager`
 (cara yang sama dengan `LogManagerTests`), sehingga error melewati facade lalu sampai ke CCM.
-FRM dan CCM saling membutuhkan saat dibuat, jadi tes memberi `CcmPort` ke FRM lebih dulu lalu
-menyambungkan `ConcurrencyControlAdapter` setelah CCM ada. Urutan startup mengikuti PRD §14:
-`frm.recover()` lalu `ccm.initAfterRecovery(lastTxId)`, peran yang di sistem penuh dijalankan QP.
-SM tetap `MockStorageManager` karena SM asli belum menyediakan `restoreRecord` dan snapshot.
+FRM dan CCM dirangkai dengan `DeferredCcmPort` mengikuti urutan startup di bawah. SM tetap
+`MockStorageManager` karena SM asli belum menyediakan `restoreRecord` dan snapshot.
 
 ## Mock
 
@@ -171,14 +172,32 @@ FRM yang diuji dipilih dengan `-Dfrm.factory=<kelas FrmFactory>`; default-nya fa
 `NOT_STARTED → RUNNING → READY | FAILED`, memvalidasi input (txId, bentuk `DataChange`,
 `RecoveryTarget`), dan melempar `FrmException` berisi `ErrorInfo`.
 
+### Urutan startup (PRD §14)
+
+FRM butuh `CcmPort` di konstruktornya, sedangkan CCM butuh facade FRM di konstruktornya, jadi
+salah satunya disambungkan belakangan lewat `DeferredCcmPort`:
+
 ```java
-FrmConfig config = FrmConfig.defaults(Path.of("data/wal.log"));   // checkpoint 60 s, idle timeout 30 s
+DeferredCcmPort ccmPort = new DeferredCcmPort();
 FailureRecoveryManager frm = new FailureRecoveryManager(
-        new StorageManagerAdapter(storageManager),
-        new ConcurrencyControlAdapter(ccm),
-        config,
-        rollbackManager);                                           // FR3
+        new StorageManagerAdapter(storageManager), ccmPort,
+        FrmConfig.defaults(Path.of("data/wal.log")));   // checkpoint 60 s, idle timeout 30 s
+// SM memakai frm sebagai gerbang WAL (IWalDurability.ensureDurable)
+ConcurrencyControlManager ccm = new ConcurrencyControlManager(frm, CCMConfig.defaults());
+ccmPort.bind(ccm);                              // wajib sebelum recover()
+RecoveryResult result = frm.recover();          // startup recovery
+ccm.initAfterRecovery(result.lastTxId());       // dipanggil QP (initialize(report)), lalu server dibuka
 ```
+
+1. Sebelum `recover()` selesai, FRM menolak semua pemanggilan log, rollback, checkpoint, dan
+   `recoverTo` dengan `INVALID_STATE` (FR-07). `ensureDurable` tetap boleh dipanggil karena SM
+   harus bisa flush selama recovery.
+2. `bind` harus sebelum `recover()`: pada startup pertama, recovery membuat checkpoint dasar yang
+   menjeda CCM. `DeferredCcmPort` yang belum di-`bind` menolak setiap panggilan dengan
+   `INVALID_STATE`, jadi urutan yang salah muncul sebagai error, bukan dianggap CCM sedang idle.
+3. `recover()` tidak memanggil `initAfterRecovery`. Menurut PRD §14 pemanggilan itu milik QP,
+   dan CCM menolak transaksi baru sampai pemanggilan itu terjadi. FRM sendiri hanya memanggilnya
+   setelah point-in-time recovery.
 
 Checkpoint berkala dimulai otomatis setelah `recover()` berhasil jika interval tidak nol.
 Interval nol hanya untuk pengujian khusus. Checkpoint manual, checkpoint berkala, dan `recoverTo`
@@ -209,7 +228,7 @@ Hasil pengujian (Windows 11, JDK 21):
 | `FRMDriver` | 10/10 skenario PASS |
 | `RollbackTests` (FR3) | 12/12 |
 | `MaintenanceTests` (FR4) | 18/18 |
-| `CcmIntegrationTests` (FRM + CCM asli) | 8/8 |
+| `CcmIntegrationTests` (FRM + CCM asli) | 11/11 |
 
 FR2 mewajibkan setiap perubahan transaksi punya record COMPENSATION (`logCompensation(txId, lsnAsli)`,
 urut LSN menurun) sebelum `logAbort` diterima; tanpa itu muncul `WalException "Rollback belum selesai untuk T<id>"`.
@@ -217,7 +236,7 @@ urut LSN menurun) sebelum `logAbort` diterima; tanpa itu muncul `WalException "R
 | Pemilik | Status |
 |---|---|
 | FR2 | Selesai (PR #64) |
-| FR3 | Selesai (PR #70): tiap undo menulis COMPENSATION lalu before-image dengan LSN CLR tersebut |
+| FR3 | Selesai (PR #70): tiap undo menulis COMPENSATION lalu before-image dengan LSN CLR tersebut; SCHEMA_CHANGE dikembalikan lewat `SmPort.restoreSchema` |
 | FR4 | Selesai (PR #65) |
 | FR5 | Selesai (PR #68): fase undo menulis COMPENSATION sebelum ABORT, dan record COMPENSATION diabaikan saat klasifikasi redo/undo |
 
@@ -225,6 +244,6 @@ urut LSN menurun) sebelum `logAbort` diterima; tanpa itu muncul `WalException "R
 
 | Hal | Keterangan |
 |---|---|
-| Undo perubahan skema | `SmPort.restoreSchema` belum ada, jadi FR3 menolak rollback transaksi yang punya record SCHEMA_CHANGE dengan `UNSUPPORTED_OPERATION` |
+| Perubahan skema saat crash recovery | `ChangeApplier` FR5 hanya menangani `DataChange`. SCHEMA_CHANGE milik transaksi yang belum selesai mendapat COMPENSATION dan ABORT, tetapi skemanya tidak dikembalikan lewat `restoreSchema`, dan redo DDL yang sudah commit juga dilewati |
 | LSN CLR di FR5 | `ChangeApplier.undo` menulis before-image dengan LSN record asli, bukan LSN CLR, sehingga page LSN bisa mundur. Tidak membuat skenario gagal |
 | Milestone 3 | Integrasi dengan CCM asli sudah diuji (`CcmIntegrationTests`); integrasi dengan SM asli belum |
