@@ -61,11 +61,11 @@ import sqlike.storage.StorageManager;
  * SM write stamped with the LSN, endApply. Per PRD section 9, CCM locks the record's table, so two
  * transactions on different RIDs of one table still wait for each other.
  *
- * <p>FRM reaches the SM through {@link RealSmPort}, which CCM owns: FRM's own StorageManagerAdapter
- * calls createSnapshot/restoreSnapshot, which the real SM does not have yet, and FRM.recover() takes a
- * baseline snapshot on first startup, so RealSmPort copies the SM data files itself. Tables are created
- * directly on the SM during setup, outside any transaction. Every scenario runs on a fresh data directory and must leave no
- * lock or protocol data behind (ConcurrencyControlManager.leftoverState).
+ * <p>FRM reaches the SM through {@link RealSmPort}, which CCM owns: it copies the flushed SM data files
+ * for the baseline snapshot FRM.recover() takes on first startup, and forwards restoreRecord and
+ * restoreSchema to the real SM. Tables are created directly on the SM during setup, outside any
+ * transaction. Every scenario runs on a fresh data directory and must leave no lock or protocol data
+ * behind (ConcurrencyControlManager.leftoverState).
  */
 public final class SmIntegrationDriver {
 
