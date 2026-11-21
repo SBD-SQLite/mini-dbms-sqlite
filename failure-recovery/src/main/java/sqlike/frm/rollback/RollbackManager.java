@@ -17,8 +17,6 @@ import sqlike.shared.DataChange;
 import sqlike.shared.ErrorCode;
 import sqlike.shared.SchemaChange;
 import sqlike.shared.SchemaImage;
-import sqlike.shared.SchemaChange;
-import sqlike.shared.SchemaImage;
 
 /**
  * Undoes one transaction during normal operation (FR3, FR-04, PRD v1.0 §11).
@@ -123,7 +121,6 @@ public class RollbackManager implements RollbackPort {
                 }
             }
             written++;
-        }
         }
         return written;
     }
