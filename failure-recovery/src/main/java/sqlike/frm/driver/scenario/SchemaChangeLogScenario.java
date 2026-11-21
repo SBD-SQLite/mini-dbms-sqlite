@@ -10,7 +10,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
-import sqlike.frm.FrmException;
 import sqlike.frm.driver.Fixtures;
 import sqlike.frm.driver.ScenarioContext;
 import sqlike.frm.driver.TestScenario;
@@ -18,7 +17,6 @@ import sqlike.frm.log.LogRecord;
 import sqlike.frm.log.LogType;
 import sqlike.shared.ColumnSchema;
 import sqlike.shared.DataType;
-import sqlike.shared.ErrorCode;
 import sqlike.shared.RID;
 import sqlike.shared.RecordImage;
 import sqlike.shared.SchemaChange;
@@ -31,9 +29,9 @@ import sqlike.shared.TableSchema;
  * SCHEMA_CHANGE record is written with the schema images intact, it shares the transaction's LSN
  * order with the data records, and a malformed request is refused before anything is logged.
  *
- * <p>It also pins the limitation down: undo of a schema change needs {@code SmPort.restoreSchema},
- * which does not exist yet, so FR3 refuses the whole rollback with {@code UNSUPPORTED_OPERATION}
- * and writes no COMPENSATION. The caller is told instead of losing the DDL silently.
+ * <p>It also rolls back a transaction that mixes DDL and DML (FR3, FR-04): every change gets a
+ * COMPENSATION record, newest first, SM receives the schema before-image through
+ * {@code SmPort.restoreSchema}, and the data change is undone.
  */
 public class SchemaChangeLogScenario extends TestScenario {
 
@@ -41,7 +39,7 @@ public class SchemaChangeLogScenario extends TestScenario {
 
     public SchemaChangeLogScenario() {
         super("schema-change-log",
-                "T1 CREATE TABLE + INSERT commits; T2 DROP TABLE + UPDATE cannot roll back (no restoreSchema)");
+                "T1 CREATE TABLE + INSERT commits; T2 DROP TABLE + UPDATE rolls back schema and data");
     }
 
     @Override
@@ -67,22 +65,24 @@ public class SchemaChangeLogScenario extends TestScenario {
         ctx.check(ctx.showLogs(Optional.of(1L)).contains(NEW_TABLE),
                 "showLogs(T1) mentions the table the DDL created");
 
-        // T2: a DDL plus a data change, and the rollback that FR3 must refuse.
+        // T2: a DDL plus a data change, rolled back newest first (CCM's abort path).
         ctx.begin(2);
-        ctx.frm().logSchemaChange(2, dropTable());
-        ctx.update(2, A2, values(account(2, "Budi", 77.0, "JKT")));
+        SchemaChange dropped = dropTable();
+        long ddl2 = ctx.frm().logSchemaChange(2, dropped);
+        long update2 = ctx.update(2, A2, values(account(2, "Budi", 77.0, "JKT")));
+        ctx.abort(2);
 
-        Optional<RuntimeException> refused = ctx.expectFailure(
-                "rollback of a transaction with a schema change is refused",
-                () -> ctx.frm().rollback(2));
-        refused.ifPresent(error -> {
-            ctx.check(error instanceof FrmException, "rollback refusal is an FrmException: " + error);
-            if (error instanceof FrmException frm) {
-                ctx.check(frm.getCode() == ErrorCode.UNSUPPORTED_OPERATION,
-                        "rollback refusal carries UNSUPPORTED_OPERATION, got " + frm.getCode());
-            }
-        });
-        checkTypes(ctx, 2, List.of(LogType.BEGIN, LogType.SCHEMA_CHANGE, LogType.UPDATE));
+        checkTypes(ctx, 2, List.of(LogType.BEGIN, LogType.SCHEMA_CHANGE, LogType.UPDATE,
+                LogType.COMPENSATION, LogType.COMPENSATION, LogType.ABORT));
+        List<Long> undone = new ArrayList<>();
+        for (LogRecord record : ctx.readLogs(Optional.of(2L))) {
+            record.undoOfLSN().ifPresent(undone::add);
+        }
+        ctx.check(undone.equals(List.of(update2, ddl2)),
+                "COMPENSATION records undo the UPDATE, then the SCHEMA_CHANGE: " + undone);
+        ctx.check(ctx.sm().getSchemaImage(Fixtures.LOAN).equals(Optional.of(dropped.before().get(0))),
+                "SM got the schema before-image of " + Fixtures.LOAN + " back: "
+                        + ctx.sm().getSchemaImage(Fixtures.LOAN));
 
         // Invalid requests are refused before a record is written.
         long before = lastLsn(ctx);
@@ -138,11 +138,9 @@ public class SchemaChangeLogScenario extends TestScenario {
 
     @Override
     public Map<String, Map<RID, RecordImage>> expected() {
-        // T1 committed its INSERT. T2's UPDATE stays applied: the rollback was refused, so FRM
-        // undid nothing, and no recovery runs in an in-process scenario.
+        // T1 committed its INSERT; T2 was rolled back, so A2 keeps its baseline value.
         return Fixtures.expectedFromBaseline()
                 .put(A5, account(5, "Eka", 42.0, "MLG"))
-                .put(A2, account(2, "Budi", 77.0, "JKT"))
                 .build();
     }
 }

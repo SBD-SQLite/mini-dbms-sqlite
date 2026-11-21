@@ -53,6 +53,7 @@ public class MockStorageManager implements SmPort {
     private final Path tablesDir;
     private final Path snapshotsDir;
     private final Map<String, TreeMap<RID, List<Value>>> tables = new TreeMap<>();
+    private final Map<String, SchemaImage> schemas = new TreeMap<>();
     private final Map<String, Long> dirtyPageLsn = new HashMap<>();
     private IWalDurability wal;
 
@@ -117,6 +118,37 @@ public class MockStorageManager implements SmPort {
             table(image.tableName());
         }
         dirtyPageLsn.merge(image.tableName(), lsn, Math::max);
+    }
+
+    @Override
+    public synchronized void restoreSchema(SchemaImage image, long lsn) {
+        Objects.requireNonNull(image, "image");
+        if (lsn < 0) {
+            throw new IllegalArgumentException("lsn must not be negative");
+        }
+        String table = image.tableName();
+        if (!TABLE_NAME.matcher(table).matches()) {
+            throw new IllegalArgumentException("invalid table name: " + table);
+        }
+        if (image.schema().isEmpty()) {
+            schemas.remove(table);
+            tables.remove(table);
+            dirtyPageLsn.remove(table); // otherwise the next flush writes the dropped table back
+            try {
+                Files.deleteIfExists(tablesDir.resolve(table + TABLE_SUFFIX));
+            } catch (IOException error) {
+                throw new UncheckedIOException("failed removing table file for " + table, error);
+            }
+        } else {
+            schemas.put(table, image);
+            table(table);
+            dirtyPageLsn.merge(table, lsn, Math::max);
+        }
+    }
+
+    /** Helper untuk inspeksi skema di unit test. */
+    public synchronized java.util.Optional<SchemaImage> getSchemaImage(String table) {
+        return java.util.Optional.ofNullable(schemas.get(table));
     }
 
     @Override

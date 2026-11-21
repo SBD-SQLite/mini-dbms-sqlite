@@ -22,7 +22,7 @@ import sqlike.storage.StorageException;
  * <ul>
  *   <li>{@code readAt} uses {@code fetch}; an empty result becomes {@code exists=false}.</li>
  *   <li>{@code writeAt} uses {@code restoreRecord}, which keeps the RID and creates no new WAL.</li>
- *   <li>{@code restoreSchema} restores a table's catalog schema, indexes and snapshot for DDL undo.</li>
+ *   <li>{@code restoreSchema} uses {@code restoreSchema}, reverting table catalog/indexes without new WAL.</li>
  *   <li>Checked {@link StorageException}s become {@link FrmException}s from component SM, so FRM
  *       never continues after a failed write.</li>
  * </ul>
@@ -60,6 +60,10 @@ public class StorageManagerAdapter implements SmPort {
     public void restoreSchema(SchemaImage image, long lsn) {
         try {
             storage.restoreSchema(image, lsn);
+        } catch (UnsupportedOperationException error) {
+            throw new FrmException(ErrorCode.UNSUPPORTED_OPERATION, ComponentType.SM,
+                    "SM restoreSchema " + image.tableName() + " at LSN " + lsn + " failed: " + error.getMessage(),
+                    error);
         } catch (StorageException error) {
             throw failure("restoreSchema " + image.tableName() + " at LSN " + lsn, error);
         }
