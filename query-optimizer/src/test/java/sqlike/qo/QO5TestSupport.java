@@ -73,16 +73,22 @@ final class QO5TestSupport {
     }
 
     static Rows eval(PlanNode plan, Map<String, List<List<Object>>> data, IStorageManager storage) {
+        return eval(plan, data, storage, List.of(), List.of());
+    }
+
+    private static Rows eval(PlanNode plan, Map<String, List<List<Object>>> data, IStorageManager storage,
+                             List<ResultColumn> outerSchema, List<Object> outerRow) {
         if (plan.kind() == PlanNodeKind.SCAN)
             return new Rows(plan.outputColumns(), data.get(plan.scan().orElseThrow().tableName().toLowerCase(Locale.ROOT)));
         if (plan.kind() == PlanNodeKind.INDEX_SCAN) return indexScan(plan, data, storage);
-        if (QO5Plans.isJoin(plan)) return join(plan, data, storage);
-        Rows input = eval(plan.children().get(0), data, storage);
+        if (QO5Plans.isJoin(plan)) return join(plan, data, storage, outerSchema, outerRow);
+        Rows input = eval(plan.children().get(0), data, storage, outerSchema, outerRow);
         List<List<Object>> rows = new ArrayList<>();
         switch (plan.kind()) {
             case FILTER -> {
                 for (List<Object> row : input.values())
-                    if (Boolean.TRUE.equals(value(plan.predicate().orElseThrow(), input.schema(), row))) rows.add(row);
+                    if (Boolean.TRUE.equals(value(plan.predicate().orElseThrow(), input.schema(), row,
+                            data, storage, outerSchema, outerRow))) rows.add(row);
             }
             case PROJECT -> {
                 for (List<Object> row : input.values()) {
@@ -105,8 +111,10 @@ final class QO5TestSupport {
         return new Rows(plan.outputColumns(), List.copyOf(rows));
     }
 
-    private static Rows join(PlanNode plan, Map<String, List<List<Object>>> data, IStorageManager storage) {
-        Rows left = eval(plan.children().get(0), data, storage), right = eval(plan.children().get(1), data, storage);
+    private static Rows join(PlanNode plan, Map<String, List<List<Object>>> data, IStorageManager storage,
+                             List<ResultColumn> outerSchema, List<Object> outerRow) {
+        Rows left = eval(plan.children().get(0), data, storage, outerSchema, outerRow);
+        Rows right = eval(plan.children().get(1), data, storage, outerSchema, outerRow);
         JoinSpec spec = plan.join().orElseThrow();
         List<ResultColumn> input = new ArrayList<>(left.schema());
         input.addAll(right.schema());
@@ -121,7 +129,8 @@ final class QO5TestSupport {
                     matches &= compare(a.get(offset(left.schema(), unqualified)), b.get(offset(right.schema(), unqualified))) == 0;
                 }
             }
-            if (spec.condition().isPresent()) matches &= Boolean.TRUE.equals(value(spec.condition().get(), input, combined));
+            if (spec.condition().isPresent()) matches &= Boolean.TRUE.equals(value(spec.condition().get(), input, combined,
+                    data, storage, outerSchema, outerRow));
             if (matches) {
                 List<Object> output = new ArrayList<>();
                 for (ResultColumn column : plan.outputColumns()) output.add(combined.get(offset(input, column.source().orElseThrow())));
@@ -181,8 +190,27 @@ final class QO5TestSupport {
         throw new AssertionError("unavailable column " + column + " in " + schema);
     }
 
-    private static Object value(Expression expression, List<ResultColumn> schema, List<Object> row) {
-        if (expression.kind() == ExpressionKind.COLUMN) return row.get(offset(schema, expression.column().orElseThrow()));
+    private static Object value(Expression expression, List<ResultColumn> schema, List<Object> row,
+                                Map<String, List<List<Object>>> data, IStorageManager storage,
+                                List<ResultColumn> outerSchema, List<Object> outerRow) {
+        List<ResultColumn> scope = new ArrayList<>(schema); scope.addAll(outerSchema);
+        List<Object> values = new ArrayList<>(row); values.addAll(outerRow);
+        if (expression.kind() == ExpressionKind.COLUMN) return values.get(offset(scope, expression.column().orElseThrow()));
+        if (expression.kind() == ExpressionKind.SUBQUERY) {
+            SubquerySpec spec = expression.subquery().orElseThrow();
+            Rows result = eval(spec.root(), data, storage, scope, values);
+            return switch (spec.type()) {
+                case EXISTS -> !result.values().isEmpty();
+                case IN -> {
+                    Object probe = value(expression.operands().get(0), schema, row, data, storage, outerSchema, outerRow);
+                    yield probe != null && result.values().stream().anyMatch(item -> compare(probe, item.get(0)) == 0);
+                }
+                case SCALAR -> {
+                    check(result.values().size() <= 1, "scalar subquery returned multiple rows");
+                    yield result.values().isEmpty() ? null : result.values().get(0).get(0);
+                }
+            };
+        }
         if (expression.kind() == ExpressionKind.LITERAL) {
             Value literal = expression.literal().orElseThrow();
             return switch (literal.type()) {
@@ -191,9 +219,14 @@ final class QO5TestSupport {
                 case CHAR, VARCHAR -> literal.textValue().orElseThrow();
             };
         }
-        Object left = value(expression.operands().get(0), schema, row);
+        Object left = value(expression.operands().get(0), schema, row, data, storage, outerSchema, outerRow);
         if (expression.kind() == ExpressionKind.UNARY) return -((Number) left).doubleValue();
-        Object right = value(expression.operands().get(1), schema, row);
+        Object right = value(expression.operands().get(1), schema, row, data, storage, outerSchema, outerRow);
+        if (expression.operator().orElseThrow() == ExpressionOperator.AND) {
+            if (Boolean.FALSE.equals(left) || Boolean.FALSE.equals(right)) return false;
+            return left == null || right == null ? null : true;
+        }
+        if (left == null || right == null) return null;
         return switch (expression.operator().orElseThrow()) {
             case EQ -> compare(left, right) == 0;
             case NE -> compare(left, right) != 0;

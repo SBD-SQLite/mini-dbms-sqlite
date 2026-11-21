@@ -10,6 +10,7 @@ import sqlike.shared.PlanNode;
 public class JoinAccessPathOptimizer {
     private final JoinRewriter joinRewriter = new JoinRewriter();
     private final JoinOrderEnumerator joinEnumerator = new JoinOrderEnumerator();
+    private final DynamicProgrammingJoinOptimizer dynamicOptimizer = new DynamicProgrammingJoinOptimizer();
     private final PlanSelector planSelector = new PlanSelector();
     private final CostModel costModel;
     private final AccessPathOptimizer accessOptimizer;
@@ -60,31 +61,59 @@ public class JoinAccessPathOptimizer {
             return new OptimizationComparison(plan, cost, cost, OptionalDouble.empty(), 0);
         }
 
+        SearchResult heuristic = searchScopes(plan, false);
+        double heuristicCost = costModel.getCost(heuristic.plan());
+        if (geneticOptimizer == null)
+            return new OptimizationComparison(heuristic.plan(), heuristicCost, heuristicCost, OptionalDouble.empty(), 0);
+
+        // Compare complete pipelines: heuristic-only subqueries must not inherit GA improvements.
+        SearchResult genetic = searchScopes(plan, true);
+        PlanNode selected = planSelector.pickCheapest(List.of(heuristic.plan(), genetic.plan()), costModel);
+        return new OptimizationComparison(selected, costModel.getCost(selected), heuristicCost,
+                OptionalDouble.of(costModel.getCost(genetic.plan())), genetic.evaluatedIndividuals());
+    }
+
+    private record SearchResult(PlanNode plan, int evaluatedIndividuals) { }
+
+    private SearchResult searchScopes(PlanNode original, boolean useGenetic) {
+        int[] nestedEvaluations = { 0 };
+        PlanNode plan = QO5Scopes.mapSubqueries(original, subquery -> {
+            SearchResult nested = searchScopes(subquery, useGenetic);
+            nestedEvaluations[0] += nested.evaluatedIndividuals();
+            return nested.plan();
+        });
+
         PlanNode rewritten = joinRewriter.mergeSelectionIntoJoin(joinRewriter.cartesianToJoin(plan));
         var candidates = new LinkedHashSet<PlanNode>();
         for (PlanNode candidate : generateCandidates(rewritten))
-            candidates.add(QO5Plans.simplifyIdentityProjects(restoreOutputSchema(candidate, plan)));
+            candidates.add(normalize(restoreOutputSchema(candidate, plan)));
+        candidates.add(dynamicOptimizer.optimize(rewritten, costModel, this::prepareDynamicCandidate).plan());
         // Include the incoming baseline too; equivalent rewritten plans win equal-cost ties.
-        candidates.add(QO5Plans.simplifyIdentityProjects(plan));
+        candidates.add(normalize(plan));
+        candidates.add(normalize(original));
         PlanNode candidate = planSelector.pickCheapest(List.copyOf(candidates), costModel);
-        // Final shape: join reordering can leave PROJECT over PROJECT or a PROJECT equal to its input.
-        PlanNode result = ProjectionCleanup.normalize(QO5Plans.simplifyIdentityProjects(restoreOutputSchema(candidate, plan)));
+        PlanNode result = normalize(restoreOutputSchema(candidate, plan));
         PlanNodes.validate(result);
-        double heuristicCost = costModel.getCost(result);
-        if (geneticOptimizer == null)
-            return new OptimizationComparison(result, heuristicCost, heuristicCost, OptionalDouble.empty(), 0);
+        if (!useGenetic) return new SearchResult(result, nestedEvaluations[0]);
 
         GeneticJoinOrderOptimizer.Result genetic = geneticOptimizer.optimize(rewritten, costModel,
                 raw -> prepareGeneticCandidate(raw, plan));
-        PlanNode selected = ProjectionCleanup.normalize(planSelector.pickCheapest(List.of(result, genetic.plan()), costModel));
+        PlanNode selected = planSelector.pickCheapest(List.of(result, normalize(genetic.plan())), costModel);
         PlanNodes.validate(selected);
-        return new OptimizationComparison(selected, costModel.getCost(selected), heuristicCost,
-                OptionalDouble.of(genetic.estimatedCost()), genetic.evaluatedIndividuals());
+        return new SearchResult(selected, nestedEvaluations[0] + genetic.evaluatedIndividuals());
+    }
+
+    private PlanNode normalize(PlanNode plan) {
+        return ProjectionCleanup.normalize(QO5Plans.simplifyIdentityProjects(plan));
     }
 
     private PlanNode prepareGeneticCandidate(PlanNode candidate, PlanNode original) {
         PlanNode accessed = accessOptimizer == null ? candidate : accessOptimizer.chooseAccessPath(candidate, costModel);
-        return QO5Plans.simplifyIdentityProjects(restoreOutputSchema(accessed, original));
+        return normalize(restoreOutputSchema(accessed, original));
+    }
+
+    private PlanNode prepareDynamicCandidate(PlanNode candidate) {
+        return normalize(accessOptimizer == null ? candidate : accessOptimizer.chooseAccessPath(candidate, costModel));
     }
 
     private List<PlanNode> generateCandidates(PlanNode plan) {

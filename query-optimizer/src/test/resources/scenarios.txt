@@ -44,8 +44,7 @@ char-column-compare  | OK | SELECT * FROM takes WHERE grade = 'E'
 
 # --- outside the agreed contract / invalid values ---
 or-unsupported       | UNSUPPORTED_OPERATION | SELECT * FROM students WHERE id = 1 OR id = 2
-subquery-unsupported | UNSUPPORTED_OPERATION | SELECT * FROM students WHERE id IN (SELECT id FROM takes)
-int-overflow         | INVALID_VALUE         | SELECT * FROM students WHERE id = 2147483648
+int-overflow        | INVALID_VALUE         | SELECT * FROM students WHERE id = 2147483648
 
 # --- bonus: LIMIT and table alias (AS only) ---
 limit-basic          | OK                    | SELECT name FROM students LIMIT 5
@@ -59,10 +58,37 @@ limit-before-order   | SYNTAX_ERROR          | SELECT * FROM students LIMIT 5 OR
 alias-as-star        | OK                    | SELECT * FROM students AS s
 column-alias         | UNSUPPORTED_OPERATION | SELECT id AS x FROM students
 alias-missing-name   | SYNTAX_ERROR          | SELECT * FROM students AS
-# KNOWN ISSUE (waits for QO3): Binder does not resolve alias qualifiers yet; desired result is OK.
-alias-qualified-where  | XFAIL SEMANTIC_ERROR  | SELECT s.id FROM students AS s WHERE s.id = 1
-alias-join-on          | XFAIL SEMANTIC_ERROR  | SELECT * FROM students AS s JOIN dept AS d ON s.dept_id = d.dept_id
-alias-comma-join       | XFAIL SEMANTIC_ERROR  | SELECT s.name FROM students AS s, dept AS d WHERE s.dept_id = d.dept_id
+alias-qualified-where  | OK                    | SELECT s.id FROM students AS s WHERE s.id = 1
+alias-join-on          | OK                    | SELECT * FROM students AS s JOIN dept AS d ON s.dept_id = d.dept_id
+alias-comma-join       | OK                    | SELECT s.name FROM students AS s, dept AS d WHERE s.dept_id = d.dept_id
+alias-self-join        | OK                    | SELECT a.name, b.name FROM students AS a JOIN students AS b ON a.dept_id = b.dept_id WHERE a.id < b.id
+alias-hides-table-name | SEMANTIC_ERROR        | SELECT students.id FROM students AS s
+alias-duplicate        | SEMANTIC_ERROR        | SELECT * FROM students AS s, dept AS s
+
+# --- bonus: subquery in WHERE (SCALAR, IN, EXISTS; correlated and uncorrelated) ---
+subquery-in            | OK                    | SELECT * FROM students WHERE id IN (SELECT id FROM takes)
+subquery-in-filtered   | OK                    | SELECT name FROM students WHERE id IN (SELECT id FROM takes WHERE course_id = 100)
+subquery-scalar        | OK                    | SELECT name FROM students WHERE gpa > (SELECT gpa FROM students WHERE id = 1)
+subquery-exists        | OK                    | SELECT name FROM students WHERE EXISTS (SELECT * FROM takes)
+subquery-exists-corr   | OK                    | SELECT name FROM students AS s WHERE EXISTS (SELECT * FROM takes AS t WHERE t.id = s.id)
+subquery-in-corr       | OK                    | SELECT name FROM students AS s WHERE s.id IN (SELECT t.id FROM takes AS t WHERE t.course_id = s.dept_id)
+subquery-unknown-table | SEMANTIC_ERROR        | SELECT * FROM students WHERE id IN (SELECT id FROM nosuch)
+subquery-unclosed      | SYNTAX_ERROR          | SELECT * FROM students WHERE id IN (SELECT id FROM takes
+subquery-with-limit    | OK                    | SELECT name FROM students WHERE id IN (SELECT id FROM takes) LIMIT 2
+
+# --- bonus: CREATE TABLE / DROP TABLE ---
+create-table           | OK                    | CREATE TABLE course (cid INTEGER PRIMARY KEY, title VARCHAR(40), credit FLOAT, code CHAR(4))
+create-table-fk        | OK                    | CREATE TABLE enroll (eid INTEGER, sid INTEGER, PRIMARY KEY (eid), FOREIGN KEY (sid) REFERENCES students(id))
+create-table-duplicate | SEMANTIC_ERROR        | CREATE TABLE students (id INTEGER)
+create-table-dup-case  | SEMANTIC_ERROR        | CREATE TABLE STUDENTS (id INTEGER)
+create-table-dup-col   | SEMANTIC_ERROR        | CREATE TABLE t (a INTEGER, a FLOAT)
+create-table-no-length | SEMANTIC_ERROR        | CREATE TABLE t (a VARCHAR)
+create-table-fk-unknown | SEMANTIC_ERROR       | CREATE TABLE t (a INTEGER, FOREIGN KEY (a) REFERENCES nosuch(id))
+create-table-syntax    | SYNTAX_ERROR          | CREATE TABLE t (a INTEGER
+drop-table             | OK                    | DROP TABLE takes
+drop-table-restrict    | OK                    | DROP TABLE takes RESTRICT
+drop-table-cascade     | OK                    | DROP TABLE takes CASCADE
+drop-table-unknown     | SEMANTIC_ERROR        | DROP TABLE nosuch
 
 # --- explain with indexes: "@index <table> <column> <HASH|BPLUS_TREE>" applies to the scenarios below it ---
 @index students id HASH

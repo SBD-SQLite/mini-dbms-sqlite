@@ -15,8 +15,7 @@ public class JoinRewriter {
     }
 
     private PlanNode rewrite(PlanNode plan, boolean mergeJoins) {
-        // LIMIT and subqueries are semantic boundaries, not predicates to redistribute.
-        if (plan.kind() == PlanNodeKind.LIMIT) return plan;
+        // Recurse inside LIMIT without moving predicates across the LIMIT node itself.
         PlanNode current = QO5Plans.withChildren(plan,
                 plan.children().stream().map(child -> rewrite(child, mergeJoins)).toList());
         if (current.kind() != PlanNodeKind.FILTER) return current;

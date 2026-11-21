@@ -22,7 +22,7 @@ final class JoinSearchSpace {
     }
 
     static boolean isRegion(PlanNode plan) {
-        if (QO5Plans.hasSubquery(plan)) return false;
+        if (QO5Scopes.isJoinBoundary(plan)) return false;
         if (QO5Plans.isJoin(plan)) return true;
         return (plan.kind() == PlanNodeKind.PROJECT || plan.kind() == PlanNodeKind.FILTER)
                 && isRegion(plan.children().get(0));
@@ -51,6 +51,39 @@ final class JoinSearchSpace {
     }
 
     int size() { return inputs.size(); }
+
+    /** Leaf of a subset plan, including predicates evaluable using this input alone. */
+    PlanNode input(int index) {
+        PlanNode result = inputs.get(index);
+        Set<String> available = QO5Plans.available(result);
+        for (Expression predicate : predicates) {
+            Set<String> refs = QO5Plans.columns(predicate);
+            if (!refs.isEmpty() && available.containsAll(refs)) result = QO5Plans.filter(result, predicate);
+        }
+        return result;
+    }
+
+    /** Attach only predicates first made evaluable by this partition; children already own local ones. */
+    PlanNode combine(PlanNode left, PlanNode right) {
+        Set<String> a = QO5Plans.available(left), b = QO5Plans.available(right);
+        Set<String> union = new HashSet<>(a); union.addAll(b);
+        List<Expression> connecting = new ArrayList<>();
+        for (Expression predicate : predicates) {
+            Set<String> refs = QO5Plans.columns(predicate);
+            if (!refs.isEmpty() && union.containsAll(refs) && !a.containsAll(refs) && !b.containsAll(refs))
+                connecting.add(predicate);
+        }
+        return QO5Plans.join(left, right, connecting);
+    }
+
+    /** Constants belong once at the region root; restore the original NATURAL representatives/layout. */
+    PlanNode finish(PlanNode result) {
+        for (Expression predicate : predicates)
+            if (QO5Plans.columns(predicate).isEmpty()) result = QO5Plans.filter(result, predicate);
+        result = QO5Plans.restore(result, original);
+        PlanNodes.validate(result);
+        return result;
+    }
 
     List<Integer> originalOrder() {
         List<Integer> order = new ArrayList<>();

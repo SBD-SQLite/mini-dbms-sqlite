@@ -32,9 +32,58 @@ java -cp "query-optimizer/target/classes;query-optimizer/target/test-classes;sha
 
 Opsi `QODriver`:
 - `--test`: menjalankan suite QO1..QO5 (exit 1 jika ada yang gagal)
-- `--scenarios [file]`: menjalankan file skenario (default `scenarios.txt`; exit 1 jika ada yang gagal)
-- `--explain "<SQL>"`: mencetak rencana kueri sebelum/sesudah optimasi beserta estimasi biaya, memakai `MockStorageManager`
+- `--scenarios [file]`: menjalankan file skenario (default `query-optimizer/src/test/resources/scenarios.txt`; exit 1 jika ada yang gagal)
+- `--explain "<SQL>" [opsi]`: mencetak rencana kueri sebelum/sesudah optimasi beserta estimasi biaya, memakai `MockStorageManager`
+- `--compare "<SQL>" [opsi]`: membandingkan biaya pencarian urutan join heuristik dan genetic algorithm (GA) untuk satu query SELECT; selalu memakai GA
 - tanpa argumen: menu interaktif (1 Parse SQL, 2 Run all tests, 3 Explain SQL, 4 Run scenario file, 0 Exit)
+
+Opsi untuk `--explain` dan `--compare`:
+
+| Opsi | Arti | Default |
+|---|---|---|
+| `--buffer-blocks M` | jumlah buffer block `M` untuk model biaya (minimal 3) | 3 |
+| `--ga` | memakai GA pada `--explain` (rencana termurah antara heuristik dan GA dipilih) | mati pada `--explain` |
+| `--population N` | ukuran populasi GA | 32 |
+| `--generations N` | jumlah generasi GA | 20 |
+| `--mutation-rate X` | peluang mutasi (swap) | 0,15 |
+| `--seed N` | seed acak GA (hasil dapat diulang) | 3140 |
+
+Parameter GA apa pun otomatis menyalakan GA. Contoh:
+
+```bash
+java -cp "$CP" sqlike.qo.QODriver --explain "SELECT * FROM students WHERE id = 5"
+java -cp "$CP" sqlike.qo.QODriver --compare "SELECT * FROM students JOIN takes ON students.id = takes.id JOIN dept ON students.dept_id = dept.dept_id" --population 8 --generations 4 --buffer-blocks 5
+```
+
+`--compare` mencetak konfigurasi GA, biaya heuristik, biaya GA, biaya terpilih, jumlah individu yang dievaluasi, dan rencana terpilih. Pada 3 sampai 4 tabel hasil GA umumnya sama dengan heuristik karena heuristik sudah mengevaluasi seluruh permutasi kecil; GA hanya berguna pada join dengan banyak tabel.
+
+### Format file skenario
+
+Satu baris per skenario: `nama | hasil yang diharapkan | SQL`. Hasil yang diharapkan adalah `OK` atau salah satu `ErrorCode` (`SYNTAX_ERROR`, `SEMANTIC_ERROR`, `UNSUPPORTED_OPERATION`, `INVALID_VALUE`, `INVALID_STATE`); awalan `XFAIL ` menandai masalah yang diketahui. Baris `@index <tabel> <kolom> <HASH|BPLUS_TREE>` menambahkan index tiruan untuk skenario di bawahnya. Katalog tiruan: `students(id, name, gpa, dept_id)`, `dept(dept_id, dname)`, `takes(id, course_id, grade)`. Jalankan dari root repositori karena path default bersifat relatif.
+
+## Sintaks yang didukung
+
+| Pernyataan | Bentuk |
+|---|---|
+| SELECT | `SELECT * \| kolom[, ...] FROM tabel [AS alias] [, tabel ...] \| JOIN tabel ON kondisi \| NATURAL JOIN tabel [WHERE kondisi] [ORDER BY kolom [ASC\|DESC]] [LIMIT n]` |
+| UPDATE | `UPDATE tabel SET kolom = ekspresi [WHERE kondisi]` (satu kolom) |
+| INSERT | `INSERT INTO tabel VALUES (v1, v2, ...)` (satu baris) |
+| DELETE | `DELETE FROM tabel [WHERE kondisi]` |
+| CREATE INDEX | `CREATE INDEX nama ON tabel(kolom) [USING HASH \| BPLUS_TREE]` |
+| CREATE TABLE | `CREATE TABLE tabel (kolom tipe [PRIMARY KEY], ..., [PRIMARY KEY (k, ...)], [FOREIGN KEY (k, ...) REFERENCES tabel(k, ...)])`; tipe `INTEGER`, `FLOAT`, `CHAR(n)`, `VARCHAR(n)` |
+| DROP TABLE | `DROP TABLE tabel [RESTRICT \| CASCADE]` (default `RESTRICT`) |
+| Transaksi | `BEGIN [TRANSACTION]`, `COMMIT`, `ABORT`; hanya di-parse, tidak dioptimasi (`optimizeQuery` melempar `INVALID_STATE`) |
+
+Kondisi: perbandingan `=, <>, >, >=, <, <=`, aritmatika `+ - * /` dengan tanda kurung, dan `AND`. Kondisi `WHERE` dan `ON` harus bernilai boolean.
+
+Aturan penting:
+- **Alias tabel hanya dengan `AS`** (`FROM students AS s`). Tanpa `AS` menghasilkan `SYNTAX_ERROR table alias requires AS`. Setelah alias diberikan, kolom hanya dapat dirujuk lewat alias (`s.id`), bukan nama tabel asli (`SEMANTIC_ERROR`); alias harus unik dalam satu `FROM`. Alias kolom (`SELECT id AS x`) tidak didukung (`UNSUPPORTED_OPERATION`).
+- **Subquery** hanya di `WHERE`: `kolom IN (SELECT satu_kolom ...)`, `EXISTS (SELECT ...)`, dan perbandingan dengan subquery skalar `kolom > (SELECT satu_kolom ...)`. Subquery berkorelasi didukung; flag `correlated` pada `SubquerySpec` selalu dihitung ulang oleh Binder dari kolom luar yang benar-benar dibaca, sehingga nilai dari pemanggil diabaikan. Subquery skalar yang menghasilkan lebih dari satu baris diperiksa saat eksekusi oleh QP, bukan oleh QO.
+- **LIMIT** harus di akhir query dan nilainya bilangan bulat nonnegatif. Node `LIMIT` selalu node paling atas pada plan. `LIMIT 0` valid.
+- **NATURAL JOIN**: kolom bersama tanpa prefix menunjuk sisi kiri; kolom bersama duplikat dibuang dari `PROJECT`.
+- `OR`, `LEFT/RIGHT/FULL OUTER JOIN`, dan alias kolom tidak didukung (`UNSUPPORTED_OPERATION`). Tidak ada NULL.
+- Kesalahan definisi pada CREATE TABLE / DROP TABLE (nama ganda tanpa membedakan huruf besar/kecil, kolom ganda, `CHAR`/`VARCHAR` tanpa panjang, rujukan FK tidak ada, `DROP` tabel yang dirujuk FK tanpa `CASCADE`) dilaporkan sebagai `SEMANTIC_ERROR`; token atau kurung yang salah tetap `SYNTAX_ERROR`.
+- Node `CREATE_TABLE` dan `DROP_TABLE` tidak punya anak dan biayanya 0.
 
 ## Sintaks CREATE INDEX
 
@@ -96,3 +145,23 @@ Untuk theta-join, `joinRows` tetap memakai heuristik sebelumnya bagi dua kolom b
 Contoh: takes (n=10.000, V(ID)=2.500) ⋈ student (n=5.000, V(ID)=5.000) = 10.000 · 5.000 / 5.000 = 10.000 baris.
 
 Jumlah blok hasil join/filter/proyeksi = `⌈baris / fb⌉`, `fb = ⌊4096 / ukuran tuple⌋` (ukuran tuple join = jumlah ukuran tuple kedua anak). Rencana yang ditampilkan `--explain` memakai biaya sesudah optimasi.
+
+## Asumsi biaya dan perbedaannya dengan QP/SM
+
+Model biaya adalah **estimasi untuk membandingkan kandidat plan**, bukan ramalan waktu eksekusi. Asumsi yang dipakai:
+
+| Aspek | Asumsi QO | Kenyataan di komponen lain |
+|---|---|---|
+| Memori join/sort | `M` = 3 buffer block (`--buffer-blocks`, minimal 3); BNLJ memakai `M−2` block untuk outer | QP memakai anggaran byte `joinBufferBytes` (default 64 KB, opsi `--join-buffer <byte>`); `8192` byte (2 blok outer) setara `M = 3` |
+| Sort | external merge sort (`b_b = 1`); biaya 0 jika `b ≤ M` | QP mengurutkan di memori (sort stabil); QO hanya memakai rumus ini untuk membandingkan plan |
+| Ukuran blok | 4096 byte untuk hasil antara | SM: halaman 4096 byte |
+| Statistik tabel | `TableStatistics` dari SM (`recordCount`, `blockCount`, `blockingFactor`, `distinctCounts`) | SM menghitung dari data nyata dan memperbaruinya setelah INSERT/DELETE |
+| Statistik index | `IndexStatistics` dari SM (`height`, `bucketCount`, `leafPageCount`, `overflowPageCount`, `clustered`) | `StorageManager` mengisi nilai nyata; `getIndexStatistics` wajib diimplementasikan (abstrak di kontrak `shared`) |
+| Selektivitas rentang | tetap 0,5 (tidak ada min/max/histogram) | — |
+| Algoritma join | hanya `BLOCK_NESTED_LOOP` | sama dengan QP |
+
+Konsekuensi yang perlu diketahui:
+- Karena selektivitas rentang 0,5, index B+Tree hampir tidak pernah dipilih untuk `<`, `<=`, `>`, `>=`; index dipilih untuk `=` bila tabel cukup besar. Pada tabel kecil (beberapa blok) pembacaan sekuensial lebih murah daripada membaca halaman index, sehingga `INDEX_SCAN` tidak muncul. Ini sesuai model biaya, bukan galat.
+- Index HASH hanya dipakai untuk `=`; kondisi rentang pada kolom ber-index HASH tetap `SCAN` + `FILTER`.
+- Biaya DDL (`CREATE_TABLE`, `DROP_TABLE`) selalu 0; `CREATE INDEX` dihitung dari satu kali baca tabel ditambah satu kali tulis index.
+- QO memakai kontrak `sqlike.contract.IStorageManager` dan `IQueryOptimizer` dari modul `shared`; QO tidak lagi menyimpan salinan sendiri. QO hanya memanggil metode baca katalog dan statistik (`listTables`, `getSchema`, `getStatistics`, `getIndexes`, `getIndexStatistics`). Semuanya abstrak di kontrak, sehingga implementasi apa pun (SM asli maupun `MockStorageManager`) wajib mengisinya dan tidak ada nilai bawaan yang diam-diam dipakai.

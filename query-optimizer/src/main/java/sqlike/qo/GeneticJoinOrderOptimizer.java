@@ -10,7 +10,6 @@ import java.util.Objects;
 import java.util.Random;
 import java.util.function.UnaryOperator;
 import sqlike.shared.PlanNode;
-import sqlike.shared.PlanNodeKind;
 
 /** QO-18: permutation GA with tournament selection, ordered crossover, swap mutation and elitism. */
 public final class GeneticJoinOrderOptimizer {
@@ -20,7 +19,7 @@ public final class GeneticJoinOrderOptimizer {
         this.config = Objects.requireNonNull(config, "genetic configuration is required");
     }
 
-    /** Pure join search. The QO5 pipeline additionally supplies access-path choice before fitness. */
+    /** Join search within this query scope; the QO5 pipeline visits expression-owned subquery scopes. */
     public Result optimize(PlanNode plan, CostModel cost) {
         return optimize(plan, cost, QO5Plans::simplifyIdentityProjects);
     }
@@ -108,7 +107,6 @@ public final class GeneticJoinOrderOptimizer {
         }
 
         private PlanNode search(PlanNode node, UnaryOperator<PlanNode> wrap) {
-            if (node.kind() == PlanNodeKind.LIMIT || QO5Plans.hasSubquery(node)) return node;
             var region = JoinSearchSpace.from(node);
             if (region.isPresent()) return evolve(node, region.get(), wrap);
             PlanNode current = node;
