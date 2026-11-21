@@ -198,6 +198,8 @@ ccm.initAfterRecovery(result.lastTxId());       // dipanggil QP (initialize(repo
 3. `recover()` tidak memanggil `initAfterRecovery`. Menurut PRD §14 pemanggilan itu milik QP,
    dan CCM menolak transaksi baru sampai pemanggilan itu terjadi. FRM sendiri hanya memanggilnya
    setelah point-in-time recovery.
+4. Jika berkas `pitr.inprogress` masih ada, `recover()` lebih dahulu menyelesaikan PITR yang
+   terputus, baru kemudian menjalankan crash recovery.
 
 Checkpoint berkala dimulai otomatis setelah `recover()` berhasil jika interval tidak nol.
 Interval nol hanya untuk pengujian khusus. Checkpoint manual, checkpoint berkala, dan `recoverTo`
@@ -228,6 +230,8 @@ Hasil pengujian (Windows 11, JDK 21):
 | `FRMDriver` | 10/10 skenario PASS |
 | `RollbackTests` (FR3) | 12/12 |
 | `MaintenanceTests` (FR4) | 18/18 |
+| `DdlRecoveryTests` (`run-ddl-recovery-tests.sh`) | 11/11 |
+| `RecoveryTest` (FR5) | 50/50 |
 | `CcmIntegrationTests` (FRM + CCM asli) | 11/11 |
 
 FR2 mewajibkan setiap perubahan transaksi punya record COMPENSATION (`logCompensation(txId, lsnAsli)`,
@@ -244,6 +248,5 @@ urut LSN menurun) sebelum `logAbort` diterima; tanpa itu muncul `WalException "R
 
 | Hal | Keterangan |
 |---|---|
-| Perubahan skema saat crash recovery | `ChangeApplier` FR5 hanya menangani `DataChange`. SCHEMA_CHANGE milik transaksi yang belum selesai mendapat COMPENSATION dan ABORT, tetapi skemanya tidak dikembalikan lewat `restoreSchema`, dan redo DDL yang sudah commit juga dilewati |
-| LSN CLR di FR5 | `ChangeApplier.undo` menulis before-image dengan LSN record asli, bukan LSN CLR, sehingga page LSN bisa mundur. Tidak membuat skenario gagal |
+| Snapshot DROP TABLE | `restoreSchema` mengembalikan katalog dan indeks, tetapi isi tabel yang di-DROP hanya kembali bila `SchemaImage.snapshotId` diisi saat DROP. Pembuatan snapshot itu bagian QP dan SM |
 | Milestone 3 | Integrasi dengan CCM asli sudah diuji (`CcmIntegrationTests`); integrasi dengan SM asli belum |

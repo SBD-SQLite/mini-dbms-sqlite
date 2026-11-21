@@ -229,6 +229,8 @@ public class FailureRecoveryManager
         }
         state = RecoveryState.RUNNING;
         try {
+            // A point-in-time restore cut by a crash must finish before crash recovery trusts any checkpoint.
+            maintenance.resumeInterruptedRecovery();
             RecoveryResult result = recoveryManager.recover();
             if (result == null) {
                 throw new IllegalStateException("recovery returned no result");
