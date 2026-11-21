@@ -142,11 +142,17 @@ public final class CliClient implements AutoCloseable {
                     output.printMessage("  BEGIN;       Start an explicit transaction (or BEGIN TRANSACTION;)");
                     output.printMessage("  COMMIT;      Commit the active explicit transaction");
                     output.printMessage("  ABORT;       Abort and rollback the active explicit transaction");
+                    output.printMessage("  SHOW LOG [txId|CURRENT];  Show the write-ahead log (same as \\log)");
+                    output.printMessage("  \\log [txId|current]  Show the log: all records, one transaction, or this session's");
                     output.printMessage("  \\q | EXIT;   Disconnect and exit client");
                     continue;
                 }
-                output.printMessage("Unknown command: " + sql + " (use \\help or \\q to quit)");
-                continue;
+                if (cmd.equals("log") || cmd.startsWith("log ")) {
+                    sql = "SHOW LOG " + cmd.substring(3).trim();
+                } else {
+                    output.printMessage("Unknown command: " + sql + " (use \\help or \\q to quit)");
+                    continue;
+                }
             }
             String normalized = sql.trim().toLowerCase(Locale.ROOT);
             if (normalized.equals("exit") || normalized.equals("quit")) {
