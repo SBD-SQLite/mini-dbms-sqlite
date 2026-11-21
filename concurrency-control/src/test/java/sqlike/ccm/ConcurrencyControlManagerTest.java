@@ -39,6 +39,8 @@ public final class ConcurrencyControlManagerTest {
         check.test("a failed COMMIT log is an unknown outcome, not an abort", ConcurrencyControlManagerTest::commitUnknown);
         check.test("a transient rollback failure is retried", ConcurrencyControlManagerTest::rollbackRetried);
         check.test("a failed rollback keeps the transaction FAILED and its locks", ConcurrencyControlManagerTest::rollbackStuck);
+        check.test("a deadlock victim whose rollback fails is answered ABORTED and the other tx keeps waiting",
+                ConcurrencyControlManagerTest::deadlockVictimRollbackFails);
         check.test("a failed logAbort keeps the locks until a retry works", ConcurrencyControlManagerTest::logAbortStuck);
         check.test("write access locks without logging", ConcurrencyControlManagerTest::writeAccess);
         check.test("a schema write locks the catalog and logs one schema change", ConcurrencyControlManagerTest::schemaWrite);
@@ -222,6 +224,33 @@ public final class ConcurrencyControlManagerTest {
             r.frm().setFailOnOperation("rollback", 0);
             require(r.ccm().abort(first).status() == TransactionStatus.ABORTED, "the retry finishes the abort");
             granted(get(blocked));
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    private static void deadlockVictimRollbackFails() throws Exception {
+        Rig r = rig();
+        long older = begin(r);
+        long victim = begin(r);
+        granted(r.ccm().requestWrite(older, change("a", 0)));
+        granted(r.ccm().requestWrite(victim, change("b", 0)));
+        r.frm().setFailOnOperation("rollback", 100);
+        ExecutorService pool = Executors.newCachedThreadPool();
+        try {
+            Future<AccessResponse> victimRequest = pool.submit(() -> r.ccm().requestWrite(victim, change("a", 1)));
+            expectBlocked(victimRequest);
+            // The older transaction closes the cycle, so its thread is the one that runs the failing abort.
+            Future<AccessResponse> olderRequest = pool.submit(() -> r.ccm().requestWrite(older, change("b", 1)));
+            AccessResponse victimResponse = get(victimRequest);
+            require(victimResponse.status() == AccessStatus.ABORTED,
+                    "the victim's own request must be answered ABORTED, not left waiting: " + victimResponse);
+            expectBlocked(olderRequest);
+            require(r.ccm().leftoverState().contains("lockTable"),
+                    "the victim keeps its locks while its rollback fails");
+            r.frm().setFailOnOperation("rollback", 0);
+            require(r.ccm().abort(victim).status() == TransactionStatus.ABORTED, "the retry finishes the abort");
+            granted(get(olderRequest));
         } finally {
             pool.shutdownNow();
         }
