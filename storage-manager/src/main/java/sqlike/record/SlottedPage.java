@@ -102,7 +102,7 @@ public class SlottedPage {
         if (current != SlotStatus.RESERVED) {
             throw new IllegalStateException("Only an unconsumed reservation can be released");
         }
-        compact(slotId, 0);
+        repack(slotId, 0, SlotStatus.EMPTY, 0, 0);
     }
 
     public void insertAtSlot(int slotId, byte[] recordBytes) {
@@ -115,7 +115,7 @@ public class SlottedPage {
         if (recordBytes.length > capacity(data, slotId)) {
             throw new IllegalArgumentException("Record exceeds its reservation");
         }
-        writeRecord(data, slotId, recordBytes);
+        writeRecord(data, slotId, recordBytes, SlotStatus.OCCUPIED);
     }
 
     public Optional<byte[]> getRecordBytes(int slotId) {
@@ -134,16 +134,17 @@ public class SlottedPage {
         Objects.requireNonNull(recordBytes, "recordBytes");
         ByteBuffer data = buffer();
         checkSlot(data, slotId);
-        if (status(data, slotId) != SlotStatus.OCCUPIED) {
+        SlotStatus current = status(data, slotId);
+        if (current != SlotStatus.OCCUPIED && current != SlotStatus.MOVED) {
             throw new IllegalStateException("Update requires an occupied slot");
         }
         int previous = capacity(data, slotId);
         int required = allocationSize(recordBytes.length);
         if (required > previous) {
             if ((long) required - previous > getFreeSpace()) return false;
-            compact(slotId, required);
+            repack(slotId, required, current, 0, 0);
         }
-        writeRecord(buffer(), slotId, recordBytes);
+        writeRecord(buffer(), slotId, recordBytes, current);
         return true;
     }
 
@@ -153,13 +154,16 @@ public class SlottedPage {
         ByteBuffer data = buffer();
         int count = data.getInt(SLOT_COUNT_OFFSET);
         int required = allocationSize(recordBytes.length);
-        if (slotId < count && status(data, slotId) != SlotStatus.EMPTY) {
+        if (slotId < count && status(data, slotId) == SlotStatus.FORWARD) {
+            throw new IllegalStateException("Forwarded slot must be updated at its target");
+        }
+        if (slotId < count && allocated(status(data, slotId))) {
             int previous = capacity(data, slotId);
             if (required > previous) {
                 if ((long) required - previous > getFreeSpace()) {
                     throw new IllegalArgumentException("Restored record does not fit in page");
                 }
-                compact(slotId, required);
+                repack(slotId, required, status(data, slotId), 0, 0);
             }
         } else {
             long extraSlots = Math.max(0L, (long) slotId + 1 - count);
@@ -174,25 +178,66 @@ public class SlottedPage {
             data.putInt(FREE_END_OFFSET, offset);
             writeSlot(data, slotId, offset, 0, SlotStatus.RESERVED);
         }
-        writeRecord(buffer(), slotId, recordBytes);
+        writeRecord(buffer(), slotId, recordBytes, SlotStatus.OCCUPIED);
     }
 
     public void deleteSlot(int slotId) {
         ByteBuffer data = buffer();
         checkSlot(data, slotId);
         SlotStatus current = status(data, slotId);
-        if (current == SlotStatus.EMPTY || current == SlotStatus.DELETED) return;
-        if (current != SlotStatus.OCCUPIED) {
-            throw new IllegalStateException("A reservation must be released, not deleted");
+        switch (current) {
+            case EMPTY, DELETED -> { }
+            case OCCUPIED -> repack(slotId, 0, SlotStatus.DELETED, 0, 0);
+            case MOVED -> repack(slotId, 0, SlotStatus.EMPTY, 0, 0);
+            case FORWARD -> writeSlot(data, slotId, 0, 0, SlotStatus.DELETED);
+            default -> throw new IllegalStateException("A reservation must be released, not deleted");
         }
-        capacity(data, slotId);
-        data.putInt(slotOffset(slotId) + 4, 0);
-        data.put(slotOffset(slotId) + 8, (byte) SlotStatus.DELETED.ordinal());
     }
 
-    // Allocations stay contiguous. Their boundaries preserve capacity after shrink/delete,
-    // without adding another field to the agreed nine-byte slot format.
-    private void compact(int changedSlot, int newCapacity) {
+    public Optional<long[]> getForward(int slotId) {
+        if (slotId < 0) throw new IllegalArgumentException("Slot must not be negative");
+        ByteBuffer data = buffer();
+        if (slotId >= data.getInt(SLOT_COUNT_OFFSET) || status(data, slotId) != SlotStatus.FORWARD) return Optional.empty();
+        return Optional.of(new long[] {data.getInt(slotOffset(slotId)), data.getInt(slotOffset(slotId) + 4)});
+    }
+
+    public Optional<byte[]> getMovedBytes(int slotId) {
+        if (slotId < 0) throw new IllegalArgumentException("Slot must not be negative");
+        ByteBuffer data = buffer();
+        if (slotId >= data.getInt(SLOT_COUNT_OFFSET) || status(data, slotId) != SlotStatus.MOVED) return Optional.empty();
+        capacity(data, slotId);
+        int offset = data.getInt(slotOffset(slotId));
+        int length = data.getInt(slotOffset(slotId) + 4);
+        return Optional.of(Arrays.copyOfRange(page.getData(), offset, offset + length));
+    }
+
+    public void markMoved(int slotId) {
+        ByteBuffer data = buffer();
+        checkSlot(data, slotId);
+        if (status(data, slotId) != SlotStatus.OCCUPIED) throw new IllegalStateException("Only an occupied slot can be marked moved");
+        data.put(slotOffset(slotId) + 8, (byte) SlotStatus.MOVED.ordinal());
+    }
+
+    public void forwardSlot(int slotId, long targetPage, int targetSlot) {
+        if (slotId < 0 || targetPage < 0 || targetPage > Integer.MAX_VALUE || targetSlot < 0) {
+            throw new IllegalArgumentException("Invalid forward target");
+        }
+        ByteBuffer data = buffer();
+        int count = data.getInt(SLOT_COUNT_OFFSET);
+        if (slotId >= count) {
+            long extra = (long) slotId + 1 - count;
+            if (extra * SLOT_SIZE > getFreeSpace()) throw new IllegalArgumentException("Slot directory does not fit in page");
+            for (int i = count; i <= slotId; i++) writeSlot(data, i, 0, 0, SlotStatus.EMPTY);
+            data.putInt(SLOT_COUNT_OFFSET, slotId + 1);
+        }
+        SlotStatus current = status(data, slotId);
+        if (current == SlotStatus.OCCUPIED) repack(slotId, 0, SlotStatus.FORWARD, (int) targetPage, targetSlot);
+        else if (current == SlotStatus.DELETED || current == SlotStatus.EMPTY || current == SlotStatus.FORWARD) {
+            writeSlot(data, slotId, (int) targetPage, targetSlot, SlotStatus.FORWARD);
+        } else throw new IllegalStateException("Slot cannot be forwarded: " + current);
+    }
+
+    private void repack(int changedSlot, int newCapacity, SlotStatus newStatus, int f1, int f2) {
         ByteBuffer source = buffer();
         byte[] packed = new byte[page.getData().length];
         System.arraycopy(page.getData(), 0, packed, 0, directoryEnd(source));
@@ -200,20 +245,28 @@ public class SlottedPage {
         int end = packed.length;
         for (int i = 0; i < source.getInt(SLOT_COUNT_OFFSET); i++) {
             SlotStatus current = status(source, i);
-            if (current == SlotStatus.EMPTY) continue;
-            int previous = capacity(source, i);
             if (i == changedSlot && newCapacity == 0) {
-                writeSlot(target, i, 0, 0, SlotStatus.EMPTY);
+                writeSlot(target, i, f1, f2, newStatus);
                 continue;
             }
-            int allocated = i == changedSlot ? newCapacity : previous;
+            if (current == SlotStatus.DELETED) {
+                writeSlot(target, i, 0, 0, SlotStatus.DELETED);
+                continue;
+            }
+            if (!allocated(current)) continue;
+            int previous = capacity(source, i);
+            int allocatedBytes = i == changedSlot ? newCapacity : previous;
             int length = source.getInt(slotOffset(i) + 4);
-            end -= allocated;
+            end -= allocatedBytes;
             System.arraycopy(page.getData(), source.getInt(slotOffset(i)), packed, end, length);
             writeSlot(target, i, end, length, current);
         }
         target.putInt(FREE_END_OFFSET, end);
         System.arraycopy(packed, 0, page.getData(), 0, packed.length);
+    }
+
+    private static boolean allocated(SlotStatus status) {
+        return status == SlotStatus.RESERVED || status == SlotStatus.OCCUPIED || status == SlotStatus.MOVED;
     }
 
     private ByteBuffer buffer() {
@@ -249,18 +302,21 @@ public class SlottedPage {
         return SlotStatus.values()[code];
     }
 
-    private static int emptySlot(ByteBuffer data) {
+     private static int emptySlot(ByteBuffer data) {
+        int deleted = -1;
         for (int i = 0; i < data.getInt(SLOT_COUNT_OFFSET); i++) {
-            if (status(data, i) == SlotStatus.EMPTY) return i;
+            SlotStatus current = status(data, i);
+            if (current == SlotStatus.EMPTY) return i;
+            if (current == SlotStatus.DELETED && deleted < 0) deleted = i;
         }
-        return -1;
+        return deleted;
     }
 
     private static int capacity(ByteBuffer data, int slotId) {
         int offset = data.getInt(slotOffset(slotId));
         int end = data.capacity();
         for (int i = 0; i < data.getInt(SLOT_COUNT_OFFSET); i++) {
-            if (i == slotId || status(data, i) == SlotStatus.EMPTY) continue;
+            if (i == slotId || !allocated(status(data, i))) continue;
             int other = data.getInt(slotOffset(i));
             if (other == offset) throw new IllegalStateException("Overlapping slot allocations");
             if (other > offset && other < end) end = other;
@@ -273,11 +329,11 @@ public class SlottedPage {
         return end - offset;
     }
 
-    private void writeRecord(ByteBuffer data, int slotId, byte[] bytes) {
+    private void writeRecord(ByteBuffer data, int slotId, byte[] bytes, SlotStatus status) {
         int offset = data.getInt(slotOffset(slotId));
         System.arraycopy(bytes, 0, page.getData(), offset, bytes.length);
         Arrays.fill(page.getData(), offset + bytes.length, offset + capacity(data, slotId), (byte) 0);
-        writeSlot(data, slotId, offset, bytes.length, SlotStatus.OCCUPIED);
+        writeSlot(data, slotId, offset, bytes.length, status);
     }
 
     private static void writeSlot(ByteBuffer data, int slotId, int offset, int length, SlotStatus status) {

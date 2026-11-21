@@ -159,7 +159,7 @@ public class IndexHelper {
         return new Entry(key, new RID(new PageId(tableId, pageNumber), slotId), keyBytes);
     }
 
-    static String storageId(IndexMetadata metadata) throws StorageException {
+    public static String storageId(IndexMetadata metadata) throws StorageException {
         if (metadata == null
                 || metadata.indexName() == null
                 || metadata.indexName().isBlank()

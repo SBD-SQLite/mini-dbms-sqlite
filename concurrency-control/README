@@ -68,8 +68,8 @@ FRM is a MockFRM here; integration with the real FRM and QP is Milestone 3.
 
 QP integration (Milestone 3), from the repository root:
   ./concurrency-control/run-qp-integration.sh
-This compiles shared, query-processor, query-optimizer, concurrency-control and failure-recovery
-together and runs src/integration/java/sqlike/ccm/QpIntegrationDriver.java: the real QP
+This compiles src/integration/java/sqlike/ccm/QpIntegrationDriver.java and only the classes it
+reaches in shared, query-processor, concurrency-control and failure-recovery, then runs it: the real QP
 ConcurrencyAdapter on the real CCM and the real FRM (WAL, rollback, recovery, checkpoint), with
 FRM's MockStorageManager as the data store. Each scenario runs on a fresh data directory, under
 both protocols where the behavior does not depend on the protocol, and must leave no lock or
@@ -77,6 +77,25 @@ protocol data behind (ConcurrencyControlManager.leftoverState). It covers the PR
 (FRM.recover, then initAfterRecovery), the two-stage write (requestWriteAccess, requestWrite,
 beginApply/endApply with the SM write stamped with the LSN), undo of an aborted write in the SM,
 deadlock, WAL and commit failures, DDL, restart recovery, the FRM checkpoint timeout and eight
-concurrent clients checked against the serializability verifier. A known gap is printed as
-[CELAH]: FRM cannot roll back a DDL transaction until SmPort has restoreSchema.
-Every module ships its own sqlike.contract copy, so the script uses only the QP copy.
+concurrent clients checked against the serializability verifier. Aborting a DDL transaction
+(INT-16) is rolled back by FRM through SmPort.restoreSchema and leaves no lock behind.
+Every module ships its own sqlike.contract copy, so the script puts the shared module first and QP
+second on the javac source path: the QP copy of sqlike.contract and sqlike.storage wins. Sources the
+driver never reaches (the query optimizer, other modules' tests) are not compiled, so a change there
+cannot break this run.
+
+Real SM integration (Milestone 3), from the repository root:
+  ./concurrency-control/run-sm-integration.sh
+This runs src/integration/java/sqlike/ccm/SmIntegrationDriver.java on the real Storage Manager
+(pages, buffer, RIDs), the real FRM and the real CCM, with nothing mocked. Every RID comes from
+StorageManager.reserveInsert; each write locks the RECORD resource with that RID, logs it through
+requestWrite, and applies it to the SM between beginApply and endApply. It covers INSERT, UPDATE and
+DELETE with commit and with abort (FRM undoes them in the real SM at the same RID), two transactions
+on different RIDs of one table (the second waits, because CCM locks the table per PRD section 9),
+1000 inserts spread over several pages, and a restart that reopens the SM from disk, runs
+FRM.recover and initAfterRecovery, redoes the committed transaction and undoes the active one.
+Both protocols, no lock or protocol data left after any scenario.
+FRM reaches the SM through RealSmPort in the driver. It copies the flushed SM data files for the
+baseline snapshot that FRM.recover takes on first startup, and forwards restoreSchema to the SM.
+SM-08 aborts a CREATE TABLE and checks that the table is gone.
+Tables are created on the SM during setup; DDL rollback is not covered until the SM has restoreSchema.

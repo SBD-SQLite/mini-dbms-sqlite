@@ -159,10 +159,11 @@ public final class QpServerMain {
             throw new IllegalArgumentException("bufferFrames must be positive: " + bufferFrames);
         }
 
+        Path dataDir = rootDir.resolve("data");
         try {
-            Files.createDirectories(rootDir);
+            Files.createDirectories(dataDir);
         } catch (IOException e) {
-            throw new UncheckedIOException("Failed to create data directory " + rootDir, e);
+            throw new UncheckedIOException("Failed to create data directory " + dataDir, e);
         }
 
         try {
@@ -188,8 +189,8 @@ public final class QpServerMain {
             Class<?> ccmClass = Class.forName("sqlike.ccm.ConcurrencyControlManager", true, cl);
             Class<?> qoClass = Class.forName("sqlike.qo.QueryOptimizer", true, cl);
 
-            Object blockManager = blockManagerClass.getConstructor(Path.class).newInstance(rootDir.resolve("data"));
-            Object catalog = catalogManagerClass.getConstructor(Path.class).newInstance(rootDir.resolve("catalog.dat"));
+            Object blockManager = blockManagerClass.getConstructor(Path.class).newInstance(dataDir);
+            Object catalog = catalogManagerClass.getConstructor(Path.class).newInstance(dataDir.resolve("catalog.dat"));
             catalogManagerClass.getMethod("load").invoke(catalog);
 
             Object lruPolicy = lruPolicyClass.getConstructor().newInstance();
@@ -241,6 +242,7 @@ public final class QpServerMain {
                     .getConstructor(recordManagerClass, catalogManagerClass, statsManagerClass, indexManagerClass, bufferPoolClass)
                     .newInstance(records, catalog, stats, indexes, bufferPool);
             storageManagerClass.getMethod("setBlockManager", blockManagerClass).invoke(realSm, blockManager);
+            indexManagerClass.getMethod("loadIndexes").invoke(indexes);
 
             // Load sample database strictly offline on a fresh/empty database (PRD §14 & §16, SM-14).
             if (loadSampleIfEmpty && realSm.listTables().isEmpty()) {

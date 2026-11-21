@@ -247,6 +247,19 @@ public class IndexManager {
         }
     }
 
+    public void reloadAll() {
+        synchronized (records) {
+            indexes.clear();
+            loadIndexes();
+        }
+    }
+
+    public void forgetIndexes(List<IndexMetadata> definitions) {
+        synchronized (records) {
+            for (IndexMetadata definition : definitions) indexes.remove(definition.indexName());
+        }
+    }
+
     public void rebuildTable(String table) throws StorageException {
         synchronized (records) {
             if (table == null || table.isBlank()) throw new StorageException(INVALID_VALUE, "Invalid table name");

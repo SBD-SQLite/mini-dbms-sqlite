@@ -26,7 +26,7 @@ public record LogRecord(long lsn, Instant time, Optional<Long> txID, LogType typ
         }
 
         change = change.map(LogRecord::copyChange);
-        schemaChange = schemaChange.map(s -> new SchemaChange(s.before().stream().map(LogRecord::copySchema).toList(), s.after().stream().map(LogRecord::copySchema).toList()));
+        schemaChange = schemaChange.map(LogRecord::copySchemaChange);
         boolean data = change.isPresent();
         boolean schema = schemaChange.isPresent();
 
@@ -95,7 +95,23 @@ public record LogRecord(long lsn, Instant time, Optional<Long> txID, LogType typ
         return new RecordImage(img.exists(), values);
     }
 
+    // SchemaChange dan SchemaImage di shared tidak memeriksa isinya, jadi aturannya dijaga di sini,
+    // baik untuk record baru maupun record yang dibaca ulang dari WAL.
+    private static SchemaChange copySchemaChange(SchemaChange s) {
+        List<SchemaImage> before = s.before().stream().map(LogRecord::copySchema).toList();
+        List<SchemaImage> after = s.after().stream().map(LogRecord::copySchema).toList();
+        if (before.isEmpty() || before.size() != after.size()) throw new IllegalArgumentException("Schema image pairs required");
+        var names = new HashSet<String>();
+        for (int i = 0; i < before.size(); i++) {
+            String name = before.get(i).tableName();
+            if (!name.equals(after.get(i).tableName()) || !names.add(name)) throw new IllegalArgumentException("Schema pairs must have matching unique names");
+        }
+        return new SchemaChange(before, after);
+    }
+
     private static SchemaImage copySchema(SchemaImage img) {
+        if (img.tableName() == null || img.tableName().isBlank()) throw new IllegalArgumentException("Invalid schema image");
+        if (img.schema().isEmpty() && (!img.indexes().isEmpty() || img.snapshotId().isPresent())) throw new IllegalArgumentException("Absent schema must have no indexes or snapshot");
         Optional<TableSchema> schema = img.schema().map(s -> new TableSchema(s.tableId(), s.tableName(),
                 List.copyOf(s.columns()), List.copyOf(s.primaryKey()), s.foreignKeys().stream()
                 .map(f -> new ForeignKeySpec(List.copyOf(f.columnNames()), f.referencedTable(), List.copyOf(f.referencedColumns()))).toList()));
