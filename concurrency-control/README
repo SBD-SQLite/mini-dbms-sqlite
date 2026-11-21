@@ -77,9 +77,8 @@ protocol data behind (ConcurrencyControlManager.leftoverState). It covers the PR
 (FRM.recover, then initAfterRecovery), the two-stage write (requestWriteAccess, requestWrite,
 beginApply/endApply with the SM write stamped with the LSN), undo of an aborted write in the SM,
 deadlock, WAL and commit failures, DDL, restart recovery, the FRM checkpoint timeout and eight
-concurrent clients checked against the serializability verifier. A known gap is printed as
-[CELAH]: FRM cannot roll back a DDL transaction until its storage adapters implement
-SmPort.restoreSchema.
+concurrent clients checked against the serializability verifier. Aborting a DDL transaction
+(INT-16) is rolled back by FRM through SmPort.restoreSchema and leaves no lock behind.
 Every module ships its own sqlike.contract copy, so the script puts the shared module first and QP
 second on the javac source path: the QP copy of sqlike.contract and sqlike.storage wins. Sources the
 driver never reaches (the query optimizer, other modules' tests) are not compiled, so a change there
@@ -96,7 +95,7 @@ on different RIDs of one table (the second waits, because CCM locks the table pe
 1000 inserts spread over several pages, and a restart that reopens the SM from disk, runs
 FRM.recover and initAfterRecovery, redoes the committed transaction and undoes the active one.
 Both protocols, no lock or protocol data left after any scenario.
-FRM reaches the SM through RealSmPort in the driver, not FRM's StorageManagerAdapter: that adapter
-needs createSnapshot/restoreSnapshot, which the real SM does not have yet, and FRM.recover takes a
-baseline snapshot on first startup. RealSmPort copies the flushed SM data files for that snapshot.
+FRM reaches the SM through RealSmPort in the driver. It copies the flushed SM data files for the
+baseline snapshot that FRM.recover takes on first startup, and forwards restoreSchema to the SM.
+SM-08 aborts a CREATE TABLE and checks that the table is gone.
 Tables are created on the SM during setup; DDL rollback is not covered until the SM has restoreSchema.
