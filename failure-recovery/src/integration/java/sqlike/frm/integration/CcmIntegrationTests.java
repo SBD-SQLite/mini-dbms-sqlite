@@ -19,17 +19,18 @@ import java.util.stream.Stream;
 import sqlike.ccm.CCMConfig;
 import sqlike.ccm.ConcurrencyControlManager;
 import sqlike.frm.FailureRecoveryManager;
+import sqlike.frm.FrmException;
 import sqlike.frm.FrmConfig;
 import sqlike.frm.RecoveryState;
-import sqlike.frm.adapter.ConcurrencyControlAdapter;
+import sqlike.frm.adapter.DeferredCcmPort;
 import sqlike.frm.log.LogManager;
 import sqlike.frm.log.LogRecord;
 import sqlike.frm.log.LogType;
 import sqlike.frm.mock.MockStorageManager;
-import sqlike.frm.port.CcmPort;
 import sqlike.shared.AccessResponse;
 import sqlike.shared.AccessStatus;
 import sqlike.shared.ChangeOperation;
+import sqlike.shared.ColumnSchema;
 import sqlike.shared.DataChange;
 import sqlike.shared.DataType;
 import sqlike.shared.ErrorCode;
@@ -40,6 +41,9 @@ import sqlike.shared.RID;
 import sqlike.shared.RecordImage;
 import sqlike.shared.RecoveryResult;
 import sqlike.shared.ResourceId;
+import sqlike.shared.SchemaChange;
+import sqlike.shared.SchemaImage;
+import sqlike.shared.TableSchema;
 import sqlike.shared.TransactionResponse;
 import sqlike.shared.TransactionStatus;
 import sqlike.shared.Value;
@@ -47,7 +51,9 @@ import sqlike.shared.Value;
 /**
  * Runs FRM with the real CCM ({@link ConcurrencyControlManager}, not {@code MockCCM}) for PRD
  * scenarios 6, 7, and 9: an abort between {@code requestWrite} and {@code beginApply}, the undo of
- * an applied change, and a WAL failure. Every scenario runs under both CCM protocols.
+ * an applied change, and a WAL failure. It also aborts a transaction holding a DDL change, which
+ * must release the catalog, and checks the startup order of {@link DeferredCcmPort}. Every
+ * scenario except the startup check runs under both CCM protocols.
  *
  * <p>The checks cover what FRM owns: the WAL records of each transaction, the FRM state, and the
  * data after a crash and restart (a new SM, FRM, and CCM on the same directory, without a flush).
@@ -63,6 +69,7 @@ public final class CcmIntegrationTests {
     private static final String TABLE = "account";
     private static final RID R0 = new RID(new PageId(TABLE, 0), 0);
     private static final int START = 100;
+    private static final String NEW_TABLE = "branch_stat";
 
     private static final ExecutorService POOL = Executors.newCachedThreadPool(task -> {
         Thread thread = new Thread(task);
@@ -88,7 +95,10 @@ public final class CcmIntegrationTests {
                     CcmIntegrationTests::walFailureOnWrite);
             run(protocol, "PRD-9 WAL failure on commit leaves the outcome unknown; restart undoes it",
                     CcmIntegrationTests::walFailureOnCommit);
+            run(protocol, "DDL abort undoes schema and data and releases the catalog",
+                    CcmIntegrationTests::ddlAbortReleasesCatalog);
         }
+        runStartupOrder();
         System.out.printf("%n%d passed, %d failed%n", passed, failed);
         System.exit(failed == 0 ? 0 : 1);
     }
@@ -227,6 +237,101 @@ public final class CcmIntegrationTests {
         }
     }
 
+    /** CCM's item 1: a DDL transaction that aborts must finish, or CCM keeps the catalog locked. */
+    private static void ddlAbortReleasesCatalog(Stack s) throws Exception {
+        long t1 = s.begin();
+        SchemaChange create = createTable(NEW_TABLE);
+        AccessResponse ddl = s.ccm.requestSchemaWrite(t1, create);
+        expectGranted(ddl, "requestSchemaWrite for T1");
+        long ddlLsn = ddl.changeLSN().orElseThrow();
+        check(s.ccm.beginApply(t1, ddlLsn), "beginApply for the DDL");
+        try {
+            s.sm.restoreSchema(create.after().get(0), ddlLsn); // SM applies CREATE TABLE
+        } finally {
+            s.ccm.endApply(t1, ddlLsn);
+        }
+        long updateLsn = s.write(t1, R0, 40);
+
+        expectStatus(s.ccm.abort(t1), TransactionStatus.ABORTED, "abort the DDL transaction");
+        List<LogRecord> log = s.frm.readLogs(Optional.of(t1));
+        check(types(log).equals(List.of(LogType.BEGIN, LogType.SCHEMA_CHANGE, LogType.UPDATE,
+                        LogType.COMPENSATION, LogType.COMPENSATION, LogType.ABORT)),
+                "T1 WAL compensates both changes, got " + types(log));
+        List<Long> undone = log.stream().flatMap(r -> r.undoOfLSN().stream()).toList();
+        check(undone.equals(List.of(updateLsn, ddlLsn)), "undo is newest first, got " + undone);
+        check(s.sm.getSchemaImage(NEW_TABLE).isEmpty(), "CREATE TABLE is undone in SM");
+        s.sm.flushAll();
+        check(!s.sm.tableNames().contains(NEW_TABLE), "a flush does not bring the dropped table back");
+        check(s.balance(R0) == START, "the UPDATE is undone, got " + s.balance(R0));
+        check(s.ccm.leftoverState().isEmpty(), "CCM released the catalog, left: '" + s.ccm.leftoverState() + "'");
+
+        long t2 = s.begin();
+        expectGranted(s.ccm.requestSchemaWrite(t2, create), "a later DDL gets the catalog");
+        expectStatus(s.ccm.commit(t2), TransactionStatus.COMMITTED, "commit the later DDL");
+    }
+
+    /** CCM's item 2: the agreed startup order works, and a wrong order fails instead of hanging. */
+    private static void runStartupOrder() {
+        String label = "[STARTUP] DeferredCcmPort: FRM, CCM, bind, recover, initAfterRecovery";
+        Path dir = null;
+        try {
+            dir = Files.createTempDirectory("frm-ccm-");
+            Path wal = dir.resolve("wal.log");
+            MockStorageManager sm = new MockStorageManager(dir.resolve("data"));
+            DeferredCcmPort port = new DeferredCcmPort();
+            FailureRecoveryManager frm = new FailureRecoveryManager(sm, port,
+                    new FrmConfig(wal, Duration.ZERO, Duration.ofSeconds(2)), new LogManager(wal.toString()));
+            try {
+                sm.setWal(frm::ensureDurable);
+                ConcurrencyControlManager ccm = new ConcurrencyControlManager(frm, new CCMConfig(
+                        ProtocolType.LOCK_BASED, 5000L, 3, 10L, 2000L));
+
+                expectFrmError(() -> frm.logBegin(1), ErrorCode.INVALID_STATE, "logBegin before recover()");
+                expectFrmError(port::pauseNewTransactions, ErrorCode.INVALID_STATE, "port used before bind");
+                check(ccm.beginTransaction().status() != TransactionStatus.ACTIVE,
+                        "CCM starts no transaction before initAfterRecovery");
+
+                port.bind(ccm);
+                expectFrmError(() -> port.bind(ccm), ErrorCode.INVALID_STATE, "second bind");
+                RecoveryResult recovered = frm.recover(); // first startup: pauses CCM for the baseline
+                check(frm.getState() == RecoveryState.READY, "FRM READY after recover, got " + frm.getState());
+                ccm.initAfterRecovery(recovered.lastTxId()); // QP's step
+                TransactionResponse tx = ccm.beginTransaction();
+                expectStatus(tx, TransactionStatus.ACTIVE, "begin after the full startup");
+                expectStatus(ccm.commit(tx.txId()), TransactionStatus.COMMITTED, "commit after the full startup");
+            } finally {
+                frm.close();
+            }
+
+            // Wrong order on a first startup: recover() before bind must fail, not skip the pause.
+            Path other = Files.createTempDirectory(dir, "unbound-");
+            Path otherWal = other.resolve("wal.log");
+            FailureRecoveryManager unbound = new FailureRecoveryManager(
+                    new MockStorageManager(other.resolve("data")), new DeferredCcmPort(),
+                    new FrmConfig(otherWal, Duration.ZERO, Duration.ofSeconds(2)), new LogManager(otherWal.toString()));
+            try {
+                try {
+                    unbound.recover();
+                    throw new AssertionError("recover() before bind must fail");
+                } catch (FrmException expected) {
+                    check(String.valueOf(expected.getMessage()).contains("not bound"),
+                            "the failure names the missing bind: " + expected.getMessage());
+                }
+                check(unbound.getState() == RecoveryState.FAILED, "FRM FAILED, got " + unbound.getState());
+            } finally {
+                unbound.close();
+            }
+            passed++;
+            System.out.println("[PASS] " + label);
+        } catch (Throwable error) {
+            failed++;
+            System.out.println("[FAIL] " + label);
+            System.out.println("       " + error);
+        } finally {
+            deleteQuietly(dir);
+        }
+    }
+
     // ------------------------------------------------------------------ stack
 
     /** One SM, FRM, and CCM on a directory, started in the PRD §14 order. */
@@ -245,13 +350,13 @@ public final class CcmIntegrationTests {
             Path wal = dir.resolve("wal.log");
             this.sm = new MockStorageManager(dir.resolve("data"));
             this.log = new LogManager(wal.toString());
-            // FRM and CCM need each other when they are built, so FRM gets CCM's adapter afterwards.
-            LateCcmPort ccmPort = new LateCcmPort();
+            // FRM and CCM need each other when they are built, so CCM is bound to FRM afterwards.
+            DeferredCcmPort ccmPort = new DeferredCcmPort();
             this.frm = new FailureRecoveryManager(sm, ccmPort,
                     new FrmConfig(wal, Duration.ZERO, Duration.ofSeconds(2)), log);
             sm.setWal(frm::ensureDurable);
             this.ccm = new ConcurrencyControlManager(frm, new CCMConfig(protocol, 5000L, 3, 10L, 2000L));
-            ccmPort.delegate = new ConcurrencyControlAdapter(ccm);
+            ccmPort.bind(ccm);
             if (seed) {
                 sm.seed(TABLE, R0, row(START));
                 sm.flushAll();
@@ -317,30 +422,6 @@ public final class CcmIntegrationTests {
         }
     }
 
-    private static final class LateCcmPort implements CcmPort {
-        volatile CcmPort delegate;
-
-        @Override
-        public void pauseNewTransactions() {
-            delegate.pauseNewTransactions();
-        }
-
-        @Override
-        public boolean waitUntilIdle(long timeoutMs) {
-            return delegate.waitUntilIdle(timeoutMs);
-        }
-
-        @Override
-        public void resumeTransactions() {
-            delegate.resumeTransactions();
-        }
-
-        @Override
-        public void initAfterRecovery(long maxTxId) {
-            delegate.initAfterRecovery(maxTxId);
-        }
-    }
-
     // ------------------------------------------------------------------ helpers
 
     private static void run(ProtocolType protocol, String name, Scenario scenario) {
@@ -380,6 +461,24 @@ public final class CcmIntegrationTests {
 
     private static Value integer(int value) {
         return new Value(DataType.INTEGER, Optional.of(value), Optional.empty(), Optional.empty());
+    }
+
+    private static SchemaChange createTable(String table) {
+        TableSchema schema = new TableSchema(table, table,
+                List.of(new ColumnSchema("id", DataType.INTEGER, Optional.empty())));
+        return new SchemaChange(
+                List.of(new SchemaImage(table, Optional.empty(), List.of(), Optional.empty())),
+                List.of(new SchemaImage(table, Optional.of(schema), List.of(), Optional.empty())));
+    }
+
+    private static void expectFrmError(Runnable action, ErrorCode code, String what) {
+        try {
+            action.run();
+        } catch (FrmException error) {
+            check(error.getCode() == code, what + ": expected " + code + ", got " + error.getCode());
+            return;
+        }
+        throw new AssertionError(what + ": expected FrmException " + code);
     }
 
     private static List<LogType> types(List<LogRecord> records) {
