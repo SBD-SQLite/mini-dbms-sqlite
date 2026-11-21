@@ -30,7 +30,7 @@ import sqlike.shared.TransactionStatus;
  */
 public class LockBasedProtocol implements IConcurrencyProtocol {
 
-    private static final long DEADLOCK_CHECK_MS = 100L;
+    private static final long DEFAULT_DEADLOCK_CHECK_MS = 100L;
 
     private final ReentrantLock mutex = new ReentrantLock();
     private final Condition changed = mutex.newCondition();
@@ -41,6 +41,7 @@ public class LockBasedProtocol implements IConcurrencyProtocol {
     private final Set<Long> stuck = new HashSet<>();
     private final DeadlockHandler deadlockHandler;
     private final LongConsumer abortHandler;
+    private final long deadlockCheckMs;
     private long generation;
 
     public LockBasedProtocol() {
@@ -53,8 +54,17 @@ public class LockBasedProtocol implements IConcurrencyProtocol {
 
     /** The callback must finish rollback and call release, or throw while retaining the locks. */
     public LockBasedProtocol(DeadlockHandler deadlockHandler, LongConsumer abortHandler) {
+        this(deadlockHandler, abortHandler, DEFAULT_DEADLOCK_CHECK_MS);
+    }
+
+    /** {@code deadlockCheckMs} is how often a waiting request re-checks the wait-for graph. */
+    public LockBasedProtocol(DeadlockHandler deadlockHandler, LongConsumer abortHandler, long deadlockCheckMs) {
+        if (deadlockCheckMs <= 0) {
+            throw new IllegalArgumentException("deadlockCheckMs must be positive");
+        }
         this.deadlockHandler = Objects.requireNonNull(deadlockHandler, "deadlockHandler");
         this.abortHandler = abortHandler;
+        this.deadlockCheckMs = deadlockCheckMs;
     }
 
     @Override
@@ -210,7 +220,7 @@ public class LockBasedProtocol implements IConcurrencyProtocol {
                 }
 
                 try {
-                    changed.await(DEADLOCK_CHECK_MS, TimeUnit.MILLISECONDS);
+                    changed.await(deadlockCheckMs, TimeUnit.MILLISECONDS);
                 } catch (InterruptedException e) {
                     interrupted = true;
                     if (tx.isActive() && !aborting.contains(tx.getTxId())) {

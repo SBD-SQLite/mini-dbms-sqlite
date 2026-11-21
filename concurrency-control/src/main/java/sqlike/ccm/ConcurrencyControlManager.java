@@ -329,7 +329,12 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
         if (!tx.isActive()) {
             return accessError(inactiveError(tx));
         }
-        return action.apply(tx);
+        try {
+            return action.apply(tx);
+        } catch (IllegalArgumentException e) {
+            // A malformed resource is rejected without touching the transaction.
+            return accessError(error(ErrorCode.INVALID_VALUE, e.getMessage()));
+        }
     }
 
     private static ErrorInfo inactiveError(Transaction tx) {
@@ -361,7 +366,7 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
 
     private IConcurrencyProtocol createProtocol(ProtocolType type) {
         return switch (type) {
-            case LOCK_BASED -> new LockBasedProtocol(new DeadlockHandler(), this::abortDeadlockVictim);
+            case LOCK_BASED -> new LockBasedProtocol(new DeadlockHandler(), this::abortDeadlockVictim, config.deadlockCheckIntervalMs());
             case TIMESTAMP_BASED -> new TimestampProtocol();
         };
     }
