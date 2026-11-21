@@ -23,11 +23,99 @@ Components talk only through the interfaces and shared data types agreed in the 
 - JDK 17 or newer
 - Java standard library only, no third-party libraries
 
+## Running the DBMS
+
+The full system (QP + QO + SM + CCM + FRM) runs as one server plus one or more CLI clients. Run everything from the repository root. The commands below use plain `java`, so they work on Windows, Linux and macOS without the `.sh` launchers.
+
+### 1. Build
+
+Requires JDK 17 or newer (the project is compiled with `--release 21`) and Maven.
+
+```bash
+mvn -o -q compile     
+```
+
+### 2. Start the server (terminal 1)
+
+```bash
+./run-server.sh --data sqlike-data --protocol lock        # Linux / macOS / Git Bash
+run-server.cmd --data sqlike-data --protocol lock         # Windows cmd / PowerShell
+```
+
+Both launchers live in the repository root, set the classpath themselves, work when the path contains spaces, and run `mvn -q compile` first if nothing has been built yet. All options are optional:
+
+| Option | Meaning | Default |
+|---|---|---|
+| `--data DIR` | Data directory (tables, indexes, catalog, WAL) | `sqlike-data` |
+| `--protocol lock\|timestamp` | Concurrency control protocol (CC-02) | `lock` |
+| `--buffer-frames N` | Buffer pool size in pages | built-in default |
+| `--port N` | TCP port to listen on | `5432` |
+| `--max-clients N` | Maximum simultaneous clients | `16` |
+| `--index HASH\|BPLUS_TREE` | Default index type for `CREATE INDEX` | `HASH` |
+| `--no-sample` | Do not load the sample database on a fresh data directory | sample is loaded |
+| `--help` | Print usage | |
+
+On startup the server runs FRM crash recovery, then initializes CCM, then accepts connections. It prints the active protocol, the data directory and the loaded tables. The default port is `5432`.
+
+The sample database (SM-14) is loaded automatically the first time a data directory is used. Starting again with the same `--data` keeps your data and runs crash recovery. Use a new directory (or delete `sqlike-data`) for a clean start.
+
+### 3. Start one or more clients (terminal 2, 3, ...)
+
+Each client is one session. Open two or more to test concurrent transactions.
+
+```bash
+./run-client.sh --port 5432          # Linux / macOS / Git Bash
+run-client.cmd --port 5432           # Windows
+```
+
+- End every statement with `;`. Statements can span several lines.
+- `\help` lists commands; `\q` or `EXIT;` quits.
+- `-f script.sql` runs a script file instead of interactive input; `--host` and `--port` select the server.
+- Errors are shown as messages and do not close the client.
+
+### Demo scenarios
+
+```sql
+-- Two clients: lock wait
+-- Client A
+BEGIN;
+UPDATE categories SET name = 'X' WHERE category_id = 1;
+-- Client B (waits until A finishes)
+SELECT * FROM categories WHERE category_id = 1;
+-- Client A
+COMMIT;
+
+-- Abort undoes changes
+BEGIN;
+DELETE FROM customers WHERE customer_id = 1;
+ABORT;
+SELECT * FROM customers WHERE customer_id = 1;
+
+-- Index
+CREATE INDEX idx_name ON categories(name);
+```
+
+- **Crash recovery:** stop the server abruptly (Ctrl+C or close the window) while a transaction is open and uncommitted, then start it again with the same `--data`. Committed changes remain and uncommitted ones are gone.
+- **Deadlock:** client A updates a row in one table, client B updates a row in another table, then each updates the other's table. One transaction is aborted as the victim.
+- **Index type:** `CREATE INDEX name ON table(column) [USING HASH | BPLUS_TREE]` (see the QO README).
+
+### Running the tests
+
+| What | Command |
+|---|---|
+| SM unit tests (JUnit) | `mvn -o test -pl storage-manager -am` |
+| QO driver | `bash query-optimizer/run-tests.sh` |
+| CCM driver | `bash concurrency-control/run-tests.sh` |
+| FRM driver | `java -cp <shared+frm classes> sqlike.frm.driver.FRMDriver --data-dir <dir>` |
+| Full 5-component integration | `PureRealFullAcceptanceTest` in `query-processor/test-scripts/` (compile it against the module `target/classes`, then run it) |
+
+The older `.sh` launchers under `query-processor/` and `failure-recovery/` assume a path without spaces and a working `python3`/`/tmp`, which is not always true on Windows. Prefer the root `run-server` and `run-client` launchers.
+
 ## Drivers
 
 | Component | Entry point |
 |---|---|
-| QP | `query-processor/run-tests.sh` |
+| QP | `query-processor/run-tests-isolated.sh` (stubs) and `query-processor/run-tests-full-integration.sh` (real components) |
 | QO | `sqlike.qo.QODriver` |
 | SM | `sqlike.storage.StorageDriver` |
 | CCM | `sqlike.ccm.CCMDriver` |
