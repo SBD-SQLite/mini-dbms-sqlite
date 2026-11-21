@@ -120,10 +120,39 @@ Setelah `run-driver` sekali (kelas sudah ada di `failure-recovery/out`):
 ```bash
 javac -d failure-recovery/out-test -cp failure-recovery/out failure-recovery/src/test/java/sqlike/frm/*.java
 java -cp "failure-recovery/out:failure-recovery/out-test" sqlike.frm.RollbackTests      # FR3, 12 test
-java -cp "failure-recovery/out:failure-recovery/out-test" sqlike.frm.MaintenanceTests   # FR4, 13 test
+java -cp "failure-recovery/out:failure-recovery/out-test" sqlike.frm.MaintenanceTests   # FR4, 18 test
 ```
 
 Di Windows, ganti `:` pada `-cp` dengan `;`.
+
+## Integrasi dengan CCM asli
+
+`CcmIntegrationTests` (`src/integration/java`) menjalankan FRM bersama `ConcurrencyControlManager`
+asli, bukan `MockCCM`, untuk skenario PRD no. 6, 7, dan 9. Setiap skenario dijalankan dengan
+protokol `LOCK_BASED` dan `TIMESTAMP_BASED`.
+
+```bash
+failure-recovery/run-ccm-integration.sh      # Linux / macOS / Git Bash
+failure-recovery\run-ccm-integration.bat     # Windows (cmd / PowerShell)
+```
+
+Skrip meng-compile `shared/`, `concurrency-control/`, dan FRM ke `failure-recovery/out-integration/`.
+Kelas di `src/integration/java` tidak ikut build Maven, jadi modul FRM tetap hanya bergantung
+pada `shared`. Exit code `0` hanya jika semua skenario PASS.
+
+| Skenario | Yang diperiksa |
+|---|---|
+| PRD-6 abort di antara `requestWrite` dan `beginApply` | `beginApply` ditolak setelah abort sehingga SM tidak pernah menerapkan perubahan; WAL T1 berisi BEGIN, UPDATE, COMPENSATION (merujuk LSN perubahan), ABORT; lock dilepas; transaksi berikutnya pada record yang sama commit dan di-redo setelah crash |
+| PRD-7 abort setelah apply | Halaman berisi nilai uncommitted sudah di-evict ke disk; abort menulis before-image kembali; dengan `LOCK_BASED` transaksi kedua menunggu sampai abort selesai lalu mendapat record; setelah crash tanpa flush nilai di disk dikembalikan dan T1 tidak di-undo dua kali |
+| PRD-9 kegagalan WAL pada `requestWrite` | `requestWrite` ditolak tanpa LSN dengan `WAL_FAILURE`; FRM FAILED (fail-stop); CCM menahan T1 dan lock-nya karena rollback ditolak; transaksi baru ditolak; setelah restart recovery menutup T1 dengan ABORT dan txId berlanjut |
+| PRD-9 kegagalan WAL pada COMMIT | CCM tidak melaporkan COMMITTED (tetap `PARTIALLY_COMMITTED`) dan tidak meng-undo; lock ditahan; setelah restart recovery meng-undo nilai T1 di disk karena COMMIT tidak pernah durable |
+
+Kegagalan WAL adalah kegagalan I/O sungguhan di FR2: channel WAL ditutup di bawah `LogManager`
+(cara yang sama dengan `LogManagerTests`), sehingga error melewati facade lalu sampai ke CCM.
+FRM dan CCM saling membutuhkan saat dibuat, jadi tes memberi `CcmPort` ke FRM lebih dulu lalu
+menyambungkan `ConcurrencyControlAdapter` setelah CCM ada. Urutan startup mengikuti PRD §14:
+`frm.recover()` lalu `ccm.initAfterRecovery(lastTxId)`, peran yang di sistem penuh dijalankan QP.
+SM tetap `MockStorageManager` karena SM asli belum menyediakan `restoreRecord` dan snapshot.
 
 ## Mock
 
@@ -157,6 +186,12 @@ memakai satu maintenance lock.
 
 ## Status integrasi
 
+Kontrak (`sqlike.contract.*`) dan tipe data, termasuk `SchemaChange` dan `SchemaImage`, hanya ada
+satu salinan di modul `shared`. Tipe skema di `shared` tidak memeriksa isinya, jadi `LogRecord`
+yang menjaga aturannya untuk record baru maupun record yang dibaca ulang dari WAL: pasangan
+before/after wajib ada dan sama panjang, nama tabel cocok dan unik, nama tidak kosong, dan skema
+yang tidak ada tidak boleh membawa index atau snapshot.
+
 FR1 sampai FR5 sudah terintegrasi di `main`: `LogManager` FR2 (PR #64), `RecoveryManager` FR5,
 `RollbackManager` FR3 (memakai `LogManager` yang sama), dan `MaintenanceService` FR4 (checkpoint,
 checkpoint berkala, PITR, `WalRecoveryLog` yang sudah mengikuti API FR2 sejak PR #65). Saat startup
@@ -173,7 +208,8 @@ Hasil pengujian (Windows 11, JDK 21):
 |---|---|
 | `FRMDriver` | 10/10 skenario PASS |
 | `RollbackTests` (FR3) | 12/12 |
-| `MaintenanceTests` (FR4) | 13/13 |
+| `MaintenanceTests` (FR4) | 18/18 |
+| `CcmIntegrationTests` (FRM + CCM asli) | 8/8 |
 
 FR2 mewajibkan setiap perubahan transaksi punya record COMPENSATION (`logCompensation(txId, lsnAsli)`,
 urut LSN menurun) sebelum `logAbort` diterima; tanpa itu muncul `WalException "Rollback belum selesai untuk T<id>"`.
@@ -189,13 +225,6 @@ urut LSN menurun) sebelum `logAbort` diterima; tanpa itu muncul `WalException "R
 
 | Hal | Keterangan |
 |---|---|
-| Tipe skema di shared | `SchemaChange` dan `SchemaImage` masih punya tiga salinan (FRM, QP, CCM) dan **sudah beda semantik**: versi FRM memvalidasi ketat (pasangan before/after wajib ada, nama tabel cocok dan unik), versi QP/CCM menerima apa saja. Harus disepakati satu versi sebelum dipindah ke `shared/` |
-| `contracts/` root | Salinan `sqlike.contract.*` masih tersebar: `IStorageManager` 4 salinan, `IFailureRecoveryManager` dan `IConcurrencyControlManager` masing-masing 3. Saat folder root-nya ada, hapus salinan di modul ini beserta `sqlike.storage.*` |
-| `IWalDurability` | Ada di tiga package berbeda: `sqlike.contract` (FRM, QP), `sqlike.frm.log` (internal FR2), dan `sqlike.replacement_durability` (SM). Karena package-nya beda, SM belum benar-benar menyambung ke kontrak FRM (FR-08) |
 | Undo perubahan skema | `SmPort.restoreSchema` belum ada, jadi FR3 menolak rollback transaksi yang punya record SCHEMA_CHANGE dengan `UNSUPPORTED_OPERATION` |
 | LSN CLR di FR5 | `ChangeApplier.undo` menulis before-image dengan LSN record asli, bukan LSN CLR, sehingga page LSN bisa mundur. Tidak membuat skenario gagal |
-| Milestone 3 | Integrasi dengan SM dan CCM asli (bukan mock) serta skenario akses berkonflik |
-
-Tiga hal pertama menyentuh modul di luar `failure-recovery/`, jadi perlu koordinasi supergroup
-lebih dulu (lihat aturan "Only modify code within your own group's component directory" di
-`CONTRIBUTING.md`).
+| Milestone 3 | Integrasi dengan CCM asli sudah diuji (`CcmIntegrationTests`); integrasi dengan SM asli belum |
