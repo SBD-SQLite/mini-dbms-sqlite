@@ -10,6 +10,8 @@ import static sqlike.frm.log.WalTestSupport.*;
 
 final class LogManagerTests {
     static void runAll() {
+        run("Dua UPDATE pada baris yang sama tersimpan setelah WAL dibuka kembali", LogManagerTests::updatesAfterReopen);
+        run("Tampilan T1 hanya memuat log T1 dalam urutan LSN", LogManagerTests::showOneTransaction);
         run("Log kosong", LogManagerTests::empty);
         run("INSERT, UPDATE, DELETE, COMMIT dan restart", LogManagerTests::changes);
         run("Input dan urutan transaksi yang salah ditolak", LogManagerTests::invalidInput);
@@ -18,6 +20,41 @@ final class LogManagerTests {
         run("Batas LSN dan kegagalan penulisan", LogManagerTests::writeFailure);
         run("Transaksi bersamaan tidak membuat LSN ganda", LogManagerTests::concurrent);
         run("Pergantian log menyimpan history", LogManagerTests::rotation);
+    }
+
+    private static void updatesAfterReopen() throws Exception {
+        try (TestLog test = new TestLog()) {
+            DataChange first = change(ChangeOperation.UPDATE, row(10), row(20));
+            DataChange second = change(ChangeOperation.UPDATE, row(20), row(30));
+            test.wal.logBegin(1);
+            test.wal.logChange(1, first);
+            test.wal.logChange(1, second);
+            test.wal.logCommit(1);
+            test.reopen();
+
+            List<LogRecord> logs = test.wal.readLogs(1L);
+            eq(4, logs.size());
+            eq(LogType.BEGIN, logs.get(0).type());
+            eq(LogType.UPDATE, logs.get(1).type());
+            eq(first, logs.get(1).change().orElseThrow());
+            eq(LogType.UPDATE, logs.get(2).type());
+            eq(second, logs.get(2).change().orElseThrow());
+            eq(LogType.COMMIT, logs.get(3).type());
+        }
+    }
+
+    private static void showOneTransaction() throws Exception {
+        try (TestLog test = new TestLog()) {
+            test.wal.logBegin(1);
+            test.wal.logBegin(10);
+            test.wal.logCommit(10);
+            test.wal.logCommit(1);
+
+            List<String> lines = test.wal.showLogs(1L).lines().toList();
+            eq(2, lines.size());
+            check(lines.get(0).startsWith("LSN=1 ") && lines.get(0).endsWith("<T1 start>"), "Baris pertama harus BEGIN T1 pada LSN 1");
+            check(lines.get(1).startsWith("LSN=4 ") && lines.get(1).endsWith("<T1 commit>"), "Baris kedua harus COMMIT T1 pada LSN 4");
+        }
     }
 
     private static void empty() throws Exception {
