@@ -52,7 +52,6 @@ public final class QueryProcessor implements IQueryProcessor {
     private final PlanExecutor planExecutor;
     private final ConcurrencyAdapter concurrencyAdapter;
     private volatile SystemState state;
-    private volatile LogSource logSource;
 
     private record Outcome(ExecutionSummary summary, Optional<TransactionResponse> transaction) {
     }
@@ -219,11 +218,6 @@ public final class QueryProcessor implements IQueryProcessor {
 
     public SystemState getState() {
         return state;
-    }
-
-    /** Connects {@code SHOW LOG} to the FRM log reader (FR-03). Without it the command reports an error. */
-    public void setLogSource(LogSource logSource) {
-        this.logSource = logSource;
     }
 
     void markReady() {
@@ -429,10 +423,6 @@ public final class QueryProcessor implements IQueryProcessor {
         session.lockExecution();
         Optional<ExecutionContext> context = Optional.empty();
         try {
-            Optional<LogCommand> logCommand = LogCommand.parse(sql);
-            if (logCommand.isPresent()) {
-                return runShowLog(session, logCommand.get(), sink);
-            }
             ParsedQuery parsed = optimizer.parseQuery(sql);
             if (parsed.transactionCommand().isPresent()) {
                 return runTransactionCommand(session, parsed.transactionCommand().get().action());
@@ -458,37 +448,6 @@ public final class QueryProcessor implements IQueryProcessor {
         } finally {
             session.unlockExecution();
         }
-    }
-
-    /**
-     * SHOW LOG: reads the WAL through the FRM. It starts no transaction and takes no lock, so it also
-     * works inside an open transaction and never changes the log.
-     */
-    private Outcome runShowLog(SessionState session, LogCommand command, ResultSink sink) {
-        LogSource source = logSource;
-        if (source == null) {
-            throw new QpException(ErrorCode.UNSUPPORTED_OPERATION, "Log viewer is not available");
-        }
-        Optional<Long> txId = command.txId();
-        if (command.current()) {
-            txId = session.getCurrentTxId();
-            if (txId.isEmpty()) {
-                throw new QpException(ErrorCode.INVALID_STATE,
-                        "No active transaction in this session. Use BEGIN first, or SHOW LOG <txId>");
-            }
-        }
-        String text = source.showLogs(txId);
-        List<String> lines = text == null ? List.of() : text.lines().filter(l -> !l.isBlank()).toList();
-        if (lines.isEmpty() || (lines.size() == 1 && lines.get(0).trim().equals("(log kosong)"))) {
-            return new Outcome(ExecutionSummary.ok(0L, "(log kosong)"), Optional.empty());
-        }
-        if (sink != null) {
-            sink.onSchema(Schema.of(List.of(new ColumnSchema("log", sqlike.shared.DataType.VARCHAR, Optional.empty()))));
-            for (String line : lines) {
-                sink.onRow(Row.of(new Value(sqlike.shared.DataType.VARCHAR, Optional.empty(), Optional.empty(), Optional.of(line))));
-            }
-        }
-        return new Outcome(ExecutionSummary.ok(0L, lines.size() + " log record(s)"), Optional.empty());
     }
 
     private Outcome runTransactionCommand(SessionState session, TransactionAction action) {

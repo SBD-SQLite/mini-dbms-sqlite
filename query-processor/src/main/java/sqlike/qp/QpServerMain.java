@@ -289,19 +289,6 @@ public final class QpServerMain {
                     .newInstance(realSm);
 
             QpBootstrap bootstrap = QpBootstrap.forComponents(realQo, realSm, realCcm, realFrm, config);
-            // SHOW LOG (FR-03): FRM owns the log reader; QP only forwards the request.
-            Method showLogsMethod = frmClass.getMethod("showLogs", Optional.class);
-            bootstrap.getProcessor().setLogSource(txId -> {
-                try {
-                    return (String) showLogsMethod.invoke(realFrm, txId);
-                } catch (InvocationTargetException e) {
-                    Throwable cause = e.getTargetException();
-                    if (cause instanceof RuntimeException re) throw re;
-                    throw new IllegalStateException("Cannot read log: " + cause.getMessage(), cause);
-                } catch (IllegalAccessException e) {
-                    throw new IllegalStateException("Cannot read log: " + e.getMessage(), e);
-                }
-            });
             bootstrap.start();
 
             // Ensure all persisted indexes are loaded and consistent after startup recovery (PRD §14).
