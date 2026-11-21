@@ -105,21 +105,6 @@ public class MockStorageManager implements SmPort {
         dirtyPageLsn.merge(table, lsn, Math::max);
     }
 
-    /** The mock keeps no catalog: an absent schema drops the table's rows, a present one ensures the table exists. */
-    @Override
-    public synchronized void restoreSchema(SchemaImage image, long lsn) {
-        Objects.requireNonNull(image, "image");
-        if (lsn < 0) {
-            throw new IllegalArgumentException("lsn must not be negative");
-        }
-        if (image.schema().isEmpty()) {
-            tables.remove(image.tableName());
-        } else {
-            table(image.tableName());
-        }
-        dirtyPageLsn.merge(image.tableName(), lsn, Math::max);
-    }
-
     @Override
     public synchronized void restoreSchema(SchemaImage image, long lsn) {
         Objects.requireNonNull(image, "image");
