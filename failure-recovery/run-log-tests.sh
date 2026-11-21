@@ -7,20 +7,10 @@ build_dir="$(mktemp -d "${TMPDIR:-/tmp}/sqlike-fr2-build.XXXXXX")"
 
 trap 'rm -rf "$build_dir"' EXIT
 
-sources=()
-
-while IFS= read -r -d '' source; do
-    sources+=("$source")
-done < <(
-    find \
-        "$frm_dir/../shared/src/main/java" \
-        "$frm_dir/src/main/java" \
-        "$frm_dir/src/test/java/sqlike/frm/log" \
-        -name '*.java' -print0
-)
-
-javac -encoding UTF-8 \
+test_dir="$frm_dir/src/test/java"
+javac --release 21 -encoding UTF-8 \
+    -sourcepath "$frm_dir/../shared/src/main/java:$frm_dir/src/main/java:$test_dir" \
     -d "$build_dir/classes" \
-    "${sources[@]}"
+    "$test_dir/sqlike/frm/log/WalTests.java"
 
 java -cp "$build_dir/classes" sqlike.frm.log.WalTests "$@"
