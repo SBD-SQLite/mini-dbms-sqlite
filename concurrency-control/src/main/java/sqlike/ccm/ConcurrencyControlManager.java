@@ -353,7 +353,9 @@ public class ConcurrencyControlManager implements IConcurrencyControlManager {
         TransactionResponse response = abort(txId);
         if (response.status() != TransactionStatus.ABORTED
                 && response.status() != TransactionStatus.COMMITTED) {
-            throw new IllegalStateException("Deadlock victim could not finish abort: " + txId);
+            // Not an error for the transaction that found the cycle: the victim stays FAILED with its locks until
+            // abort is retried or recovery runs, and its own pending request is answered ABORTED.
+            LOG.warning("Deadlock victim " + txId + " could not finish abort, status " + response.status());
         }
     }
 

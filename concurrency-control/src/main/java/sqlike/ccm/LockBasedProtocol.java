@@ -37,6 +37,8 @@ public class LockBasedProtocol implements IConcurrencyProtocol {
     private final Map<ResourceId, LockEntry> lockTable = new HashMap<>();
     private final Map<Long, Transaction> transactions = new HashMap<>();
     private final Set<Long> aborting = new HashSet<>();
+    /** Transactions whose abort could not finish: still FAILED with their locks, but their requests are answered ABORTED. */
+    private final Set<Long> stuck = new HashSet<>();
     private final DeadlockHandler deadlockHandler;
     private final LongConsumer abortHandler;
     private long generation;
@@ -106,6 +108,7 @@ public class LockBasedProtocol implements IConcurrencyProtocol {
             }
             transactions.remove(tx.getTxId());
             aborting.remove(tx.getTxId());
+            stuck.remove(tx.getTxId());
             updateGraph();
             changed.signalAll();
         } finally {
@@ -144,6 +147,7 @@ public class LockBasedProtocol implements IConcurrencyProtocol {
             lockTable.clear();
             transactions.clear();
             aborting.clear();
+            stuck.clear();
             deadlockHandler.reset();
             changed.signalAll();
         } finally {
@@ -185,7 +189,7 @@ public class LockBasedProtocol implements IConcurrencyProtocol {
             entry.waiters.addLast(request);
 
             while (requestGeneration == generation) {
-                if (isFinished(tx)) {
+                if (isFinished(tx) || stuck.contains(tx.getTxId())) {
                     return AccessStatus.ABORTED;
                 }
                 if (tx.isActive() && !aborting.contains(tx.getTxId())) {
@@ -296,7 +300,10 @@ public class LockBasedProtocol implements IConcurrencyProtocol {
             mutex.lock();
         }
         if (abortGeneration == generation && transactions.containsKey(txId)) {
-            throw new IllegalStateException("Abort handler returned before releasing transaction " + txId);
+            // The abort could not finish (rollback failed). The transaction stays FAILED and keeps its locks, so
+            // its data stays protected, but its own pending request must not wait forever for a release.
+            stuck.add(txId);
+            changed.signalAll();
         }
     }
 
